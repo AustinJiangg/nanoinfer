@@ -1,0 +1,31 @@
+# Python bytecode / packaging
+__pycache__/
+*.py[cod]
+*.egg
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Test & tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Model / data artifacts (don't commit downloaded weights)
+*.safetensors
+*.bin
+*.pt
+
+# OS & editor cruft
+.DS_Store
+*.swp
+.idea/
+.vscode/

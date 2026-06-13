@@ -1,0 +1,31 @@
+[project]
+name = "nanoinfer"
+version = "0.1.0"
+description = "A from-scratch LLM inference engine, built for learning."
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.2",
+    "transformers>=4.44",
+    "safetensors>=0.4",
+    "numpy",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["nanoinfer"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Stage-0 parity tests download a small model; mark them slow so the fast
+# shape tests can run alone with:  pytest -m "not slow"
+markers = [
+    "slow: tests that download weights or run the full model",
+]
