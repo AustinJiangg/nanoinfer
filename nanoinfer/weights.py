@@ -9,13 +9,20 @@ tests.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 
 from .config import ModelConfig
 from .model import Model
 
+if TYPE_CHECKING:
+    # For the return annotation only — keeps the real transformers import lazy
+    # (it stays inside load_model) while letting type checkers resolve the name.
+    from transformers import AutoTokenizer
 
-def load_model(model_name: str, dtype=torch.float32, device="cpu") -> tuple[Model, "AutoTokenizer"]:
+
+def load_model(model_name: str, dtype=torch.float32, device="cpu") -> tuple[Model, AutoTokenizer]:
     """Download/load `model_name`, build our Model, copy weights in.
 
     Returns (model, tokenizer). The model is in eval mode on `device`.
