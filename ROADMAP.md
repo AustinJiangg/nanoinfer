@@ -3,7 +3,7 @@
 Each stage is independently runnable and testable. Land one fully (code + tests
 green) before starting the next. Check the box when done.
 
-## Stage 0 — Naive forward pass + greedy loop  ← MVP (this commit)
+## Stage 0 — Naive forward pass + greedy loop  ✅ landed
 The minimal correct engine. No cache, no batching. Recomputes the full sequence
 every step. Slow but easy to verify.
 - [x] ModelConfig from HF config

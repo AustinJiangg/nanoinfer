@@ -75,7 +75,7 @@ tests/
   test_layers.py    shape + numerical-parity tests vs HF
   test_generate.py  end-to-end: greedy output matches HF, deterministic
 ROADMAP.md      the staged plan
-CLAUDE.md       working notes & known sharp edges (RoPE, GQA, masking, dtype)
+CLAUDE.md       how we develop here: the golden rule, conventions, sharp edges
 ```
 
 ## Status & roadmap
@@ -89,3 +89,12 @@ for the full plan.
 - [ ] **Stage 3** — continuous batching
 - [ ] **Stage 4** — paged attention (vLLM-style block KV cache)
 - [ ] **Stage 5** — quantization / custom kernels (stretch)
+
+## Development
+
+Reading the code or contributing? Two companion docs split the work:
+
+- **[CLAUDE.md](CLAUDE.md)** — how we develop here: the golden rule, conventions,
+  and known sharp edges (RoPE, GQA, masking, dtype, config gotchas).
+- **[ROADMAP.md](ROADMAP.md)** — the staged plan, with the "done when" bar for each
+  stage and reference reading.
