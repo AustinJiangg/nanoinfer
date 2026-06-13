@@ -69,10 +69,12 @@ nanoinfer/
   config.py     ModelConfig, loaded from the HF config
   weights.py    load an HF checkpoint -> our own state-dict naming
   layers.py     rmsnorm, rope, attention, swiglu, transformer block
-  model.py      assembles the blocks; forward(input_ids) -> logits
+  cache.py      per-layer KV cache for incremental decoding (stage 1)
+  model.py      assembles the blocks; forward(input_ids, cache=None) -> logits
   generate.py   the autoregressive loop + CLI entry point
 tests/
   test_layers.py    shape + numerical-parity tests vs HF
+  test_cache.py     cached decode == stage-0 full recompute, token-for-token
   test_generate.py  end-to-end: greedy output matches HF, deterministic
 ROADMAP.md      the staged plan
 CLAUDE.md       how we develop here: the golden rule, conventions, sharp edges
@@ -80,11 +82,11 @@ CLAUDE.md       how we develop here: the golden rule, conventions, sharp edges
 
 ## Status & roadmap
 
-Stage 0 is complete and verified against Hugging Face. See [ROADMAP.md](ROADMAP.md)
-for the full plan.
+Stages 0 and 1 are complete and verified against Hugging Face. See
+[ROADMAP.md](ROADMAP.md) for the full plan.
 
 - [x] **Stage 0** — naive forward pass + greedy decoding (full recompute, no cache)
-- [ ] **Stage 1** — KV cache (prefill / decode split)
+- [x] **Stage 1** — KV cache (prefill / decode split); ~2.4× faster, same tokens
 - [ ] **Stage 2** — sampling: temperature, top-k, top-p, repetition penalty
 - [ ] **Stage 3** — continuous batching
 - [ ] **Stage 4** — paged attention (vLLM-style block KV cache)

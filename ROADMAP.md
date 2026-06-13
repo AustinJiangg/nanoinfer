@@ -15,14 +15,17 @@ every step. Slow but easy to verify.
 **Done when:** `python -m nanoinfer.generate --prompt "..."` produces coherent,
 deterministic text that matches HF greedy decoding token-for-token.
 
-## Stage 1 — KV cache
+## Stage 1 — KV cache  ✅ landed
 Stop recomputing. Cache K and V per layer; each step processes only the new
 token. This is the single biggest correctness-preserving speedup.
-- [ ] Per-layer KV cache structure (preallocated to max length)
-- [ ] Attention path for the single-token (decode) case
-- [ ] Split prefill (process prompt) from decode (one token at a time)
-- [ ] Test: cached output == stage-0 uncached output, token-for-token
-- [ ] Benchmark: tokens/sec before vs after
+- [x] Per-layer KV cache structure (preallocated to max length) — `cache.py`
+- [x] Attention path for the single-token (decode) case
+- [x] Split prefill (process prompt) from decode (one token at a time)
+- [x] Test: cached output == stage-0 uncached output, token-for-token
+- [x] Benchmark: tokens/sec before vs after (~2.4× on Qwen2.5-0.5B, CPU, 60 tok)
+**Done when:** `generate(..., use_cache=True)` matches the uncached path
+token-for-token and HF greedy decoding, and is measurably faster. The stage-0
+full-recompute path stays reachable via `--no-cache` for A/B.
 
 ## Stage 2 — Sampling strategies
 - [ ] temperature, top-k, top-p (nucleus), repetition penalty

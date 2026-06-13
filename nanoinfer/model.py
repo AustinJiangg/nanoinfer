@@ -5,8 +5,9 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from .cache import KVCache
 from .config import ModelConfig
-from .layers import RMSNorm, TransformerBlock, build_rope_cache
+from .layers import RMSNorm, TransformerBlock, build_decode_mask, build_rope_cache
 
 
 class Model(nn.Module):
@@ -30,20 +31,64 @@ class Model(nn.Module):
         self.register_buffer("rope_sin", sin, persistent=False)
 
     @torch.no_grad()
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, input_ids: torch.Tensor, cache: KVCache | None = None
+    ) -> torch.Tensor:
         """input_ids: [batch, seq] of token ids -> logits [batch, seq, vocab].
 
-        Stage 0: the whole sequence is processed every call. We slice the RoPE
-        tables to the current length and let each block apply causal masking.
+        Without a cache (stage 0): the whole sequence is processed every call,
+        positions run 0..t-1.
+
+        With a cache (stage 1): `input_ids` is just the new token(s). They sit at
+        absolute positions start_pos..start_pos+t-1, where start_pos is however
+        many tokens the cache already holds. Slicing the RoPE tables at start_pos
+        — not 0 — is what gives each new token the rotation for its true position;
+        getting this wrong is the classic cache bug. The length is advanced once,
+        after every layer has written its slice for this pass.
         """
         b, t = input_ids.shape
         x = self.embed_tokens(input_ids)  # [b, t, hidden]
 
-        cos = self.rope_cos[:t]
-        sin = self.rope_sin[:t]
+        start_pos = cache.length if cache is not None else 0
 
-        for layer in self.layers:
-            x = layer(x, cos, sin)
+        # Guard the context limit explicitly. Slicing the RoPE tables past their
+        # end is silent (Python returns fewer rows, not an error), which would
+        # otherwise surface as a baffling shape mismatch deep in attention rather
+        # than a clear "ran out of positions" — mirror the cache's overflow guard.
+        max_pos = self.rope_cos.shape[0]
+        if start_pos + t > max_pos:
+            raise ValueError(
+                f"sequence position {start_pos + t} exceeds the model's context "
+                f"length {max_pos} (max_position_embeddings)"
+            )
+
+        cos = self.rope_cos[start_pos : start_pos + t]
+        sin = self.rope_sin[start_pos : start_pos + t]
+
+        # Build the attention mask once for the whole stack — every layer shares
+        # it, just like cos/sin. None is the square prefill / stage-0 case (each
+        # block takes the optimized is_causal path); a non-None mask is the cached
+        # non-square case where new queries must attend the full history.
+        attn_mask = None if start_pos == 0 else build_decode_mask(t, start_pos, x.device)
+
+        for i, layer in enumerate(self.layers):
+            x = layer(x, cos, sin, cache=cache, layer_idx=i, attn_mask=attn_mask)
+
+        if cache is not None:
+            cache.advance(t)
 
         x = self.norm(x)
         return self.lm_head(x)
+
+    def init_cache(self, batch: int, max_seq: int) -> KVCache:
+        """Allocate a fresh KV cache sized to this model, on its device/dtype."""
+        w = self.embed_tokens.weight
+        return KVCache(
+            num_layers=self.cfg.num_layers,
+            batch=batch,
+            n_kv_heads=self.cfg.num_kv_heads,
+            head_dim=self.cfg.head_dim,
+            max_seq=max_seq,
+            device=w.device,
+            dtype=w.dtype,
+        )

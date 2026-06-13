@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .cache import KVCache
 from .config import ModelConfig
 
 
@@ -88,10 +89,28 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     return x.reshape(b, n_kv * n_rep, s, d)
 
 
+def build_decode_mask(t: int, start: int, device) -> torch.Tensor:
+    """Boolean attend-mask [t, start+t] for cached attention (start > 0).
+
+    Query i sits at absolute position `start + i` and may attend key j iff
+    `j <= start + i`. This covers the case a naive [t, t] lower-triangular mask
+    gets wrong: the new queries must also attend ALL past keys (j < start), not
+    just the current window. For the common decode step (t == 1) this is a single
+    row of all-True — the lone query attends every cached key and itself.
+
+    True = attend (the convention F.scaled_dot_product_attention's bool mask uses).
+    """
+    q_pos = torch.arange(t, device=device).unsqueeze(1) + start  # [t, 1]
+    k_pos = torch.arange(start + t, device=device).unsqueeze(0)   # [1, start+t]
+    return k_pos <= q_pos
+
+
 class Attention(nn.Module):
     """Grouped-query causal self-attention with RoPE.
 
-    Stage 0: processes the whole sequence and applies a full causal mask.
+    Stage 0 (no cache): processes the whole sequence with a full causal mask.
+    Stage 1 (cache): writes the new token(s)' K/V into the cache and attends over
+    everything cached so far.
     """
 
     def __init__(self, cfg: ModelConfig):
@@ -108,7 +127,13 @@ class Attention(nn.Module):
         self.o_proj = nn.Linear(self.n_heads * self.head_dim, cfg.hidden_size, bias=False)
 
     def forward(
-        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        cache: KVCache | None = None,
+        layer_idx: int = 0,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         b, t, _ = x.shape
 
@@ -117,15 +142,27 @@ class Attention(nn.Module):
         k = self.k_proj(x).view(b, t, self.n_kv_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(b, t, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
+        # RoPE is applied before caching: keys are stored already rotated, so a
+        # cached key keeps the rotation for its absolute position forever.
         q, k = apply_rope(q, k, cos, sin)
+
+        if cache is not None:
+            # Append the new K/V and read back everything cached so far.
+            k, v = cache.update(layer_idx, k, v)
 
         # GQA: expand KV heads to match Q heads.
         k = repeat_kv(k, self.cfg.n_rep)
         v = repeat_kv(v, self.cfg.n_rep)
 
-        # Scaled dot-product attention with a causal mask.
-        # is_causal handles the [t, t] lower-triangular mask for us.
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        # Masking (see CLAUDE.md "Causal mask"). The model builds the mask once and
+        # shares it across layers. None == the square prefill / stage-0 case: use
+        # the optimized is_causal triangle. A non-None mask is the cached non-square
+        # case, where the new queries must attend the whole history (a naive [t, t]
+        # triangle would wrongly hide the past keys).
+        if attn_mask is None:
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
 
         out = out.transpose(1, 2).contiguous().view(b, t, -1)
         return self.o_proj(out)
@@ -155,8 +192,20 @@ class TransformerBlock(nn.Module):
         self.mlp = SwiGLU(cfg)
 
     def forward(
-        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        cache: KVCache | None = None,
+        layer_idx: int = 0,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        x = x + self.self_attn(self.input_layernorm(x), cos, sin)
+        # Pass the cache/mask args by keyword: layer_idx and the mask are easy to
+        # transpose positionally, and a swap would silently corrupt the cache slice
+        # or the masking (exactly the kind of off-by-one CLAUDE.md warns about).
+        x = x + self.self_attn(
+            self.input_layernorm(x), cos, sin,
+            cache=cache, layer_idx=layer_idx, attn_mask=attn_mask,
+        )
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
