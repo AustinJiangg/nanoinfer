@@ -40,8 +40,20 @@ int main(int argc, char** argv) {
         std::printf("unknown mode '%s' (use fp32, q8, q4, q4g)\n", mode_str.c_str());
         return 2;
     }
-    const int64_t prefill_len = argc > 3 ? std::stoll(argv[3]) : 64;
-    const int64_t decode_len = argc > 4 ? std::stoll(argv[4]) : 64;
+    // Parse lengths defensively: std::stoll throws on non-numeric input, and a
+    // negative prefill_len would wrap to a huge vector allocation below.
+    int64_t prefill_len = 64, decode_len = 64;
+    try {
+        if (argc > 3) prefill_len = std::stoll(argv[3]);
+        if (argc > 4) decode_len = std::stoll(argv[4]);
+    } catch (const std::exception& e) {
+        std::printf("run_bench: bad length argument: %s\n", e.what());
+        return 2;
+    }
+    if (prefill_len < 1 || decode_len < 0) {
+        std::printf("run_bench: need prefill_len >= 1 and decode_len >= 0\n");
+        return 2;
+    }
 
     try {
         ni::Model model(dir, mode);
