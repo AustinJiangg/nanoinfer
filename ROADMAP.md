@@ -77,7 +77,7 @@ API simple/C-style so the later binding is cheap.
 ## Pure C++ core
 - [x] **C0** — Tensor + ops (matmul/rmsnorm/softmax/add), CMake, numpy parity
 - [x] **C1** — Qwen2.5 forward pass; NIT0 weight export, logit parity vs nanoinfer (~4e-5)
-- [ ] **C2** — sampling (temperature / top-k / top-p / repetition penalty)
+- [x] **C2** — sampling + generate loop; greedy generation matches nanoinfer token-for-token
 - [ ] **C3** — KV cache (prefill / decode split)
 - [ ] **C4** — quantization (Q8/Q4 weight-only, dequant on the fly) ← new math, derive first
 - [ ] **C5** — SIMD (AVX2/NEON) + multithreading (OpenMP) ← the performance well

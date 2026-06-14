@@ -23,6 +23,7 @@ Config load_config(const std::string& path) {
         else if (key == "rms_norm_eps") f >> c.rms_norm_eps;
         else if (key == "rope_theta") f >> c.rope_theta;
         else if (key == "tie_word_embeddings") f >> c.tie_word_embeddings;
+        else if (key == "eos_token_id") f >> c.eos_token_id;
         else { std::string ignored; f >> ignored; }  // unknown key: skip its value
     }
 

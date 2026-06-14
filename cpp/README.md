@@ -55,18 +55,22 @@ C++ logits can be compared against the Python engine's directly.
 python tools/export_weights.py weights/qwen2.5-0.5b
 # 2. dump nanoinfer's reference logits for a prompt
 python tools/dump_reference.py  weights/qwen2.5-0.5b "The capital of France is"
-# 3. run the C++ forward and compare
+# 3a. compare logits
 ./build/run_parity weights/qwen2.5-0.5b
+# 3b. generate: greedy parity vs nanoinfer + a sampled demo
+./build/run_generate weights/qwen2.5-0.5b
 ```
 
 The C++ logits match nanoinfer to ~4e-5 max abs diff (float accumulation order),
-argmax token-for-token — e.g. "The capital of France is" → " Paris".
+argmax token-for-token. Greedy generation matches nanoinfer exactly — e.g. "The
+capital of France is" → " Paris. It is the largest city in Europe and the second".
+(No KV cache yet, so generation re-runs the full forward each step — that's C3.)
 
 ## Status
 
 - [x] **C0** — Tensor + ops (matmul/rmsnorm/softmax/add), CMake, numpy parity
 - [x] **C1** — Qwen2.5 forward pass; NIT0 weight export, logit parity vs nanoinfer
-- [ ] **C2** — sampling (temperature / top-k / top-p)
+- [x] **C2** — sampling + generate loop; greedy generation matches nanoinfer token-for-token
 - [ ] **C3** — KV cache
 - [ ] **C4** — quantization (Q8/Q4)
 - [ ] **C5** — SIMD / multithreading

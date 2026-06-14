@@ -37,9 +37,23 @@ def main() -> None:
     id_list = ids[0].tolist()
     (out / "ref_ids.txt").write_text(" ".join(str(i) for i in id_list))
     save_bin(out / "ref_logits.bin", logits.numpy())
+
+    # Greedy continuation (full-recompute, no EOS stop) for the C++ generate parity
+    # test — fixed length so both engines emit the same number of tokens.
+    n_gen = 12
+    cur = ids.clone()
+    gen: list[int] = []
+    with torch.no_grad():
+        for _ in range(n_gen):
+            nxt = int(model(cur)[0, -1].argmax())
+            gen.append(nxt)
+            cur = torch.cat([cur, torch.tensor([[nxt]])], dim=1)
+    (out / "ref_gen_ids.txt").write_text(" ".join(str(i) for i in gen))
+
     print(f"prompt: {prompt!r}")
     print(f"seq={len(id_list)}  next-token argmax={int(logits[-1].argmax())}")
-    print(f"wrote ref_ids.txt + ref_logits.bin to {out}")
+    print(f"greedy {n_gen} tokens: {gen}")
+    print(f"wrote ref_ids.txt + ref_logits.bin + ref_gen_ids.txt to {out}")
 
 
 if __name__ == "__main__":

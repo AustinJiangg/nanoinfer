@@ -27,8 +27,9 @@ def main() -> None:
     from nanoinfer.weights import load_model
 
     print(f"loading {model_name} ...")
-    model, _ = load_model(model_name, dtype=torch.float32, device="cpu")
+    model, tokenizer = load_model(model_name, dtype=torch.float32, device="cpu")
     cfg = model.cfg
+    eos_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else -1
 
     with open(out / "config.txt", "w") as f:
         f.write(f"vocab_size {cfg.vocab_size}\n")
@@ -42,6 +43,7 @@ def main() -> None:
         f.write(f"rms_norm_eps {cfg.rms_norm_eps}\n")
         f.write(f"rope_theta {cfg.rope_theta}\n")
         f.write(f"tie_word_embeddings {int(cfg.tie_word_embeddings)}\n")
+        f.write(f"eos_token_id {eos_id}\n")
 
     sd = model.state_dict()
     count = 0
