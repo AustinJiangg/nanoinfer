@@ -81,6 +81,53 @@ int main() {
         CHECK_CLOSE(rms, 1.0, 1e-5);
     }
 
+    // linear: weight is [out, in] (nn.Linear), so y = x @ w^T + bias.
+    {
+        Tensor x = make({1, 2}, {1, 2});
+        Tensor w = make({2, 2}, {1, 0, 0, 1});  // identity
+        Tensor b = make({2}, {10, 20});
+        Tensor y = ni::linear(x, w, &b);
+        CHECK_CLOSE(y.at(0, 0), 11.0, 1e-6);  // 1 + 10
+        CHECK_CLOSE(y.at(0, 1), 22.0, 1e-6);  // 2 + 20
+        Tensor y2 = ni::linear(x, w);          // no bias
+        CHECK_CLOSE(y2.at(0, 0), 1.0, 1e-6);
+        CHECK_CLOSE(y2.at(0, 1), 2.0, 1e-6);
+
+        // A non-identity row to confirm the weight is read row-per-output.
+        Tensor w2 = make({1, 3}, {1, 2, 3});
+        Tensor x2 = make({1, 3}, {1, 1, 1});
+        CHECK_CLOSE(ni::linear(x2, w2).at(0, 0), 6.0, 1e-6);  // 1+2+3
+    }
+
+    // silu: silu(0)=0, silu(+large)~x, silu(-large)~0.
+    {
+        Tensor x = make({3}, {0, 20, -20});
+        Tensor y = ni::silu(x);
+        CHECK_CLOSE(y[0], 0.0, 1e-6);
+        CHECK_CLOSE(y[1], 20.0, 1e-3);
+        CHECK_CLOSE(y[2], 0.0, 1e-6);
+    }
+
+    // mul: elementwise.
+    {
+        Tensor a = make({3}, {1, 2, 3});
+        Tensor b = make({3}, {4, 5, 6});
+        Tensor c = ni::mul(a, b);
+        CHECK_CLOSE(c[0], 4.0, 1e-6);
+        CHECK_CLOSE(c[1], 10.0, 1e-6);
+        CHECK_CLOSE(c[2], 18.0, 1e-6);
+    }
+
+    // embedding: gather rows by id.
+    {
+        Tensor table = make({3, 2}, {10, 11, 20, 21, 30, 31});
+        Tensor e = ni::embedding(table, {2, 0});
+        CHECK_CLOSE(e.at(0, 0), 30.0, 1e-6);
+        CHECK_CLOSE(e.at(0, 1), 31.0, 1e-6);
+        CHECK_CLOSE(e.at(1, 0), 10.0, 1e-6);
+        CHECK_CLOSE(e.at(1, 1), 11.0, 1e-6);
+    }
+
     std::printf(g_failures ? "test_ops: %d failures\n" : "test_ops: ok\n", g_failures);
     return g_failures ? 1 : 0;
 }

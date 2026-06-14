@@ -33,6 +33,57 @@ Tensor matmul(const Tensor& a, const Tensor& b) {
     return out;
 }
 
+Tensor linear(const Tensor& x, const Tensor& weight, const Tensor* bias) {
+    require(x.ndim() == 2 && weight.ndim() == 2, "linear expects 2-D x and weight");
+    require(x.size(1) == weight.size(1), "linear: x cols must match weight in-features");
+
+    const int64_t m = x.size(0), in = x.size(1), out = weight.size(0);
+    if (bias) require(bias->numel() == out, "linear: bias must match out-features");
+
+    Tensor y({m, out});
+    for (int64_t i = 0; i < m; ++i) {
+        const float* xr = x.data() + i * in;
+        for (int64_t o = 0; o < out; ++o) {
+            const float* wr = weight.data() + o * in;  // row o = the o-th output's weights
+            double acc = bias ? double((*bias)[o]) : 0.0;
+            for (int64_t p = 0; p < in; ++p) acc += double(xr[p]) * wr[p];
+            y.at(i, o) = float(acc);
+        }
+    }
+    return y;
+}
+
+Tensor embedding(const Tensor& table, const std::vector<int64_t>& ids) {
+    require(table.ndim() == 2, "embedding table must be 2-D [vocab, hidden]");
+    const int64_t vocab = table.size(0), hidden = table.size(1);
+
+    Tensor out({static_cast<int64_t>(ids.size()), hidden});
+    for (size_t r = 0; r < ids.size(); ++r) {
+        const int64_t id = ids[r];
+        require(id >= 0 && id < vocab, "embedding id out of range");
+        const float* src = table.data() + id * hidden;
+        float* dst = out.data() + static_cast<int64_t>(r) * hidden;
+        for (int64_t c = 0; c < hidden; ++c) dst[c] = src[c];
+    }
+    return out;
+}
+
+Tensor silu(const Tensor& x) {
+    Tensor out(x.shape());
+    for (int64_t i = 0; i < x.numel(); ++i) {
+        const float v = x[i];
+        out[i] = v / (1.0f + std::exp(-v));
+    }
+    return out;
+}
+
+Tensor mul(const Tensor& a, const Tensor& b) {
+    require(a.shape() == b.shape(), "mul expects equally-shaped tensors");
+    Tensor out(a.shape());
+    for (int64_t i = 0; i < a.numel(); ++i) out[i] = a[i] * b[i];
+    return out;
+}
+
 Tensor rmsnorm(const Tensor& x, const Tensor& weight, float eps) {
     require(x.ndim() >= 1, "rmsnorm expects at least 1-D input");
     const int64_t d = x.size(x.ndim() - 1);

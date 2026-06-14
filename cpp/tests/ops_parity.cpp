@@ -4,6 +4,7 @@
 //
 // Usage: ops_parity <fixtures_dir>   (ctest passes the build-dir fixtures path).
 #include <string>
+#include <vector>
 
 #include "ops.hpp"
 #include "serialize.hpp"
@@ -49,6 +50,34 @@ int main(int argc, char** argv) {
             ni::Tensor b = load_bin(dir + "add_b.bin");
             ni::Tensor expected = load_bin(dir + "add_expected.bin");
             fails += compare_tensors(ni::add(a, b), expected, 1e-6, "add");
+        }
+        // linear
+        {
+            ni::Tensor x = load_bin(dir + "linear_x.bin");
+            ni::Tensor w = load_bin(dir + "linear_w.bin");
+            ni::Tensor b = load_bin(dir + "linear_bias.bin");
+            ni::Tensor expected = load_bin(dir + "linear_expected.bin");
+            fails += compare_tensors(ni::linear(x, w, &b), expected, 1e-3, "linear");
+        }
+        // silu
+        {
+            ni::Tensor x = load_bin(dir + "silu_x.bin");
+            ni::Tensor expected = load_bin(dir + "silu_expected.bin");
+            fails += compare_tensors(ni::silu(x), expected, 1e-5, "silu");
+        }
+        // mul
+        {
+            ni::Tensor a = load_bin(dir + "mul_a.bin");
+            ni::Tensor b = load_bin(dir + "mul_b.bin");
+            ni::Tensor expected = load_bin(dir + "mul_expected.bin");
+            fails += compare_tensors(ni::mul(a, b), expected, 1e-6, "mul");
+        }
+        // embedding (ids mirror gen_fixtures.py)
+        {
+            ni::Tensor table = load_bin(dir + "embedding_table.bin");
+            ni::Tensor expected = load_bin(dir + "embedding_expected.bin");
+            std::vector<int64_t> ids = {3, 0, 19, 7};
+            fails += compare_tensors(ni::embedding(table, ids), expected, 1e-6, "embedding");
         }
     } catch (const std::exception& e) {
         std::printf("ops_parity: exception: %s\n", e.what());

@@ -76,6 +76,33 @@ def main() -> None:
     save_bin(out / "add_b.bin", pb)
     save_bin(out / "add_expected.bin", pa + pb)
 
+    # linear: y = x @ w.T + bias  (nn.Linear weight layout [out, in])
+    lx = rng.standard_normal((4, 8)).astype(np.float32)
+    lw = rng.standard_normal((6, 8)).astype(np.float32)
+    lb = rng.standard_normal((6,)).astype(np.float32)
+    save_bin(out / "linear_x.bin", lx)
+    save_bin(out / "linear_w.bin", lw)
+    save_bin(out / "linear_bias.bin", lb)
+    save_bin(out / "linear_expected.bin", lx.astype(np.float64) @ lw.astype(np.float64).T + lb)
+
+    # silu: x * sigmoid(x)
+    ux = rng.standard_normal((4, 8)).astype(np.float32)
+    save_bin(out / "silu_x.bin", ux)
+    save_bin(out / "silu_expected.bin", ux / (1.0 + np.exp(-ux.astype(np.float64))))
+
+    # mul: elementwise
+    ma = rng.standard_normal((3, 4)).astype(np.float32)
+    mb = rng.standard_normal((3, 4)).astype(np.float32)
+    save_bin(out / "mul_a.bin", ma)
+    save_bin(out / "mul_b.bin", mb)
+    save_bin(out / "mul_expected.bin", ma * mb)
+
+    # embedding: table[ids]; ids fixed and mirrored in ops_parity.cpp
+    etable = rng.standard_normal((20, 5)).astype(np.float32)
+    eids = [3, 0, 19, 7]
+    save_bin(out / "embedding_table.bin", etable)
+    save_bin(out / "embedding_expected.bin", etable[eids])
+
     print(f"wrote fixtures to {out}")
 
 
