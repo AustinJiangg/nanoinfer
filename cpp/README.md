@@ -100,31 +100,39 @@ the full recompute and ~7× faster.
 ## Performance (C5: SIMD + threads)
 
 The hot kernels (`linear`, the quant linears, attention) reduce through the AVX2/FMA
-dot products in `simd.hpp` and parallelize over output channels / heads with OpenMP.
-Both choices are deliberately **parity-preserving**: the SIMD path accumulates in
-`double` (it only re-associates the sum), and threading splits *output channels* so
-each output is one thread's complete reduction. The logits are therefore unchanged —
-still `max|diff| 4.24e-5` vs nanoinfer, greedy still token-for-token — while the
-engine gets much faster. `run_bench`, Qwen2.5-0.5B, 20-core CPU, prefill 128 / decode 32:
+dot products in `simd.hpp`, parallelize over output channels / heads with OpenMP, and
+keep the **row loop innermost** so each weight row is loaded once and reused across all
+prefill rows — streamed once per call, not once per row. All three are deliberately
+**parity-preserving**: the SIMD path accumulates in `double` (it only re-associates the
+sum) and threading splits *output channels*, so each output is one thread's complete
+reduction. The logits are therefore unchanged — still `max|diff| 4.24e-5` vs nanoinfer,
+greedy still token-for-token — while the engine gets much faster. `run_bench`,
+Qwen2.5-0.5B, 20-core CPU:
 
-| build (fp32)                | prefill tok/s | decode tok/s |
-| --------------------------- | ------------- | ------------ |
-| scalar + serial (pre-C5)    | 4.9           | 4.0          |
-| AVX2+FMA, 1 thread          | 11.9  (2.4×)  | 6.4  (1.6×)  |
-| AVX2+FMA, 20 threads        | 37.3  (7.6×)  | 8.6  (2.1×)  |
+| build (fp32, prefill 128 / decode 32)   | prefill tok/s | decode tok/s |
+| --------------------------------------- | ------------- | ------------ |
+| scalar + serial (pre-C5)                | 4.9           | 4.0          |
+| C5: AVX2/FMA + OpenMP + weight reuse     | 81   (≈16×)   | 8.6  (2.1×)  |
 
-The gap between the two columns is the roofline. **Prefill is compute-bound** (the
-weight is reused across all 128 rows), so SIMD *and* cores both pay off → 7.6×.
-**Decode is memory-bound** (one new token, so every weight is streamed once and used
-once), so it saturates memory bandwidth quickly — extra cores can't beat the wall,
-and the win is only ~2×. That wall is exactly what weight quantization (C4) attacks:
-q8 streams a quarter of the bytes, so q8 decode (10.0 tok/s) overtakes fp32 (8.6),
-even though q8 *prefill* is slower (the int8→float widening adds compute that the
-reused-weight regime can't hide — weight-only quant saves memory, not compute).
+Three compounding levers act on **prefill**: SIMD (~2.4× single-thread), cores, and —
+the big one — streaming each weight *once* instead of once-per-row. The last shows up
+in the per-token cost: before the weight-reuse fix, prefill got *more* expensive per
+token as the prompt grew (≈30→34 ms/tok at 64→256 tokens, because every row re-read the
+whole weight matrix); after, it *drops* and flattens (≈14→12 ms/tok), the weight read
+amortized across rows. Prefill is now compute-bound.
 
-A NEON path slots into `simd.hpp` at the marked `#elif`; float32-accumulation (the
-further, lossy step llama.cpp takes) is left out on purpose — it would break the
-parity floor this project is built around.
+**Decode stays memory-bound** and gets only the SIMD + threads ≈2.1×: it processes one
+new token, so every weight is streamed once and used once — there is no row dimension to
+amortize over, and extra cores just hit the memory-bandwidth wall. That wall is exactly
+what weight quantization (C4) attacks: q8 streams a quarter of the bytes, so q8 decode
+(10.0 tok/s) overtakes fp32 (8.6) — even though q8 *prefill* is slower, since the
+int8→float widening adds compute the now-compute-bound prefill can't hide (weight-only
+quant saves memory, not compute).
+
+Deliberately left out: a NEON path (slots into `simd.hpp` at the marked `#elif`),
+float32-accumulation (the further, lossy step llama.cpp takes — it would break the
+parity floor), and a SIMD nibble-unpack for q4/q4g (would only help compute-bound q4
+prefill, an uncommon path).
 
 ## Status
 
@@ -136,5 +144,6 @@ parity floor this project is built around.
       group-wise int4 (Q4_0-style), behind a QuantizedWeight interface. (Optional
       extension: quantize the embedding/lm_head too, for more overall savings.)
 - [x] **C5** — SIMD (AVX2/FMA double-accum dot, scalar fallback) + OpenMP threads
-      over output channels/heads. Parity-preserving: logits unchanged (4.24e-5 vs
-      nanoinfer, greedy token-for-token); ~7.6× prefill, ~2.1× decode on 20 cores.
+      over output channels/heads + once-per-call weight streaming (row loop inner).
+      Parity-preserving: logits unchanged (4.24e-5 vs nanoinfer, greedy
+      token-for-token); ~16× prefill, ~2.1× decode (memory-bound) on 20 cores.

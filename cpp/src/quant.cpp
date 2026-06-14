@@ -109,23 +109,23 @@ Tensor linear_q8(const Tensor& x, const QTensor& w, const Tensor* bias) {
 
     const int64_t m = x.size(0), in = w.in, out = w.out;
     Tensor y({m, out});
+    const float* xp = x.data();
     const int8_t* qp = w.q.data();
     const float* sp = w.scale.data();
     const float* bp = bias ? bias->data() : nullptr;
-    for (int64_t i = 0; i < m; ++i) {
-        const float* xr = x.data() + i * in;
-        float* yr = y.data() + i * out;
-        // Threaded over output channels (bit-identical to serial); dot_qf32
-        // vectorizes the int8×fp32 inner product, accumulating in double.
+    float* yp = y.data();
+    // Output-channel parallel, row loop inner so each weight row streams once per
+    // call, not once per row (see linear() in ops.cpp). dot_qf32 vectorizes the
+    // int8×fp32 inner product in double; the per-row scale is applied once.
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(static) if (out >= kParallelMinRows)
 #endif
-        for (int64_t o = 0; o < out; ++o) {
-            // Per-row scale applied once, after the inner product.
-            double acc = simd::dot_qf32(xr, qp + o * in, in) * double(sp[o]);
-            if (bp) acc += double(bp[o]);
-            yr[o] = float(acc);
-        }
+    for (int64_t o = 0; o < out; ++o) {
+        const int8_t* qr = qp + o * in;
+        const double scale = double(sp[o]);
+        const double b = bp ? double(bp[o]) : 0.0;
+        for (int64_t i = 0; i < m; ++i)
+            yp[i * out + o] = float(simd::dot_qf32(xp + i * in, qr, in) * scale + b);
     }
     return y;
 }
@@ -173,24 +173,26 @@ Tensor linear_q4(const Tensor& x, const Q4Tensor& w, const Tensor* bias) {
 
     const int64_t m = x.size(0), in = w.in, out = w.out, row_bytes = q4_row_bytes(in);
     Tensor y({m, out});
+    const float* xp = x.data();
     const uint8_t* qp = w.q.data();
     const float* sp = w.scale.data();
     const float* bp = bias ? bias->data() : nullptr;
-    for (int64_t i = 0; i < m; ++i) {
-        const float* xr = x.data() + i * in;
-        float* yr = y.data() + i * out;
-        // Threaded over output channels (bit-identical to serial). The packed
-        // nibble unpack stays scalar — threading is the win that matters here.
+    float* yp = y.data();
+    // Output-channel parallel, row loop inner so the packed weight row streams once
+    // per call (see linear()). The nibble unpack stays scalar — threading + weight
+    // reuse are the wins; SIMD unpack would help only compute-bound q4 prefill.
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(static) if (out >= kParallelMinRows)
 #endif
-        for (int64_t o = 0; o < out; ++o) {
-            const uint8_t* row = qp + o * row_bytes;
+    for (int64_t o = 0; o < out; ++o) {
+        const uint8_t* row = qp + o * row_bytes;
+        const double scale = double(sp[o]);
+        const double b = bp ? double(bp[o]) : 0.0;
+        for (int64_t i = 0; i < m; ++i) {
+            const float* xr = xp + i * in;
             double acc = 0.0;
             for (int64_t j = 0; j < in; ++j) acc += double(xr[j]) * q4_code(row, j);
-            acc = acc * double(sp[o]);
-            if (bp) acc += double(bp[o]);
-            yr[o] = float(acc);
+            yp[i * out + o] = float(acc * scale + b);
         }
     }
     return y;
@@ -247,28 +249,31 @@ Tensor linear_q4g(const Tensor& x, const Q4GTensor& w, const Tensor* bias) {
     const int64_t m = x.size(0), in = w.in, out = w.out;
     const int64_t row_bytes = q4_row_bytes(in), blocks = n_blocks(in, w.group);
     Tensor y({m, out});
+    const float* xp = x.data();
     const uint8_t* qp = w.q.data();
     const float* sp = w.scale.data();
     const float* bp = bias ? bias->data() : nullptr;
-    for (int64_t i = 0; i < m; ++i) {
-        const float* xr = x.data() + i * in;
-        float* yr = y.data() + i * out;
-        // Threaded over output channels (bit-identical to serial).
+    float* yp = y.data();
+    // Output-channel parallel, row loop inner so the packed weight row streams once
+    // per call (see linear()).
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(static) if (out >= kParallelMinRows)
 #endif
-        for (int64_t o = 0; o < out; ++o) {
-            const uint8_t* row = qp + o * row_bytes;
+    for (int64_t o = 0; o < out; ++o) {
+        const uint8_t* row = qp + o * row_bytes;
+        const float* srow = sp + o * blocks;
+        const double bias_o = bp ? double(bp[o]) : 0.0;
+        for (int64_t i = 0; i < m; ++i) {
+            const float* xr = xp + i * in;
             double acc = 0.0;
             // The scale varies per block, so apply it to each block's partial sum.
-            for (int64_t b = 0; b < blocks; ++b) {
-                const int64_t j0 = b * w.group, j1 = std::min(j0 + w.group, in);
+            for (int64_t bk = 0; bk < blocks; ++bk) {
+                const int64_t j0 = bk * w.group, j1 = std::min(j0 + w.group, in);
                 double bsum = 0.0;
                 for (int64_t j = j0; j < j1; ++j) bsum += double(xr[j]) * q4_code(row, j);
-                acc += bsum * double(sp[o * blocks + b]);
+                acc += bsum * double(srow[bk]);
             }
-            if (bp) acc += double(bp[o]);
-            yr[o] = float(acc);
+            yp[i * out + o] = float(acc + bias_o);
         }
     }
     return y;

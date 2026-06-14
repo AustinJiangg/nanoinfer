@@ -47,22 +47,23 @@ Tensor linear(const Tensor& x, const Tensor& weight, const Tensor* bias) {
     if (bias) require(bias->numel() == out, "linear: bias must match out-features");
 
     Tensor y({m, out});
+    const float* xp = x.data();
     const float* wp = weight.data();
     const float* bp = bias ? bias->data() : nullptr;
-    for (int64_t i = 0; i < m; ++i) {
-        const float* xr = x.data() + i * in;
-        float* yr = y.data() + i * out;
-        // Threaded over output channels: each output o is computed in full by one
-        // thread (no shared accumulator), so the result is identical to the serial
-        // reduction. dot_f32 vectorizes the inner product, accumulating in double.
+    float* yp = y.data();
+    // Parallelize over output channels (each output is one thread's full reduction,
+    // so the result is identical to serial). The row loop is INNER on purpose:
+    // weight row o is loaded once and reused across all m rows, so the weight matrix
+    // is streamed once per call instead of once per row — that is the difference
+    // between memory-bound and compute-bound prefill. Decode is m=1, so unaffected.
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(static) if (out >= kParallelMinRows)
 #endif
-        for (int64_t o = 0; o < out; ++o) {
-            double acc = simd::dot_f32(xr, wp + o * in, in);  // row o = output o's weights
-            if (bp) acc += double(bp[o]);
-            yr[o] = float(acc);
-        }
+    for (int64_t o = 0; o < out; ++o) {
+        const float* wr = wp + o * in;  // output o's weights, reused across rows
+        const double b = bp ? double(bp[o]) : 0.0;
+        for (int64_t i = 0; i < m; ++i)
+            yp[i * out + o] = float(simd::dot_f32(xp + i * in, wr, in) + b);
     }
     return y;
 }
