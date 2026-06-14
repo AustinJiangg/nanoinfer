@@ -8,6 +8,9 @@ namespace ni {
 
 std::vector<int64_t> generate(const Model& model, const std::vector<int64_t>& prompt,
                               const GenerateConfig& cfg) {
+    cfg.params.validate();
+    if (prompt.empty()) return {};  // nothing to condition on; forward needs >=1 token
+
     std::mt19937_64 rng(cfg.seed);
     std::vector<int64_t> ids = prompt;  // running context: prompt + generated so far
     std::vector<int64_t> generated;

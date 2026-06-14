@@ -15,21 +15,7 @@
 
 #include "generate.hpp"
 #include "model.hpp"
-
-static std::vector<int64_t> read_ids(const std::string& path) {
-    std::ifstream f(path);
-    if (!f) throw std::runtime_error("cannot open " + path);
-    std::vector<int64_t> ids;
-    int64_t x;
-    while (f >> x) ids.push_back(x);
-    return ids;
-}
-
-static void print_ids(const char* label, const std::vector<int64_t>& ids) {
-    std::printf("%s", label);
-    for (int64_t id : ids) std::printf(" %lld", (long long)id);
-    std::printf("\n");
-}
+#include "parity_util.hpp"
 
 int main(int argc, char** argv) {
     if (argc < 2) {

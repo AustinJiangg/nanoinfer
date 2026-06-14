@@ -5,6 +5,7 @@
 #include <functional>
 #include <limits>
 #include <numeric>
+#include <stdexcept>
 #include <unordered_set>
 
 namespace ni {
@@ -20,12 +21,23 @@ int64_t argmax(const std::vector<float>& v) {
 constexpr float kNegInf = -std::numeric_limits<float>::infinity();
 }  // namespace
 
+void SamplingParams::validate() const {
+    // Mirror nanoinfer.sampling.SamplingParams.__post_init__: catch the params
+    // that would otherwise divide by zero / flip the distribution mid-generation.
+    if (temperature < 0.0f)
+        throw std::invalid_argument("temperature must be >= 0");
+    if (repetition_penalty <= 0.0f)
+        throw std::invalid_argument("repetition_penalty must be > 0 (>= 1 to penalize)");
+}
+
 void apply_repetition_penalty(std::vector<float>& logits,
                               const std::vector<int64_t>& context, float penalty) {
     if (penalty == 1.0f) return;
+    const int64_t vocab = static_cast<int64_t>(logits.size());
     // Unique tokens only — penalizing a repeated context id twice would compound.
     std::unordered_set<int64_t> seen(context.begin(), context.end());
     for (int64_t id : seen) {
+        if (id < 0 || id >= vocab) continue;  // ignore out-of-range ids (no OOB write)
         float& s = logits[static_cast<size_t>(id)];
         s = (s > 0.0f) ? s / penalty : s * penalty;  // both lower the score
     }
@@ -64,17 +76,14 @@ void apply_top_p(std::vector<float>& logits, float p) {
         prob[static_cast<size_t>(i)] = e;
         denom += e;
     }
-    // Keep the smallest prefix whose cumulative prob reaches p (including the
-    // token that crosses it); drop the rest. Always keeps at least the top-1.
+    // Drop a token once the cumulative prob of everything BEFORE it already
+    // exceeds p (strict) — i.e. keep the token that crosses p, and always keep
+    // the top-1. `cum` is the prefix sum excluding the current token, matching
+    // nanoinfer's shifted mask (drop iff cumprob[i-1] > p) exactly.
     double cum = 0.0;
-    bool crossed = false;
     for (int64_t i = 0; i < n; ++i) {
-        if (crossed) {
-            logits[idx[i]] = kNegInf;
-            continue;
-        }
+        if (cum > p) logits[idx[i]] = kNegInf;
         cum += prob[static_cast<size_t>(i)] / denom;
-        if (cum >= p) crossed = true;  // keep this one; drop everything after
     }
 }
 

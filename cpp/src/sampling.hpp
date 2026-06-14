@@ -5,9 +5,11 @@
 // then temperature -> top-k -> top-p -> softmax -> a categorical draw. Operates on
 // a 1-D logits vector for the current position.
 //
-// The draw uses a std::mt19937_64 the caller seeds, so sampling is reproducible —
-// but the RNG differs from torch, so sampled output is NOT token-identical to the
-// Python engine (greedy decoding is, and that's what the parity test checks).
+// The draw uses a std::mt19937_64 the caller seeds, so sampling is reproducible
+// within a single libstdc++ build — but the RNG (and std::discrete_distribution's
+// consumption of it) differs from torch and across stdlib implementations, so
+// sampled output is NOT token-identical to the Python engine or portable across
+// platforms. Greedy decoding IS deterministic and matches Python (the parity test).
 #pragma once
 
 #include <cstdint>
@@ -23,6 +25,10 @@ struct SamplingParams {
     float repetition_penalty = 1.0f;   // 1 == off; > 1 discourages seen tokens
 
     bool greedy() const { return temperature == 0.0f; }
+
+    // Throws std::invalid_argument on params that would misbehave (negative
+    // temperature, non-positive repetition_penalty). Called once in generate().
+    void validate() const;
 };
 
 // In-place logit transforms (each a no-op at its "off" value).

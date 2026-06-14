@@ -15,16 +15,8 @@
 #include <vector>
 
 #include "model.hpp"
+#include "parity_util.hpp"
 #include "serialize.hpp"
-
-static std::vector<int64_t> read_ids(const std::string& path) {
-    std::ifstream f(path);
-    if (!f) throw std::runtime_error("cannot open " + path);
-    std::vector<int64_t> ids;
-    int64_t x;
-    while (f >> x) ids.push_back(x);
-    return ids;
-}
 
 static int64_t argmax_row(const ni::Tensor& t, int64_t row, int64_t vocab) {
     int64_t best = 0;

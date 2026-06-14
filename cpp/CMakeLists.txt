@@ -57,6 +57,8 @@ set_tests_properties(ops_parity PROPERTIES FIXTURES_REQUIRED fixtures)
 # export + a reference dump first (see the file headers).
 add_executable(run_parity tests/run_parity.cpp)
 target_link_libraries(run_parity PRIVATE nicore)
+target_include_directories(run_parity PRIVATE tests)
 
 add_executable(run_generate tests/run_generate.cpp)
 target_link_libraries(run_generate PRIVATE nicore)
+target_include_directories(run_generate PRIVATE tests)
