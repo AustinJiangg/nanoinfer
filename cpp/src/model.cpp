@@ -10,7 +10,17 @@ namespace fs = std::filesystem;
 
 namespace ni {
 
-Model::Model(const std::string& weights_dir) {
+namespace {
+// The per-layer projection weights (q/k/v/o/gate/up/down) — "layers.N.*_proj.weight".
+// These are the bulk of the model and what we quantize; embed/lm_head/norms stay fp32.
+bool is_layer_proj(const std::string& name) {
+    const std::string suffix = "_proj.weight";
+    return name.rfind("layers.", 0) == 0 && name.size() > suffix.size() &&
+           name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+}  // namespace
+
+Model::Model(const std::string& weights_dir, bool quantize) {
     cfg_ = load_config(weights_dir + "/config.txt");
     for (const auto& entry : fs::directory_iterator(weights_dir)) {
         const fs::path& p = entry.path();
@@ -24,10 +34,41 @@ Model::Model(const std::string& weights_dir) {
 
     // Build the RoPE tables once for the full context; forward slices them.
     rope_ = build_rope_cache(cfg_.max_position_embeddings, cfg_.head_dim, cfg_.rope_theta);
+
+    if (quantize) {
+        std::vector<std::string> names;
+        for (const auto& kv : w_)
+            if (is_layer_proj(kv.first)) names.push_back(kv.first);
+        for (const std::string& n : names) {
+            qw_.emplace(n, quantize_q8(w_.at(n)));
+            w_.erase(n);  // free the fp32 copy — the int8 is the live weight now
+        }
+    }
 }
 
 KVCache Model::make_cache(int64_t max_seq) const {
     return KVCache(cfg_.num_layers, cfg_.num_kv_heads, cfg_.head_dim, max_seq);
+}
+
+Tensor Model::project(const Tensor& x, const std::string& name, const Tensor* bias) const {
+    auto it = qw_.find(name);
+    if (it != qw_.end()) return linear_q8(x, it->second, bias);
+    return linear(x, W(name), bias);
+}
+
+std::pair<int64_t, int64_t> Model::weight_bytes() const {
+    int64_t actual = 0, fp32 = 0;
+    for (const auto& kv : w_) {
+        const int64_t n = kv.second.numel();
+        actual += n * 4;
+        fp32 += n * 4;
+    }
+    for (const auto& kv : qw_) {
+        const QTensor& q = kv.second;
+        actual += static_cast<int64_t>(q.q.size()) + static_cast<int64_t>(q.scale.size()) * 4;
+        fp32 += q.out * q.in * 4;
+    }
+    return {actual, fp32};
 }
 
 const Tensor& Model::W(const std::string& name) const {
@@ -55,9 +96,9 @@ Tensor Model::forward(const std::vector<int64_t>& ids, KVCache* cache) const {
 
         // --- attention (pre-norm + residual) ---
         Tensor h = rmsnorm(x, W(L + "input_layernorm.weight"), eps);
-        Tensor q = linear(h, W(L + "self_attn.q_proj.weight"), &W(L + "self_attn.q_proj.bias"));
-        Tensor k = linear(h, W(L + "self_attn.k_proj.weight"), &W(L + "self_attn.k_proj.bias"));
-        Tensor v = linear(h, W(L + "self_attn.v_proj.weight"), &W(L + "self_attn.v_proj.bias"));
+        Tensor q = project(h, L + "self_attn.q_proj.weight", &W(L + "self_attn.q_proj.bias"));
+        Tensor k = project(h, L + "self_attn.k_proj.weight", &W(L + "self_attn.k_proj.bias"));
+        Tensor v = project(h, L + "self_attn.v_proj.weight", &W(L + "self_attn.v_proj.bias"));
 
         q = split_heads(q, cfg_.num_attention_heads, cfg_.head_dim);
         k = split_heads(k, cfg_.num_kv_heads, cfg_.head_dim);
@@ -77,15 +118,15 @@ Tensor Model::forward(const std::vector<int64_t>& ids, KVCache* cache) const {
         v = repeat_kv(v, cfg_.n_rep());
 
         Tensor a = attention(q, k, v, /*causal=*/true, /*query_offset=*/start_pos);
-        a = merge_heads(a);                               // [seq, n_heads*head_dim]
-        a = linear(a, W(L + "self_attn.o_proj.weight"));  // o_proj has no bias
+        a = merge_heads(a);                                 // [seq, n_heads*head_dim]
+        a = project(a, L + "self_attn.o_proj.weight", nullptr);  // o_proj has no bias
         x = add(x, a);
 
         // --- SwiGLU MLP (pre-norm + residual) ---
         Tensor hm = rmsnorm(x, W(L + "post_attention_layernorm.weight"), eps);
-        Tensor gate = silu(linear(hm, W(L + "mlp.gate_proj.weight")));
-        Tensor up = linear(hm, W(L + "mlp.up_proj.weight"));
-        Tensor down = linear(mul(gate, up), W(L + "mlp.down_proj.weight"));
+        Tensor gate = silu(project(hm, L + "mlp.gate_proj.weight", nullptr));
+        Tensor up = project(hm, L + "mlp.up_proj.weight", nullptr);
+        Tensor down = project(mul(gate, up), L + "mlp.down_proj.weight", nullptr);
         x = add(x, down);
     }
 

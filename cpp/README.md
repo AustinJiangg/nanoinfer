@@ -61,6 +61,8 @@ python tools/dump_reference.py  weights/qwen2.5-0.5b "The capital of France is"
 ./build/run_generate weights/qwen2.5-0.5b
 # 3c. cached forward == uncached full recompute (bit-identical)
 ./build/run_cache weights/qwen2.5-0.5b
+# 3d. run with Q8 weight quantization; report memory + accuracy vs fp32
+./build/run_quant weights/qwen2.5-0.5b
 ```
 
 The C++ logits match nanoinfer to ~4e-5 max abs diff (float accumulation order),
@@ -75,5 +77,6 @@ the full recompute and ~7× faster.
 - [x] **C1** — Qwen2.5 forward pass; NIT0 weight export, logit parity vs nanoinfer
 - [x] **C2** — sampling + generate loop; greedy generation matches nanoinfer token-for-token
 - [x] **C3** — KV cache (prefill/decode); bit-identical to full recompute, ~7× faster
-- [ ] **C4** — quantization (Q8/Q4)
+- [~] **C4** — quantization: Q8 weight-only (per-channel int8) landed — layer weights
+      4× smaller, next-token preserved, greedy 11/12 vs fp32; Q4 + group-wise + embedding next
 - [ ] **C5** — SIMD / multithreading
