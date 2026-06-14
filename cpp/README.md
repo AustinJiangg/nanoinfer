@@ -61,9 +61,15 @@ python tools/dump_reference.py  weights/qwen2.5-0.5b "The capital of France is"
 ./build/run_generate weights/qwen2.5-0.5b
 # 3c. cached forward == uncached full recompute (bit-identical)
 ./build/run_cache weights/qwen2.5-0.5b
-# 3d. run with Q8 weight quantization; report memory + accuracy vs fp32
-./build/run_quant weights/qwen2.5-0.5b
+# 3d. run quantized; report memory + accuracy vs fp32 (q8 default, or q4)
+./build/run_quant weights/qwen2.5-0.5b q8
+./build/run_quant weights/qwen2.5-0.5b q4
 ```
+
+Q8 preserves the greedy next token (11/12 vs fp32). Naive per-channel **Q4 is too
+coarse** — one scale per row can't absorb weight outliers, so the model's output
+changes (next-token not preserved). That's the motivation for group-wise quant
+(llama.cpp's Q4_0 uses per-32-element blocks), the next step.
 
 The C++ logits match nanoinfer to ~4e-5 max abs diff (float accumulation order),
 argmax token-for-token. Greedy generation matches nanoinfer exactly — e.g. "The
@@ -77,6 +83,7 @@ the full recompute and ~7× faster.
 - [x] **C1** — Qwen2.5 forward pass; NIT0 weight export, logit parity vs nanoinfer
 - [x] **C2** — sampling + generate loop; greedy generation matches nanoinfer token-for-token
 - [x] **C3** — KV cache (prefill/decode); bit-identical to full recompute, ~7× faster
-- [~] **C4** — quantization: Q8 weight-only (per-channel int8) landed — layer weights
-      4× smaller, next-token preserved, greedy 11/12 vs fp32; Q4 + group-wise + embedding next
+- [~] **C4** — quantization (weight-only, per-channel): Q8 int8 (layer weights 4×,
+      next-token preserved) + Q4 int4 (8×, but too coarse — motivates group-wise);
+      group-wise (Q4_0-style) + embedding quantization next
 - [ ] **C5** — SIMD / multithreading

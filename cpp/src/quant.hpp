@@ -41,4 +41,18 @@ Tensor dequantize_q8(const QTensor& w);
 // runs over the int8 codes; the per-row scale is applied once at the end.
 Tensor linear_q8(const Tensor& x, const QTensor& w, const Tensor* bias = nullptr);
 
+// An int4-quantized [out, in] weight (Q4): codes in [-7, 7] packed two per byte
+// (each stored as code+8, a nibble in [1, 15]), per row, plus one fp32 scale per
+// output row. ~8x smaller than fp32; ~18x coarser per weight than Q8.
+struct Q4Tensor {
+    std::vector<uint8_t> q;    // [out * ceil(in/2)] packed nibbles
+    std::vector<float> scale;  // [out]
+    int64_t out = 0;
+    int64_t in = 0;
+};
+
+Q4Tensor quantize_q4(const Tensor& w);
+Tensor dequantize_q4(const Q4Tensor& w);
+Tensor linear_q4(const Tensor& x, const Q4Tensor& w, const Tensor* bias = nullptr);
+
 }  // namespace ni

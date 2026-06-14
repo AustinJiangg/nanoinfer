@@ -20,7 +20,7 @@ bool is_layer_proj(const std::string& name) {
 }
 }  // namespace
 
-Model::Model(const std::string& weights_dir, bool quantize) {
+Model::Model(const std::string& weights_dir, QuantMode mode) {
     cfg_ = load_config(weights_dir + "/config.txt");
     for (const auto& entry : fs::directory_iterator(weights_dir)) {
         const fs::path& p = entry.path();
@@ -35,13 +35,14 @@ Model::Model(const std::string& weights_dir, bool quantize) {
     // Build the RoPE tables once for the full context; forward slices them.
     rope_ = build_rope_cache(cfg_.max_position_embeddings, cfg_.head_dim, cfg_.rope_theta);
 
-    if (quantize) {
+    if (mode != QuantMode::None) {
         std::vector<std::string> names;
         for (const auto& kv : w_)
             if (is_layer_proj(kv.first)) names.push_back(kv.first);
         for (const std::string& n : names) {
-            qw_.emplace(n, quantize_q8(w_.at(n)));
-            w_.erase(n);  // free the fp32 copy — the int8 is the live weight now
+            if (mode == QuantMode::Q8) qw8_.emplace(n, quantize_q8(w_.at(n)));
+            else qw4_.emplace(n, quantize_q4(w_.at(n)));
+            w_.erase(n);  // free the fp32 copy — the quantized weight is live now
         }
     }
 }
@@ -51,8 +52,10 @@ KVCache Model::make_cache(int64_t max_seq) const {
 }
 
 Tensor Model::project(const Tensor& x, const std::string& name, const Tensor* bias) const {
-    auto it = qw_.find(name);
-    if (it != qw_.end()) return linear_q8(x, it->second, bias);
+    auto it8 = qw8_.find(name);
+    if (it8 != qw8_.end()) return linear_q8(x, it8->second, bias);
+    auto it4 = qw4_.find(name);
+    if (it4 != qw4_.end()) return linear_q4(x, it4->second, bias);
     return linear(x, W(name), bias);
 }
 
@@ -63,8 +66,13 @@ std::pair<int64_t, int64_t> Model::weight_bytes() const {
         actual += n * 4;
         fp32 += n * 4;
     }
-    for (const auto& kv : qw_) {
+    for (const auto& kv : qw8_) {
         const QTensor& q = kv.second;
+        actual += static_cast<int64_t>(q.q.size()) + static_cast<int64_t>(q.scale.size()) * 4;
+        fp32 += q.out * q.in * 4;
+    }
+    for (const auto& kv : qw4_) {
+        const Q4Tensor& q = kv.second;
         actual += static_cast<int64_t>(q.q.size()) + static_cast<int64_t>(q.scale.size()) * 4;
         fp32 += q.out * q.in * 4;
     }

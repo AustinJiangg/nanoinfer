@@ -94,6 +94,56 @@ int main() {
         CHECK_CLOSE(dq.at(0, 1), 0.0, 1e-12);
     }
 
+    // --- Q4 (int4) ---
+
+    // Q4 error is bounded by half a step (scale_o/2 = absmax_o/14) per weight,
+    // and dequant round-trips the packed nibbles.
+    {
+        std::mt19937_64 rng(3);
+        std::normal_distribution<float> nd(0.0f, 2.0f);
+        Tensor w({6, 24});
+        for (int64_t i = 0; i < w.numel(); ++i) w[i] = nd(rng);
+        ni::Q4Tensor q = ni::quantize_q4(w);
+        Tensor dq = ni::dequantize_q4(q);
+        for (int64_t o = 0; o < 6; ++o) {
+            const double bound = q.scale[static_cast<size_t>(o)] / 2.0 + 1e-6;
+            for (int64_t j = 0; j < 24; ++j)
+                CHECK(std::fabs(double(dq.at(o, j)) - w.at(o, j)) <= bound);
+        }
+    }
+
+    // linear_q4(x, q) == linear(x, dequant(q)) with and without bias.
+    {
+        std::mt19937_64 rng(4);
+        std::normal_distribution<float> nd;
+        Tensor x({3, 20}), w({5, 20}), bias({5});
+        for (int64_t i = 0; i < x.numel(); ++i) x[i] = nd(rng);
+        for (int64_t i = 0; i < w.numel(); ++i) w[i] = nd(rng);
+        for (int64_t i = 0; i < bias.numel(); ++i) bias[i] = nd(rng);
+        ni::Q4Tensor q = ni::quantize_q4(w);
+        Tensor dq = ni::dequantize_q4(q);
+        Tensor refb = ni::linear(x, dq, &bias);
+        Tensor gotb = ni::linear_q4(x, q, &bias);
+        Tensor refn = ni::linear(x, dq);
+        Tensor gotn = ni::linear_q4(x, q);
+        for (int64_t i = 0; i < refb.numel(); ++i) {
+            CHECK_CLOSE(gotb[i], refb[i], 1e-4);
+            CHECK_CLOSE(gotn[i], refn[i], 1e-4);
+        }
+    }
+
+    // Odd in-features: the last byte uses only its low nibble; round-trip holds.
+    {
+        Tensor w = make({2, 3}, {1, -2, 4, 7, 0, -7});
+        ni::Q4Tensor q = ni::quantize_q4(w);
+        CHECK(q.q.size() == static_cast<size_t>(2 * 2));  // 2 rows * ceil(3/2)=2 bytes
+        Tensor dq = ni::dequantize_q4(q);
+        for (int64_t o = 0; o < 2; ++o)
+            for (int64_t j = 0; j < 3; ++j)
+                CHECK(std::fabs(double(dq.at(o, j)) - w.at(o, j)) <=
+                      q.scale[static_cast<size_t>(o)] / 2.0 + 1e-6);
+    }
+
     std::printf(g_failures ? "test_quant: %d failures\n" : "test_quant: ok\n", g_failures);
     return g_failures ? 1 : 0;
 }
