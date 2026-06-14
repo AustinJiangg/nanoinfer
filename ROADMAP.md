@@ -56,8 +56,41 @@ contiguous-memory requirement. Enables high memory utilization.
 - [ ] Optional: a fused kernel (Triton) for attention or RMSNorm
 - [ ] Benchmark memory + throughput tradeoffs
 
+---
+
+# C++ track (`cpp/`)
+
+A second engine, written from scratch in C++, for the low-level / kernel side.
+The **Python engine is frozen at stage 2 and serves as the reference oracle** —
+every C++ stage is parity-tested against it (and numpy), the same discipline as
+Python-vs-HuggingFace. Target model is the same: **Qwen2.5-0.5B**.
+
+The Python roadmap (stages 3–4 above) is the *serving* layer (vLLM direction);
+the C++ track is the *compute/kernel* layer (llama.cpp direction). They are two
+layers, not a fork — they merge in the fusion stages below.
+
+Build sequence: **pure C++ core first** (no Python in the hot path), then expose
+it via pybind11 and rebuild the serving layer in Python on top of our own kernels
+— the vLLM shape (Python orchestration + C++ kernels). Keep the C++ core's public
+API simple/C-style so the later binding is cheap.
+
+## Pure C++ core
+- [x] **C0** — Tensor + ops (matmul/rmsnorm/softmax/add), CMake, numpy parity
+- [ ] **C1** — Qwen2.5 forward pass; export nanoinfer weights (NIT0), parity per layer
+- [ ] **C2** — sampling (temperature / top-k / top-p / repetition penalty)
+- [ ] **C3** — KV cache (prefill / decode split)
+- [ ] **C4** — quantization (Q8/Q4 weight-only, dequant on the fly) ← new math, derive first
+- [ ] **C5** — SIMD (AVX2/NEON) + multithreading (OpenMP) ← the performance well
+
+## Fusion (→ mini-vLLM)
+- [ ] **F6** — pybind11: expose the C++ core to Python
+- [ ] **F7** — Python serving layer: scheduler + continuous batching over C++ kernels
+- [ ] **F8** — paged attention (C++ kernel + Python block scheduler) — the merge point
+
 ## Reference reading
 - PagedAttention / vLLM paper — KV memory management
 - RadixAttention / SGLang — prefix sharing
 - FlashAttention — IO-aware exact attention
 - The annotated Llama / nanoGPT — minimal architectures
+- Karpathy's llama2.c — single-file C Llama2 inference (blueprint for C0–C2)
+- ggml / llama.cpp — CPU kernels, quantization formats (GGUF)
