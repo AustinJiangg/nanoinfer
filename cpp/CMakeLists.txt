@@ -27,6 +27,11 @@ target_link_libraries(test_ops PRIVATE nicore)
 target_include_directories(test_ops PRIVATE tests)
 add_test(NAME test_ops COMMAND test_ops)
 
+add_executable(test_io tests/test_io.cpp)
+target_link_libraries(test_io PRIVATE nicore)
+target_include_directories(test_io PRIVATE tests)
+add_test(NAME test_io COMMAND test_io)
+
 # numpy parity: a setup test generates fixtures, then ops_parity checks against them.
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_executable(ops_parity tests/ops_parity.cpp)

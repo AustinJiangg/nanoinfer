@@ -70,7 +70,10 @@ Tensor Model::forward(const std::vector<int64_t>& ids) const {
     }
 
     x = rmsnorm(x, W("norm.weight"), eps);
-    return linear(x, W("lm_head.weight"));  // [seq, vocab]
+    // Tied models share the embedding as the output projection, so the exporter
+    // skips the duplicate lm_head.weight; fall back to embed_tokens here.
+    const std::string lm = cfg_.tie_word_embeddings ? "embed_tokens.weight" : "lm_head.weight";
+    return linear(x, W(lm));  // [seq, vocab]
 }
 
 }  // namespace ni

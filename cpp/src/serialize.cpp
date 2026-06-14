@@ -24,12 +24,18 @@ Tensor load_bin(const std::string& path) {
     for (int32_t i = 0; i < ndim; ++i) {
         int32_t d = 0;
         f.read(reinterpret_cast<char*>(&d), sizeof(d));
+        if (d < 0) throw std::runtime_error("load_bin: negative shape dim in " + path);
         shape[i] = d;
     }
 
     Tensor t(shape);
-    f.read(reinterpret_cast<char*>(t.data()), t.numel() * static_cast<int64_t>(sizeof(float)));
-    if (!f) throw std::runtime_error("load_bin: short read in " + path);
+    const std::streamsize need = t.numel() * static_cast<std::streamsize>(sizeof(float));
+    f.read(reinterpret_cast<char*>(t.data()), need);
+    if (!f || f.gcount() != need) throw std::runtime_error("load_bin: short read in " + path);
+    // Reject a file longer than its declared shape — a truncated/corrupt header
+    // (or a wrong, smaller shape) would otherwise read silently as wrong data.
+    if (f.peek() != std::char_traits<char>::eof())
+        throw std::runtime_error("load_bin: trailing bytes (shape/data mismatch) in " + path);
     return t;
 }
 

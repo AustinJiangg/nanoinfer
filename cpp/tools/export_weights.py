@@ -48,6 +48,11 @@ def main() -> None:
     for name, t in sd.items():
         if name.startswith("rope_"):  # non-persistent buffers; skip if ever present
             continue
+        # Tied models alias lm_head to the embedding — don't write it twice (~0.5 GB).
+        # The C++ Model reads the tie flag and reuses embed_tokens for the lm_head.
+        if name == "lm_head.weight" and cfg.tie_word_embeddings:
+            continue
+        assert t.dtype == torch.float32, f"{name} is {t.dtype}, expected float32"
         save_bin(out / f"{name}.bin", t.detach().cpu().numpy())
         count += 1
     print(f"wrote {count} weight tensors + config.txt to {out}")

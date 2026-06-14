@@ -18,6 +18,7 @@ struct Config {
     int64_t max_position_embeddings = 0;
     float rms_norm_eps = 1e-6f;
     float rope_theta = 10000.0f;
+    int64_t tie_word_embeddings = 0;  // 1 == lm_head shares the embedding weight
 
     // GQA: how many query heads each KV head feeds.
     int64_t n_rep() const { return num_attention_heads / num_kv_heads; }

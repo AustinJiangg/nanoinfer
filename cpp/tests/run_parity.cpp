@@ -45,6 +45,10 @@ int main(int argc, char** argv) {
     try {
         ni::Model model(dir);
         std::vector<int64_t> ids = read_ids(dir + "/ref_ids.txt");
+        if (ids.empty()) {
+            std::printf("run_parity: ref_ids.txt is empty\n");
+            return 2;
+        }
         std::printf("model: %lld layers, vocab %lld, hidden %lld; seq %zu\n",
                     (long long)model.config().num_layers, (long long)model.config().vocab_size,
                     (long long)model.config().hidden_size, ids.size());
@@ -58,7 +62,9 @@ int main(int argc, char** argv) {
         }
 
         double maxd = 0.0, sumd = 0.0;
+        bool has_nan = false;
         for (int64_t i = 0; i < logits.numel(); ++i) {
+            if (std::isnan(logits[i])) has_nan = true;
             const double d = std::fabs(double(logits[i]) - double(ref[i]));
             maxd = d > maxd ? d : maxd;
             sumd += d;
@@ -77,9 +83,10 @@ int main(int argc, char** argv) {
         std::printf("next-token argmax: cpp=%lld ref=%lld  %s\n", (long long)cpp_tok,
                     (long long)ref_tok, cpp_tok == ref_tok ? "MATCH" : "MISMATCH");
 
+        if (has_nan) std::printf("WARNING: C++ logits contain NaN\n");
         // Correctness is the argmax agreement (the tokens both engines decode);
         // the abs-diff bound is a loose guard on accumulated float drift.
-        const bool ok = (mism == 0) && (cpp_tok == ref_tok) && (maxd < 0.1);
+        const bool ok = !has_nan && (mism == 0) && (cpp_tok == ref_tok) && (maxd < 0.1);
         std::printf(ok ? "run_parity: ok\n" : "run_parity: FAIL\n");
         return ok ? 0 : 1;
     } catch (const std::exception& e) {
