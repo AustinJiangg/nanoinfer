@@ -128,6 +128,35 @@ int main() {
         CHECK_CLOSE(e.at(1, 1), 11.0, 1e-6);
     }
 
+    // rope cache: position 0 is the identity rotation (cos=1, sin=0).
+    {
+        ni::RopeCache rc = ni::build_rope_cache(/*seq=*/2, /*head_dim=*/4, /*theta=*/10000.0f);
+        CHECK(rc.cos.size(0) == 2 && rc.cos.size(1) == 4);
+        for (int64_t d = 0; d < 4; ++d) {
+            CHECK_CLOSE(rc.cos.at(0, d), 1.0, 1e-6);
+            CHECK_CLOSE(rc.sin.at(0, d), 0.0, 1e-6);
+        }
+        // The half-split duplicates each frequency: column i and i+half match.
+        CHECK_CLOSE(rc.cos.at(1, 0), rc.cos.at(1, 2), 1e-6);
+        CHECK_CLOSE(rc.sin.at(1, 1), rc.sin.at(1, 3), 1e-6);
+    }
+
+    // apply_rope: position 0 leaves the vector unchanged; rotation preserves norm.
+    {
+        ni::RopeCache rc = ni::build_rope_cache(2, 4, 10000.0f);
+        Tensor q = make({1, 2, 4}, {1, 2, 3, 4, 5, 6, 7, 8});  // [heads=1, seq=2, dim=4]
+        Tensor r = ni::apply_rope(q, rc.cos, rc.sin);
+        // pos 0 unchanged
+        for (int64_t d = 0; d < 4; ++d) CHECK_CLOSE(r.at(0, 0, d), q.at(0, 0, d), 1e-6);
+        // pos 1: norm preserved by the rotation
+        auto rownorm = [](const Tensor& t, int64_t p) {
+            double s = 0;
+            for (int64_t d = 0; d < 4; ++d) s += double(t.at(0, p, d)) * t.at(0, p, d);
+            return std::sqrt(s);
+        };
+        CHECK_CLOSE(rownorm(r, 1), rownorm(q, 1), 1e-5);
+    }
+
     std::printf(g_failures ? "test_ops: %d failures\n" : "test_ops: ok\n", g_failures);
     return g_failures ? 1 : 0;
 }

@@ -40,6 +40,21 @@ def softmax(x: np.ndarray) -> np.ndarray:
     return e / e.sum(axis=-1, keepdims=True)
 
 
+def build_rope_cache(seq_len: int, head_dim: int, theta: float):
+    # neox / half-split convention (matches nanoinfer.layers.build_rope_cache).
+    inv_freq = 1.0 / (theta ** (np.arange(0, head_dim, 2) / head_dim))  # [head_dim/2]
+    freqs = np.outer(np.arange(seq_len), inv_freq)                      # [seq, head_dim/2]
+    emb = np.concatenate([freqs, freqs], axis=-1)                       # [seq, head_dim]
+    return np.cos(emb), np.sin(emb)
+
+
+def apply_rope(x: np.ndarray, cos: np.ndarray, sin: np.ndarray) -> np.ndarray:
+    # x: [heads, seq, head_dim]; cos/sin: [seq, head_dim] broadcast over heads.
+    half = x.shape[-1] // 2
+    rot = np.concatenate([-x[..., half:], x[..., :half]], axis=-1)  # rotate_half
+    return x * cos + rot * sin
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         print("usage: gen_fixtures.py <out_dir>")
@@ -102,6 +117,15 @@ def main() -> None:
     eids = [3, 0, 19, 7]
     save_bin(out / "embedding_table.bin", etable)
     save_bin(out / "embedding_expected.bin", etable[eids])
+
+    # rope: cache (seq=4, head_dim=8, theta=10000) + apply to q [heads=2, seq=4, dim=8].
+    # ROPE_SEQ/HEAD_DIM/THETA mirror the constants in ops_parity.cpp.
+    rcos, rsin = build_rope_cache(4, 8, 10000.0)
+    save_bin(out / "rope_cos.bin", rcos)
+    save_bin(out / "rope_sin.bin", rsin)
+    rq = rng.standard_normal((2, 4, 8)).astype(np.float32)
+    save_bin(out / "rope_q.bin", rq)
+    save_bin(out / "rope_applied_expected.bin", apply_rope(rq, rcos, rsin))
 
     print(f"wrote fixtures to {out}")
 

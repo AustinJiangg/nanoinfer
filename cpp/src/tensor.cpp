@@ -31,4 +31,14 @@ float Tensor::at(int64_t i, int64_t j) const {
     return data_[i * strides_[0] + j * strides_[1]];
 }
 
+float& Tensor::at(int64_t i, int64_t j, int64_t k) {
+    assert(ndim() == 3);
+    return data_[i * strides_[0] + j * strides_[1] + k * strides_[2]];
+}
+
+float Tensor::at(int64_t i, int64_t j, int64_t k) const {
+    assert(ndim() == 3);
+    return data_[i * strides_[0] + j * strides_[1] + k * strides_[2]];
+}
+
 }  // namespace ni

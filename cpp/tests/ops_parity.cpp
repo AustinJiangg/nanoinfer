@@ -12,8 +12,11 @@
 
 using ni::load_bin;
 
-// eps used for the rmsnorm fixture — must match gen_fixtures.py.
+// Constants shared with gen_fixtures.py.
 static constexpr float kRmsEps = 1e-6f;
+static constexpr int64_t kRopeSeq = 4;
+static constexpr int64_t kRopeHeadDim = 8;
+static constexpr float kRopeTheta = 10000.0f;
 
 int main(int argc, char** argv) {
     if (argc < 2) {
@@ -78,6 +81,20 @@ int main(int argc, char** argv) {
             ni::Tensor expected = load_bin(dir + "embedding_expected.bin");
             std::vector<int64_t> ids = {3, 0, 19, 7};
             fails += compare_tensors(ni::embedding(table, ids), expected, 1e-6, "embedding");
+        }
+        // rope cache: built tables match numpy's
+        {
+            ni::RopeCache rc = ni::build_rope_cache(kRopeSeq, kRopeHeadDim, kRopeTheta);
+            fails += compare_tensors(rc.cos, load_bin(dir + "rope_cos.bin"), 1e-5, "rope_cos");
+            fails += compare_tensors(rc.sin, load_bin(dir + "rope_sin.bin"), 1e-5, "rope_sin");
+        }
+        // rope apply: use the loaded cache so this isolates apply from build
+        {
+            ni::Tensor q = load_bin(dir + "rope_q.bin");
+            ni::Tensor cos = load_bin(dir + "rope_cos.bin");
+            ni::Tensor sin = load_bin(dir + "rope_sin.bin");
+            ni::Tensor expected = load_bin(dir + "rope_applied_expected.bin");
+            fails += compare_tensors(ni::apply_rope(q, cos, sin), expected, 1e-5, "rope_apply");
         }
     } catch (const std::exception& e) {
         std::printf("ops_parity: exception: %s\n", e.what());

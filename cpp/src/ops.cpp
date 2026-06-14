@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <stdexcept>
+#include <utility>
 
 namespace ni {
 
@@ -81,6 +82,50 @@ Tensor mul(const Tensor& a, const Tensor& b) {
     require(a.shape() == b.shape(), "mul expects equally-shaped tensors");
     Tensor out(a.shape());
     for (int64_t i = 0; i < a.numel(); ++i) out[i] = a[i] * b[i];
+    return out;
+}
+
+RopeCache build_rope_cache(int64_t seq_len, int64_t head_dim, float theta) {
+    require(head_dim % 2 == 0, "rope head_dim must be even");
+    const int64_t half = head_dim / 2;
+    Tensor cos({seq_len, head_dim});
+    Tensor sin({seq_len, head_dim});
+    for (int64_t p = 0; p < seq_len; ++p) {
+        for (int64_t i = 0; i < half; ++i) {
+            // inv_freq_i = theta^(-(2i)/head_dim); angle = position * inv_freq.
+            const double inv_freq =
+                1.0 / std::pow(double(theta), double(2 * i) / double(head_dim));
+            const double angle = double(p) * inv_freq;
+            const float c = float(std::cos(angle));
+            const float s = float(std::sin(angle));
+            // Duplicate each frequency across both halves (the half-split layout).
+            cos.at(p, i) = c;
+            cos.at(p, i + half) = c;
+            sin.at(p, i) = s;
+            sin.at(p, i + half) = s;
+        }
+    }
+    return {std::move(cos), std::move(sin)};
+}
+
+Tensor apply_rope(const Tensor& x, const Tensor& cos, const Tensor& sin) {
+    require(x.ndim() == 3, "apply_rope expects [heads, seq, head_dim]");
+    const int64_t heads = x.size(0), seq = x.size(1), dim = x.size(2);
+    const int64_t half = dim / 2;
+    require(cos.ndim() == 2 && cos.size(1) == dim && cos.size(0) >= seq, "apply_rope: cos shape");
+    require(sin.ndim() == 2 && sin.size(1) == dim && sin.size(0) >= seq, "apply_rope: sin shape");
+
+    Tensor out({heads, seq, dim});
+    for (int64_t h = 0; h < heads; ++h) {
+        for (int64_t p = 0; p < seq; ++p) {
+            for (int64_t d = 0; d < dim; ++d) {
+                // rotate_half(x) = [-x2, x1]: the first half pulls -(second half),
+                // the second half pulls +(first half).
+                const float rot = (d < half) ? -x.at(h, p, d + half) : x.at(h, p, d - half);
+                out.at(h, p, d) = x.at(h, p, d) * cos.at(p, d) + rot * sin.at(p, d);
+            }
+        }
+    }
     return out;
 }
 

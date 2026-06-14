@@ -32,9 +32,12 @@ public:
     float& operator[](int64_t i) { return data_[i]; }
     float operator[](int64_t i) const { return data_[i]; }
 
-    // 2-D convenience for the [rows, cols] tensors the ops work on.
+    // 2-D / 3-D convenience for the [rows, cols] and [heads, seq, head_dim]
+    // tensors the ops work on. (Attention is batch-1 here, so 3-D is enough.)
     float& at(int64_t i, int64_t j);
     float at(int64_t i, int64_t j) const;
+    float& at(int64_t i, int64_t j, int64_t k);
+    float at(int64_t i, int64_t j, int64_t k) const;
 
 private:
     std::vector<int64_t> shape_;
