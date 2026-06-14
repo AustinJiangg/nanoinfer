@@ -11,7 +11,7 @@ add_compile_options(-Wall -Wextra)
 
 # Core library. Kept as a plain C++ lib with a simple API so it can be wrapped by
 # pybind11 later (the F-stage fusion) without reshaping it.
-add_library(nicore src/tensor.cpp src/ops.cpp src/serialize.cpp)
+add_library(nicore src/tensor.cpp src/ops.cpp src/serialize.cpp src/config.cpp src/model.cpp)
 target_include_directories(nicore PUBLIC src)
 
 enable_testing()
@@ -40,3 +40,8 @@ set_tests_properties(gen_fixtures PROPERTIES FIXTURES_SETUP fixtures)
 
 add_test(NAME ops_parity COMMAND ops_parity ${CMAKE_CURRENT_BINARY_DIR}/fixtures)
 set_tests_properties(ops_parity PROPERTIES FIXTURES_REQUIRED fixtures)
+
+# End-to-end model parity vs nanoinfer. Not wired into ctest: it needs the ~2 GB
+# weight export + a reference dump first (see tests/run_parity.cpp header).
+add_executable(run_parity tests/run_parity.cpp)
+target_link_libraries(run_parity PRIVATE nicore)

@@ -10,23 +10,13 @@ Usage:  python gen_fixtures.py <out_dir>
 
 from __future__ import annotations
 
-import struct
 import sys
 from pathlib import Path
 
 import numpy as np
+from nit0 import save_bin
 
 RMS_EPS = 1e-6  # must match kRmsEps in cpp/tests/ops_parity.cpp
-
-
-def save_bin(path: Path, arr: np.ndarray) -> None:
-    arr = np.ascontiguousarray(arr, dtype="<f4")
-    with open(path, "wb") as f:
-        f.write(b"NIT0")
-        f.write(struct.pack("<i", arr.ndim))
-        for d in arr.shape:
-            f.write(struct.pack("<i", int(d)))
-        f.write(arr.tobytes())
 
 
 def rmsnorm(x: np.ndarray, w: np.ndarray, eps: float) -> np.ndarray:

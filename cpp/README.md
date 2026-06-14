@@ -48,10 +48,24 @@ and assert allclose. The same format will carry exported nanoinfer weights into
 the C++ engine in the next stage, so both run the *same* Qwen2.5 tensors and the
 C++ logits can be compared against the Python engine's directly.
 
+## Run the full Qwen2.5 forward
+
+```bash
+# 1. export weights + config from nanoinfer (~2 GB, into cpp/weights/, gitignored)
+python tools/export_weights.py weights/qwen2.5-0.5b
+# 2. dump nanoinfer's reference logits for a prompt
+python tools/dump_reference.py  weights/qwen2.5-0.5b "The capital of France is"
+# 3. run the C++ forward and compare
+./build/run_parity weights/qwen2.5-0.5b
+```
+
+The C++ logits match nanoinfer to ~4e-5 max abs diff (float accumulation order),
+argmax token-for-token — e.g. "The capital of France is" → " Paris".
+
 ## Status
 
 - [x] **C0** — Tensor + ops (matmul/rmsnorm/softmax/add), CMake, numpy parity
-- [ ] **C1** — Qwen2.5 forward pass (translate nanoinfer, parity-test per layer)
+- [x] **C1** — Qwen2.5 forward pass; NIT0 weight export, logit parity vs nanoinfer
 - [ ] **C2** — sampling (temperature / top-k / top-p)
 - [ ] **C3** — KV cache
 - [ ] **C4** — quantization (Q8/Q4)

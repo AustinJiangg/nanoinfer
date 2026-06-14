@@ -24,6 +24,9 @@ env/
 *.bin
 *.pt
 
+# Exported C++ engine weights (large; regenerate with cpp/tools/export_weights.py)
+cpp/weights/
+
 # OS & editor cruft
 .DS_Store
 *.swp
