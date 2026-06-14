@@ -176,6 +176,88 @@ int main() {
                       q.scale[static_cast<size_t>(o)] / 2.0 + 1e-6);
     }
 
+    // --- Q4G (group-wise int4) ---
+
+    // Q4G error is bounded per block (scale_block/2) and dequant round-trips.
+    {
+        std::mt19937_64 rng(5);
+        std::normal_distribution<float> nd(0.0f, 2.0f);
+        Tensor w({4, 40});
+        for (int64_t i = 0; i < w.numel(); ++i) w[i] = nd(rng);
+        const int64_t group = 8, blocks = (40 + group - 1) / group;
+        ni::Q4GTensor q = ni::quantize_q4g(w, group);
+        CHECK(q.group == group);
+        CHECK(static_cast<int64_t>(q.scale.size()) == 4 * blocks);
+        Tensor dq = ni::dequantize_q4g(q);
+        for (int64_t o = 0; o < 4; ++o)
+            for (int64_t j = 0; j < 40; ++j) {
+                const double bound = q.scale[static_cast<size_t>(o * blocks + j / group)] / 2.0 + 1e-6;
+                CHECK(std::fabs(double(dq.at(o, j)) - w.at(o, j)) <= bound);
+            }
+    }
+
+    // linear_q4g(x, q) == linear(x, dequant(q)), with and without bias.
+    {
+        std::mt19937_64 rng(6);
+        std::normal_distribution<float> nd;
+        Tensor x({3, 32}), w({5, 32}), bias({5});
+        for (int64_t i = 0; i < x.numel(); ++i) x[i] = nd(rng);
+        for (int64_t i = 0; i < w.numel(); ++i) w[i] = nd(rng);
+        for (int64_t i = 0; i < bias.numel(); ++i) bias[i] = nd(rng);
+        ni::Q4GTensor q = ni::quantize_q4g(w, 8);
+        Tensor dq = ni::dequantize_q4g(q);
+        Tensor refb = ni::linear(x, dq, &bias), gotb = ni::linear_q4g(x, q, &bias);
+        Tensor refn = ni::linear(x, dq), gotn = ni::linear_q4g(x, q);
+        for (int64_t i = 0; i < refb.numel(); ++i) {
+            CHECK_CLOSE(gotb[i], refb[i], 1e-4);
+            CHECK_CLOSE(gotn[i], refn[i], 1e-4);
+        }
+    }
+
+    // The whole point: with an outlier in one block, group-wise quantizes the
+    // OTHER block accurately — per-channel crushes it because one global scale is
+    // set by the distant outlier. Measure error on the outlier-free block (j>=8).
+    {
+        Tensor w({1, 16});
+        for (int64_t j = 0; j < 16; ++j) w[j] = (j == 0) ? 100.0f : 0.5f;  // outlier in block 0
+        auto max_err_block1 = [&](const Tensor& dq) {
+            double e = 0;
+            for (int64_t j = 8; j < 16; ++j) e = std::max(e, std::fabs(double(dq.at(0, j)) - w[j]));
+            return e;
+        };
+        const double q4_err = max_err_block1(ni::dequantize_q4(ni::quantize_q4(w)));
+        const double q4g_err = max_err_block1(ni::dequantize_q4g(ni::quantize_q4g(w, 8)));
+        CHECK(q4g_err < q4_err / 5.0);  // block 1 (no outlier) is far tighter under Q4G
+    }
+
+    // Partial last block (in not divisible by group) round-trips.
+    {
+        Tensor w({2, 10});
+        for (int64_t i = 0; i < w.numel(); ++i) w[i] = float(i) - 5.0f;
+        ni::Q4GTensor q = ni::quantize_q4g(w, 4);  // blocks of 4,4,2
+        CHECK(static_cast<int64_t>(q.scale.size()) == 2 * 3);
+        Tensor dq = ni::dequantize_q4g(q);
+        for (int64_t o = 0; o < 2; ++o)
+            for (int64_t j = 0; j < 10; ++j)
+                CHECK(std::fabs(double(dq.at(o, j)) - w.at(o, j)) <=
+                      q.scale[static_cast<size_t>(o * 3 + j / 4)] / 2.0 + 1e-6);
+    }
+
+    // The polymorphic factory routes linear() to the matching free function.
+    {
+        std::mt19937_64 rng(7);
+        std::normal_distribution<float> nd;
+        Tensor x({2, 16}), w({4, 16});
+        for (int64_t i = 0; i < x.numel(); ++i) x[i] = nd(rng);
+        for (int64_t i = 0; i < w.numel(); ++i) w[i] = nd(rng);
+        auto qg = ni::make_quantized(w, ni::QuantMode::Q4G);
+        Tensor ref = ni::linear_q4g(x, ni::quantize_q4g(w, 32));  // in<32 -> one block
+        Tensor got = qg->linear(x, nullptr);
+        for (int64_t i = 0; i < ref.numel(); ++i) CHECK_CLOSE(got[i], ref[i], 1e-9);
+        CHECK(qg->bytes() < qg->fp32_bytes());
+        CHECK(ni::make_quantized(w, ni::QuantMode::None) == nullptr);
+    }
+
     std::printf(g_failures ? "test_quant: %d failures\n" : "test_quant: ok\n", g_failures);
     return g_failures ? 1 : 0;
 }

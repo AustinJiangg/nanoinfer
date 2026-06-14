@@ -17,11 +17,16 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "tensor.hpp"
 
 namespace ni {
+
+// Weight quantization mode for the model. None = fp32; Q8/Q4 are per-channel;
+// Q4G is group-wise int4 (one scale per K-element block — accurate enough to use).
+enum class QuantMode { None, Q8, Q4, Q4G };
 
 // An int8-quantized [out, in] weight: codes row-major, one scale per output row.
 struct QTensor {
@@ -55,5 +60,34 @@ struct Q4Tensor {
 Q4Tensor quantize_q4(const Tensor& w);
 Tensor dequantize_q4(const Q4Tensor& w);
 Tensor linear_q4(const Tensor& x, const Q4Tensor& w, const Tensor* bias = nullptr);
+
+// Group-wise int4 (Q4_0-style): codes packed two per byte like Q4, but with one
+// fp32 scale per `group` consecutive weights instead of per row. A local scale
+// can't be blown out by a distant outlier, so the model stays usable at ~6.4x
+// smaller (5 bits/weight). Still weight-only (memory, not compute).
+struct Q4GTensor {
+    std::vector<uint8_t> q;    // [out * ceil(in/2)] packed nibbles (same as Q4)
+    std::vector<float> scale;  // [out * ceil(in/group)] — one per block
+    int64_t out = 0;
+    int64_t in = 0;
+    int64_t group = 0;         // block size K
+};
+
+Q4GTensor quantize_q4g(const Tensor& w, int64_t group = 32);
+Tensor dequantize_q4g(const Q4GTensor& w);
+Tensor linear_q4g(const Tensor& x, const Q4GTensor& w, const Tensor* bias = nullptr);
+
+// Polymorphic wrapper so the model can hold any quant mode in one map and add a
+// new mode as one subclass + one factory branch (no N-map / N-way-if growth).
+class QuantizedWeight {
+public:
+    virtual ~QuantizedWeight() = default;
+    virtual Tensor linear(const Tensor& x, const Tensor* bias) const = 0;
+    virtual int64_t bytes() const = 0;       // actual storage
+    virtual int64_t fp32_bytes() const = 0;  // out*in*4 (the unquantized size)
+};
+
+// Quantize `w` into a QuantizedWeight of the given mode (nullptr for None).
+std::unique_ptr<QuantizedWeight> make_quantized(const Tensor& w, QuantMode mode);
 
 }  // namespace ni

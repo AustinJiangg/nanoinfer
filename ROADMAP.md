@@ -79,9 +79,9 @@ API simple/C-style so the later binding is cheap.
 - [x] **C1** — Qwen2.5 forward pass; NIT0 weight export, logit parity vs nanoinfer (~4e-5)
 - [x] **C2** — sampling + generate loop; greedy generation matches nanoinfer token-for-token
 - [x] **C3** — KV cache (prefill / decode); bit-identical to full recompute, ~7× faster
-- [~] **C4** — quantization (weight-only, per-channel): Q8 int8 (4×, next-token preserved)
-      + Q4 int4 (8×, too coarse for outliers — shows why group-wise is needed);
-      group-wise (Q4_0-style blocks) + embedding quantization remain
+- [x] **C4** — weight quantization (weight-only): per-channel int8 (q8) & int4 (q4),
+      group-wise int4 (q4g, Q4_0-style 32-blocks — recovers accuracy vs per-channel),
+      behind a QuantizedWeight interface. (Optional: quantize embedding/lm_head too.)
 - [ ] **C5** — SIMD (AVX2/NEON) + multithreading (OpenMP) ← the performance well
 
 ## Fusion (→ mini-vLLM)

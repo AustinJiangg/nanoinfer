@@ -4,7 +4,7 @@
 //
 //   python ../tools/export_weights.py weights/qwen2.5-0.5b
 //   python ../tools/dump_reference.py  weights/qwen2.5-0.5b
-//   ./build/run_quant weights/qwen2.5-0.5b [q8|q4]   (default q8)
+//   ./build/run_quant weights/qwen2.5-0.5b [q8|q4|q4g]   (default q8)
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -26,8 +26,9 @@ int main(int argc, char** argv) {
     const std::string mode_str = argc > 2 ? argv[2] : "q8";
     ni::QuantMode mode = ni::QuantMode::Q8;
     if (mode_str == "q4") mode = ni::QuantMode::Q4;
+    else if (mode_str == "q4g") mode = ni::QuantMode::Q4G;
     else if (mode_str != "q8") {
-        std::printf("unknown mode '%s' (use q8 or q4)\n", mode_str.c_str());
+        std::printf("unknown mode '%s' (use q8, q4, or q4g)\n", mode_str.c_str());
         return 2;
     }
     try {

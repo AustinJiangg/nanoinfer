@@ -18,8 +18,6 @@
 
 namespace ni {
 
-enum class QuantMode { None, Q8, Q4 };
-
 class Model {
 public:
     // Load config.txt and every <name>.bin in `weights_dir`. With a quant mode,
@@ -46,9 +44,9 @@ private:
     Tensor project(const Tensor& x, const std::string& name, const Tensor* bias) const;
 
     Config cfg_;
-    std::unordered_map<std::string, Tensor> w_;       // fp32 weights
-    std::unordered_map<std::string, QTensor> qw8_;    // Q8 layer-projection weights
-    std::unordered_map<std::string, Q4Tensor> qw4_;   // Q4 layer-projection weights
+    std::unordered_map<std::string, Tensor> w_;  // fp32 weights
+    // Quantized layer-projection weights (any mode), via the polymorphic wrapper.
+    std::unordered_map<std::string, std::unique_ptr<QuantizedWeight>> qweights_;
     RopeCache rope_;  // built once for max_position_embeddings, sliced per forward
 };
 

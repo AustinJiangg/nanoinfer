@@ -40,8 +40,7 @@ Model::Model(const std::string& weights_dir, QuantMode mode) {
         for (const auto& kv : w_)
             if (is_layer_proj(kv.first)) names.push_back(kv.first);
         for (const std::string& n : names) {
-            if (mode == QuantMode::Q8) qw8_.emplace(n, quantize_q8(w_.at(n)));
-            else qw4_.emplace(n, quantize_q4(w_.at(n)));
+            qweights_.emplace(n, make_quantized(w_.at(n), mode));
             w_.erase(n);  // free the fp32 copy — the quantized weight is live now
         }
     }
@@ -52,10 +51,8 @@ KVCache Model::make_cache(int64_t max_seq) const {
 }
 
 Tensor Model::project(const Tensor& x, const std::string& name, const Tensor* bias) const {
-    auto it8 = qw8_.find(name);
-    if (it8 != qw8_.end()) return linear_q8(x, it8->second, bias);
-    auto it4 = qw4_.find(name);
-    if (it4 != qw4_.end()) return linear_q4(x, it4->second, bias);
+    auto it = qweights_.find(name);
+    if (it != qweights_.end()) return it->second->linear(x, bias);
     return linear(x, W(name), bias);
 }
 
@@ -66,15 +63,9 @@ std::pair<int64_t, int64_t> Model::weight_bytes() const {
         actual += n * 4;
         fp32 += n * 4;
     }
-    for (const auto& kv : qw8_) {
-        const QTensor& q = kv.second;
-        actual += static_cast<int64_t>(q.q.size()) + static_cast<int64_t>(q.scale.size()) * 4;
-        fp32 += q.out * q.in * 4;
-    }
-    for (const auto& kv : qw4_) {
-        const Q4Tensor& q = kv.second;
-        actual += static_cast<int64_t>(q.q.size()) + static_cast<int64_t>(q.scale.size()) * 4;
-        fp32 += q.out * q.in * 4;
+    for (const auto& kv : qweights_) {
+        actual += kv.second->bytes();
+        fp32 += kv.second->fp32_bytes();
     }
     return {actual, fp32};
 }
