@@ -96,6 +96,31 @@ int main(int argc, char** argv) {
             ni::Tensor expected = load_bin(dir + "rope_applied_expected.bin");
             fails += compare_tensors(ni::apply_rope(q, cos, sin), expected, 1e-5, "rope_apply");
         }
+        // split_heads / merge_heads (shapes mirror gen_fixtures.py)
+        {
+            ni::Tensor x = load_bin(dir + "split_x.bin");
+            ni::Tensor expected = load_bin(dir + "split_expected.bin");
+            fails += compare_tensors(ni::split_heads(x, 2, 4), expected, 1e-6, "split_heads");
+        }
+        {
+            ni::Tensor x = load_bin(dir + "merge_x.bin");
+            ni::Tensor expected = load_bin(dir + "merge_expected.bin");
+            fails += compare_tensors(ni::merge_heads(x), expected, 1e-6, "merge_heads");
+        }
+        // repeat_kv (n_rep mirrors gen_fixtures.py)
+        {
+            ni::Tensor x = load_bin(dir + "repeatkv_x.bin");
+            ni::Tensor expected = load_bin(dir + "repeatkv_expected.bin");
+            fails += compare_tensors(ni::repeat_kv(x, 3), expected, 1e-6, "repeat_kv");
+        }
+        // causal attention
+        {
+            ni::Tensor q = load_bin(dir + "attn_q.bin");
+            ni::Tensor k = load_bin(dir + "attn_k.bin");
+            ni::Tensor v = load_bin(dir + "attn_v.bin");
+            ni::Tensor expected = load_bin(dir + "attn_expected.bin");
+            fails += compare_tensors(ni::attention(q, k, v, true), expected, 1e-5, "attention");
+        }
     } catch (const std::exception& e) {
         std::printf("ops_parity: exception: %s\n", e.what());
         return 1;

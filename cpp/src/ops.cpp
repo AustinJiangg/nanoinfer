@@ -1,8 +1,10 @@
 #include "ops.hpp"
 
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace ni {
 
@@ -123,6 +125,87 @@ Tensor apply_rope(const Tensor& x, const Tensor& cos, const Tensor& sin) {
                 // the second half pulls +(first half).
                 const float rot = (d < half) ? -x.at(h, p, d + half) : x.at(h, p, d - half);
                 out.at(h, p, d) = x.at(h, p, d) * cos.at(p, d) + rot * sin.at(p, d);
+            }
+        }
+    }
+    return out;
+}
+
+Tensor split_heads(const Tensor& x, int64_t n_heads, int64_t head_dim) {
+    require(x.ndim() == 2, "split_heads expects [seq, n_heads*head_dim]");
+    require(x.size(1) == n_heads * head_dim, "split_heads: width must be n_heads*head_dim");
+    const int64_t seq = x.size(0);
+    Tensor out({n_heads, seq, head_dim});
+    for (int64_t s = 0; s < seq; ++s)
+        for (int64_t h = 0; h < n_heads; ++h)
+            for (int64_t d = 0; d < head_dim; ++d)
+                out.at(h, s, d) = x.at(s, h * head_dim + d);
+    return out;
+}
+
+Tensor merge_heads(const Tensor& x) {
+    require(x.ndim() == 3, "merge_heads expects [heads, seq, head_dim]");
+    const int64_t heads = x.size(0), seq = x.size(1), dim = x.size(2);
+    Tensor out({seq, heads * dim});
+    for (int64_t h = 0; h < heads; ++h)
+        for (int64_t s = 0; s < seq; ++s)
+            for (int64_t d = 0; d < dim; ++d)
+                out.at(s, h * dim + d) = x.at(h, s, d);
+    return out;
+}
+
+Tensor repeat_kv(const Tensor& x, int64_t n_rep) {
+    require(x.ndim() == 3, "repeat_kv expects [n_kv, seq, head_dim]");
+    require(n_rep >= 1, "repeat_kv: n_rep must be >= 1");
+    const int64_t kv = x.size(0), seq = x.size(1), dim = x.size(2);
+    Tensor out({kv * n_rep, seq, dim});
+    for (int64_t j = 0; j < kv; ++j)
+        for (int64_t r = 0; r < n_rep; ++r)
+            for (int64_t s = 0; s < seq; ++s)
+                for (int64_t d = 0; d < dim; ++d)
+                    out.at(j * n_rep + r, s, d) = x.at(j, s, d);
+    return out;
+}
+
+Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, bool causal) {
+    require(q.ndim() == 3 && k.ndim() == 3 && v.ndim() == 3, "attention expects 3-D q/k/v");
+    const int64_t heads = q.size(0), sq = q.size(1), dim = q.size(2);
+    const int64_t sk = k.size(1);
+    require(k.size(0) == heads && v.size(0) == heads, "attention: head count must match");
+    require(k.size(2) == dim && v.size(2) == dim, "attention: head_dim must match");
+    require(v.size(1) == sk, "attention: k and v seq length must match");
+
+    const float scale = 1.0f / std::sqrt(float(dim));
+    Tensor out({heads, sq, dim});
+    std::vector<float> scores(static_cast<size_t>(sk));
+
+    for (int64_t h = 0; h < heads; ++h) {
+        for (int64_t i = 0; i < sq; ++i) {
+            // Keys this query may attend: 0..i under the causal (prefill) mask.
+            const int64_t limit = causal ? (i + 1) : sk;
+            // scores_j = scale * (q_i . k_j); track the max for stable softmax.
+            float maxv = -std::numeric_limits<float>::infinity();
+            for (int64_t j = 0; j < limit; ++j) {
+                double dot = 0.0;
+                for (int64_t d = 0; d < dim; ++d) dot += double(q.at(h, i, d)) * k.at(h, j, d);
+                const float s = float(dot) * scale;
+                scores[static_cast<size_t>(j)] = s;
+                if (s > maxv) maxv = s;
+            }
+            // softmax over the visible keys
+            double denom = 0.0;
+            for (int64_t j = 0; j < limit; ++j) {
+                const float e = std::exp(scores[static_cast<size_t>(j)] - maxv);
+                scores[static_cast<size_t>(j)] = e;
+                denom += e;
+            }
+            const float inv = float(1.0 / denom);
+            // out_i = sum_j softmax_ij * v_j
+            for (int64_t d = 0; d < dim; ++d) {
+                double acc = 0.0;
+                for (int64_t j = 0; j < limit; ++j)
+                    acc += double(scores[static_cast<size_t>(j)]) * inv * v.at(h, j, d);
+                out.at(h, i, d) = float(acc);
             }
         }
     }

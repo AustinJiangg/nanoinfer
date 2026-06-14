@@ -157,6 +157,46 @@ int main() {
         CHECK_CLOSE(rownorm(r, 1), rownorm(q, 1), 1e-5);
     }
 
+    // split_heads / merge_heads are inverses: merge(split(x)) == x.
+    {
+        Tensor x = make({2, 6}, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});  // [seq=2, 3*2]
+        Tensor s = ni::split_heads(x, /*n_heads=*/3, /*head_dim=*/2);
+        CHECK(s.ndim() == 3 && s.size(0) == 3 && s.size(1) == 2 && s.size(2) == 2);
+        // head h, seq s pulls columns [h*2 .. h*2+1] of row s.
+        CHECK_CLOSE(s.at(0, 0, 0), 1.0, 1e-6);   // x[0, 0]
+        CHECK_CLOSE(s.at(2, 1, 1), 12.0, 1e-6);  // x[1, 5]
+        Tensor back = ni::merge_heads(s);
+        for (int64_t i = 0; i < x.numel(); ++i) CHECK_CLOSE(back[i], x[i], 1e-6);
+    }
+
+    // repeat_kv: each KV head feeds n_rep consecutive output heads.
+    {
+        Tensor x = make({2, 1, 2}, {1, 2, 3, 4});  // [n_kv=2, seq=1, dim=2]
+        Tensor r = ni::repeat_kv(x, 3);
+        CHECK(r.size(0) == 6);
+        for (int64_t h = 0; h < 3; ++h) {  // heads 0..2 == kv 0
+            CHECK_CLOSE(r.at(h, 0, 0), 1.0, 1e-6);
+            CHECK_CLOSE(r.at(h, 0, 1), 2.0, 1e-6);
+        }
+        for (int64_t h = 3; h < 6; ++h) {  // heads 3..5 == kv 1
+            CHECK_CLOSE(r.at(h, 0, 0), 3.0, 1e-6);
+            CHECK_CLOSE(r.at(h, 0, 1), 4.0, 1e-6);
+        }
+    }
+
+    // attention: under the causal mask query 0 sees only key 0, so out[*,0,:] == v[*,0,:].
+    {
+        Tensor q = make({1, 2, 2}, {1, 0, 0, 1});
+        Tensor k = make({1, 2, 2}, {1, 1, 2, 2});
+        Tensor v = make({1, 2, 2}, {5, 6, 7, 8});
+        Tensor o = ni::attention(q, k, v, /*causal=*/true);
+        CHECK_CLOSE(o.at(0, 0, 0), 5.0, 1e-6);  // == v[0,0]
+        CHECK_CLOSE(o.at(0, 0, 1), 6.0, 1e-6);
+        // Row 1 is a convex combo of v rows 0 and 1, so each coord lies within range.
+        CHECK(o.at(0, 1, 0) >= 5.0 && o.at(0, 1, 0) <= 7.0);
+        CHECK(o.at(0, 1, 1) >= 6.0 && o.at(0, 1, 1) <= 8.0);
+    }
+
     std::printf(g_failures ? "test_ops: %d failures\n" : "test_ops: ok\n", g_failures);
     return g_failures ? 1 : 0;
 }

@@ -44,6 +44,24 @@ RopeCache build_rope_cache(int64_t seq_len, int64_t head_dim, float theta);
 // new tensor; q and k are rotated by separate calls.
 Tensor apply_rope(const Tensor& x, const Tensor& cos, const Tensor& sin);
 
+// --- Attention building blocks (batch-1; per-head tensors are [heads, seq, head_dim]) ---
+
+// [seq, n_heads*head_dim] -> [n_heads, seq, head_dim] (split the projection into heads).
+Tensor split_heads(const Tensor& x, int64_t n_heads, int64_t head_dim);
+
+// [n_heads, seq, head_dim] -> [seq, n_heads*head_dim] (inverse of split_heads).
+Tensor merge_heads(const Tensor& x);
+
+// GQA: repeat each KV head n_rep times to match the query heads.
+// [n_kv, seq, head_dim] -> [n_kv*n_rep, seq, head_dim]; KV head j feeds output
+// heads j*n_rep .. (j+1)*n_rep-1 (see nanoinfer CLAUDE.md "GQA").
+Tensor repeat_kv(const Tensor& x, int64_t n_rep);
+
+// Scaled dot-product attention over [heads, seq, head_dim] q/k/v (k/v may be a
+// different seq length than q). scale = 1/sqrt(head_dim). causal=true is the
+// prefill mask — query i attends keys 0..i; decode/cache masking arrives in C3.
+Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, bool causal);
+
 // RMSNorm over the last dimension: x / sqrt(mean(x^2) + eps) * weight.
 // x is [..., d] (treated as rows of length d); weight is [d]. Matches
 // nanoinfer.layers.RMSNorm (computed in float32).

@@ -55,6 +55,38 @@ def apply_rope(x: np.ndarray, cos: np.ndarray, sin: np.ndarray) -> np.ndarray:
     return x * cos + rot * sin
 
 
+def split_heads(x: np.ndarray, n_heads: int, head_dim: int) -> np.ndarray:
+    s = x.shape[0]
+    return x.reshape(s, n_heads, head_dim).transpose(1, 0, 2)  # [H, S, D]
+
+
+def merge_heads(x: np.ndarray) -> np.ndarray:
+    h, s, d = x.shape
+    return x.transpose(1, 0, 2).reshape(s, h * d)  # [S, H*D]
+
+
+def repeat_kv(x: np.ndarray, n_rep: int) -> np.ndarray:
+    return np.repeat(x, n_rep, axis=0)  # [H*n_rep, S, D]
+
+
+def attention(q: np.ndarray, k: np.ndarray, v: np.ndarray, causal: bool) -> np.ndarray:
+    h, sq, d = q.shape
+    sk = k.shape[1]
+    scale = 1.0 / np.sqrt(d)
+    qd, kd, vd = q.astype(np.float64), k.astype(np.float64), v.astype(np.float64)
+    out = np.zeros((h, sq, d), dtype=np.float64)
+    for hi in range(h):
+        scores = (qd[hi] @ kd[hi].T) * scale  # [sq, sk]
+        if causal:
+            mask = np.triu(np.ones((sq, sk), dtype=bool), k=1)  # j > i
+            scores = np.where(mask, -np.inf, scores)
+        scores -= scores.max(axis=-1, keepdims=True)
+        e = np.exp(scores)
+        attn = e / e.sum(axis=-1, keepdims=True)
+        out[hi] = attn @ vd[hi]
+    return out
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         print("usage: gen_fixtures.py <out_dir>")
@@ -126,6 +158,29 @@ def main() -> None:
     rq = rng.standard_normal((2, 4, 8)).astype(np.float32)
     save_bin(out / "rope_q.bin", rq)
     save_bin(out / "rope_applied_expected.bin", apply_rope(rq, rcos, rsin))
+
+    # attention blocks. Shapes mirror the constants in ops_parity.cpp.
+    # split/merge heads: [S=3, H=2, D=4]
+    sh_x = rng.standard_normal((3, 8)).astype(np.float32)
+    save_bin(out / "split_x.bin", sh_x)
+    save_bin(out / "split_expected.bin", split_heads(sh_x, 2, 4))
+    mh_x = rng.standard_normal((2, 3, 4)).astype(np.float32)
+    save_bin(out / "merge_x.bin", mh_x)
+    save_bin(out / "merge_expected.bin", merge_heads(mh_x))
+
+    # repeat_kv: [H=2, S=3, D=4], n_rep=3
+    rk_x = rng.standard_normal((2, 3, 4)).astype(np.float32)
+    save_bin(out / "repeatkv_x.bin", rk_x)
+    save_bin(out / "repeatkv_expected.bin", repeat_kv(rk_x, 3))
+
+    # causal attention: q/k/v [H=2, S=4, D=4]
+    aq = rng.standard_normal((2, 4, 4)).astype(np.float32)
+    ak = rng.standard_normal((2, 4, 4)).astype(np.float32)
+    av = rng.standard_normal((2, 4, 4)).astype(np.float32)
+    save_bin(out / "attn_q.bin", aq)
+    save_bin(out / "attn_k.bin", ak)
+    save_bin(out / "attn_v.bin", av)
+    save_bin(out / "attn_expected.bin", attention(aq, ak, av, causal=True))
 
     print(f"wrote fixtures to {out}")
 
