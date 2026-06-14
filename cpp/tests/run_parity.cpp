@@ -18,16 +18,6 @@
 #include "parity_util.hpp"
 #include "serialize.hpp"
 
-static int64_t argmax_row(const ni::Tensor& t, int64_t row, int64_t vocab) {
-    int64_t best = 0;
-    float bv = t.at(row, 0);
-    for (int64_t j = 1; j < vocab; ++j) {
-        const float x = t.at(row, j);
-        if (x > bv) { bv = x; best = j; }
-    }
-    return best;
-}
-
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::printf("usage: run_parity <weights_dir>\n");

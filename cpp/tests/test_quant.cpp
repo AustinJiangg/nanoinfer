@@ -62,6 +62,27 @@ int main() {
         for (int64_t i = 0; i < ref.numel(); ++i) CHECK_CLOSE(got[i], ref[i], 1e-4);
     }
 
+    // linear_q8 with NO bias (the path o/gate/up/down projections take).
+    {
+        std::mt19937_64 rng(2);
+        std::normal_distribution<float> nd;
+        Tensor x({2, 12}), w({7, 12});
+        for (int64_t i = 0; i < x.numel(); ++i) x[i] = nd(rng);
+        for (int64_t i = 0; i < w.numel(); ++i) w[i] = nd(rng);
+        ni::QTensor q = ni::quantize_q8(w);
+        Tensor ref = ni::linear(x, ni::dequantize_q8(q));  // no bias
+        Tensor got = ni::linear_q8(x, q);                  // no bias
+        for (int64_t i = 0; i < ref.numel(); ++i) CHECK_CLOSE(got[i], ref[i], 1e-4);
+    }
+
+    // Codes always stay in [-127, 127], even for adversarial magnitudes near
+    // absmax or with a huge dynamic range (the clamp must hold).
+    {
+        Tensor w = make({2, 4}, {5, 5, 5, 5, 1e30f, -1e30f, 1e-30f, 0});
+        ni::QTensor q = ni::quantize_q8(w);
+        for (int8_t c : q.q) CHECK(c >= -127 && c <= 127);
+    }
+
     // An all-zero row quantizes to scale 0 / codes 0 / dequant 0 (no divide-by-zero).
     {
         Tensor w = make({2, 2}, {0, 0, 3, -3});

@@ -17,9 +17,20 @@ void require(bool cond, const char* msg) {
 int8_t quant_code(float w, float scale) {
     if (scale <= 0.0f) return 0;  // all-zero row: code is 0, dequant is 0
     float r = std::nearbyint(w / scale);
+    // Clamp BEFORE the cast: float division can nudge the max element past 127.
     if (r > kQ8Max) r = kQ8Max;
     if (r < -kQ8Max) r = -kQ8Max;
+    // A NaN weight slips through the clamps (all comparisons are false); casting
+    // it to int8 is UB, so map it to 0 instead. (+/-inf is caught by the clamp.)
+    if (std::isnan(r)) return 0;
     return static_cast<int8_t>(r);
+}
+
+// A QTensor from quantize_q8 is always consistent, but guard against a
+// hand-built or (future) deserialized one before indexing into its buffers.
+void check_qtensor(const QTensor& w) {
+    require(static_cast<int64_t>(w.q.size()) == w.out * w.in, "QTensor: q size != out*in");
+    require(static_cast<int64_t>(w.scale.size()) == w.out, "QTensor: scale size != out");
 }
 }  // namespace
 
@@ -45,6 +56,7 @@ QTensor quantize_q8(const Tensor& w) {
 }
 
 Tensor dequantize_q8(const QTensor& w) {
+    check_qtensor(w);
     Tensor out({w.out, w.in});
     for (int64_t o = 0; o < w.out; ++o) {
         const float scale = w.scale[static_cast<size_t>(o)];
@@ -55,6 +67,7 @@ Tensor dequantize_q8(const QTensor& w) {
 }
 
 Tensor linear_q8(const Tensor& x, const QTensor& w, const Tensor* bias) {
+    check_qtensor(w);
     require(x.ndim() == 2, "linear_q8 expects 2-D x");
     require(x.size(1) == w.in, "linear_q8: x cols must match weight in-features");
     if (bias) require(bias->numel() == w.out, "linear_q8: bias must match out-features");

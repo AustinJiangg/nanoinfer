@@ -8,6 +8,18 @@
 #include <string>
 #include <vector>
 
+#include "tensor.hpp"
+
+// Argmax over row `row` of a [seq, vocab] logits tensor (first max on ties,
+// matching torch.argmax).
+inline int64_t argmax_row(const ni::Tensor& t, int64_t row, int64_t vocab) {
+    int64_t best = 0;
+    float bv = t.at(row, 0);
+    for (int64_t j = 1; j < vocab; ++j)
+        if (t.at(row, j) > bv) { bv = t.at(row, j); best = j; }
+    return best;
+}
+
 // Read whitespace-separated token ids from a text file (ref_ids.txt etc.).
 inline std::vector<int64_t> read_ids(const std::string& path) {
     std::ifstream f(path);

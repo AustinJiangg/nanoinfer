@@ -10,7 +10,10 @@
 //
 // linear factors the scale out of the sum: y[i,o] = scale_o * sum_j x[i,j]*q[o,j].
 // Storing int8 instead of fp32 is a 4x shrink of the linear weights (the bulk of
-// the model).
+// the model). This is WEIGHT-ONLY quant: it saves memory, not compute — the inner
+// product still runs in floating point (each int8 code is promoted), so it is no
+// faster than fp32 linear. A true int8 x int8 -> int32 GEMM with one final scale
+// would be the compute win; that's deferred.
 #pragma once
 
 #include <cstdint>
