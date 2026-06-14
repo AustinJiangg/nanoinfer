@@ -4,6 +4,9 @@
 #include <cmath>
 #include <stdexcept>
 
+#include "parallel.hpp"
+#include "simd.hpp"
+
 namespace ni {
 
 namespace {
@@ -106,16 +109,22 @@ Tensor linear_q8(const Tensor& x, const QTensor& w, const Tensor* bias) {
 
     const int64_t m = x.size(0), in = w.in, out = w.out;
     Tensor y({m, out});
+    const int8_t* qp = w.q.data();
+    const float* sp = w.scale.data();
+    const float* bp = bias ? bias->data() : nullptr;
     for (int64_t i = 0; i < m; ++i) {
         const float* xr = x.data() + i * in;
+        float* yr = y.data() + i * out;
+        // Threaded over output channels (bit-identical to serial); dot_qf32
+        // vectorizes the int8×fp32 inner product, accumulating in double.
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if (out >= kParallelMinRows)
+#endif
         for (int64_t o = 0; o < out; ++o) {
-            const int8_t* qr = w.q.data() + o * in;
-            double acc = 0.0;  // int8 weights, fp32 activations -> fp accumulation
-            for (int64_t j = 0; j < in; ++j) acc += double(xr[j]) * qr[j];
-            // The per-row scale is applied once, after the inner product.
-            acc = acc * w.scale[static_cast<size_t>(o)];
-            if (bias) acc += double((*bias)[o]);
-            y.at(i, o) = float(acc);
+            // Per-row scale applied once, after the inner product.
+            double acc = simd::dot_qf32(xr, qp + o * in, in) * double(sp[o]);
+            if (bp) acc += double(bp[o]);
+            yr[o] = float(acc);
         }
     }
     return y;
@@ -164,15 +173,24 @@ Tensor linear_q4(const Tensor& x, const Q4Tensor& w, const Tensor* bias) {
 
     const int64_t m = x.size(0), in = w.in, out = w.out, row_bytes = q4_row_bytes(in);
     Tensor y({m, out});
+    const uint8_t* qp = w.q.data();
+    const float* sp = w.scale.data();
+    const float* bp = bias ? bias->data() : nullptr;
     for (int64_t i = 0; i < m; ++i) {
         const float* xr = x.data() + i * in;
+        float* yr = y.data() + i * out;
+        // Threaded over output channels (bit-identical to serial). The packed
+        // nibble unpack stays scalar — threading is the win that matters here.
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if (out >= kParallelMinRows)
+#endif
         for (int64_t o = 0; o < out; ++o) {
-            const uint8_t* row = w.q.data() + o * row_bytes;
+            const uint8_t* row = qp + o * row_bytes;
             double acc = 0.0;
             for (int64_t j = 0; j < in; ++j) acc += double(xr[j]) * q4_code(row, j);
-            acc = acc * w.scale[static_cast<size_t>(o)];
-            if (bias) acc += double((*bias)[o]);
-            y.at(i, o) = float(acc);
+            acc = acc * double(sp[o]);
+            if (bp) acc += double(bp[o]);
+            yr[o] = float(acc);
         }
     }
     return y;
@@ -229,20 +247,28 @@ Tensor linear_q4g(const Tensor& x, const Q4GTensor& w, const Tensor* bias) {
     const int64_t m = x.size(0), in = w.in, out = w.out;
     const int64_t row_bytes = q4_row_bytes(in), blocks = n_blocks(in, w.group);
     Tensor y({m, out});
+    const uint8_t* qp = w.q.data();
+    const float* sp = w.scale.data();
+    const float* bp = bias ? bias->data() : nullptr;
     for (int64_t i = 0; i < m; ++i) {
         const float* xr = x.data() + i * in;
+        float* yr = y.data() + i * out;
+        // Threaded over output channels (bit-identical to serial).
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if (out >= kParallelMinRows)
+#endif
         for (int64_t o = 0; o < out; ++o) {
-            const uint8_t* row = w.q.data() + o * row_bytes;
+            const uint8_t* row = qp + o * row_bytes;
             double acc = 0.0;
             // The scale varies per block, so apply it to each block's partial sum.
             for (int64_t b = 0; b < blocks; ++b) {
                 const int64_t j0 = b * w.group, j1 = std::min(j0 + w.group, in);
                 double bsum = 0.0;
                 for (int64_t j = j0; j < j1; ++j) bsum += double(xr[j]) * q4_code(row, j);
-                acc += bsum * w.scale[static_cast<size_t>(o * blocks + b)];
+                acc += bsum * double(sp[o * blocks + b]);
             }
-            if (bias) acc += double((*bias)[o]);
-            y.at(i, o) = float(acc);
+            if (bp) acc += double(bp[o]);
+            yr[o] = float(acc);
         }
     }
     return y;

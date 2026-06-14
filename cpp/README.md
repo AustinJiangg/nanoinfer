@@ -23,6 +23,11 @@ ctest --test-dir build --output-on-failure
 Requires a C++17 compiler, CMake ≥ 3.16, and Python 3 + numpy (only to generate
 the parity fixtures — the engine itself has no Python dependency).
 
+The build targets the host CPU (`-march=native`, enabling the AVX2/FMA kernels)
+and uses OpenMP if found. Both are optional and degrade to the same numbers:
+`-DNI_NATIVE=OFF` falls back to the scalar inner products, and a toolchain
+without OpenMP runs single-threaded. Cap threads with `OMP_NUM_THREADS=N`.
+
 ## Layout
 
 ```
@@ -31,6 +36,8 @@ cpp/
     tensor.{hpp,cpp}     row-major contiguous float32 Tensor (shape/stride/data)
     ops.{hpp,cpp}        matmul, rmsnorm, softmax, add — naive, readable
     serialize.{hpp,cpp}  read/write the "NIT0" tensor format (the parity bridge)
+    simd.hpp             C5: AVX2/FMA dot products (double-accum), scalar fallback
+    parallel.hpp         C5: OpenMP thread-count knobs for the kernels
   tests/
     test_util.hpp        dependency-free CHECK / CHECK_CLOSE / compare_tensors
     test_tensor.cpp      shape/stride/indexing
@@ -65,6 +72,8 @@ python tools/dump_reference.py  weights/qwen2.5-0.5b "The capital of France is"
 ./build/run_quant weights/qwen2.5-0.5b q8
 ./build/run_quant weights/qwen2.5-0.5b q4
 ./build/run_quant weights/qwen2.5-0.5b q4g
+# 3e. benchmark prefill/decode tok/s; reports SIMD target + thread count
+./build/run_bench weights/qwen2.5-0.5b fp32 128 32   # [fp32|q8|q4|q4g] [prefill] [decode]
 ```
 
 Quantization modes (layer weights only; embedding/lm_head stay fp32), measured
@@ -88,6 +97,35 @@ capital of France is" → " Paris. It is the largest city in Europe and the seco
 Generation uses a KV cache (prefill + decode); cached output is bit-identical to
 the full recompute and ~7× faster.
 
+## Performance (C5: SIMD + threads)
+
+The hot kernels (`linear`, the quant linears, attention) reduce through the AVX2/FMA
+dot products in `simd.hpp` and parallelize over output channels / heads with OpenMP.
+Both choices are deliberately **parity-preserving**: the SIMD path accumulates in
+`double` (it only re-associates the sum), and threading splits *output channels* so
+each output is one thread's complete reduction. The logits are therefore unchanged —
+still `max|diff| 4.24e-5` vs nanoinfer, greedy still token-for-token — while the
+engine gets much faster. `run_bench`, Qwen2.5-0.5B, 20-core CPU, prefill 128 / decode 32:
+
+| build (fp32)                | prefill tok/s | decode tok/s |
+| --------------------------- | ------------- | ------------ |
+| scalar + serial (pre-C5)    | 4.9           | 4.0          |
+| AVX2+FMA, 1 thread          | 11.9  (2.4×)  | 6.4  (1.6×)  |
+| AVX2+FMA, 20 threads        | 37.3  (7.6×)  | 8.6  (2.1×)  |
+
+The gap between the two columns is the roofline. **Prefill is compute-bound** (the
+weight is reused across all 128 rows), so SIMD *and* cores both pay off → 7.6×.
+**Decode is memory-bound** (one new token, so every weight is streamed once and used
+once), so it saturates memory bandwidth quickly — extra cores can't beat the wall,
+and the win is only ~2×. That wall is exactly what weight quantization (C4) attacks:
+q8 streams a quarter of the bytes, so q8 decode (10.0 tok/s) overtakes fp32 (8.6),
+even though q8 *prefill* is slower (the int8→float widening adds compute that the
+reused-weight regime can't hide — weight-only quant saves memory, not compute).
+
+A NEON path slots into `simd.hpp` at the marked `#elif`; float32-accumulation (the
+further, lossy step llama.cpp takes) is left out on purpose — it would break the
+parity floor this project is built around.
+
 ## Status
 
 - [x] **C0** — Tensor + ops (matmul/rmsnorm/softmax/add), CMake, numpy parity
@@ -97,4 +135,6 @@ the full recompute and ~7× faster.
 - [x] **C4** — weight quantization (q8 / q4 / q4g): per-channel int8 & int4 plus
       group-wise int4 (Q4_0-style), behind a QuantizedWeight interface. (Optional
       extension: quantize the embedding/lm_head too, for more overall savings.)
-- [ ] **C5** — SIMD / multithreading
+- [x] **C5** — SIMD (AVX2/FMA double-accum dot, scalar fallback) + OpenMP threads
+      over output channels/heads. Parity-preserving: logits unchanged (4.24e-5 vs
+      nanoinfer, greedy token-for-token); ~7.6× prefill, ~2.1× decode on 20 cores.

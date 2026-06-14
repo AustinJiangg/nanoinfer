@@ -82,7 +82,11 @@ API simple/C-style so the later binding is cheap.
 - [x] **C4** — weight quantization (weight-only): per-channel int8 (q8) & int4 (q4),
       group-wise int4 (q4g, Q4_0-style 32-blocks — recovers accuracy vs per-channel),
       behind a QuantizedWeight interface. (Optional: quantize embedding/lm_head too.)
-- [ ] **C5** — SIMD (AVX2/NEON) + multithreading (OpenMP) ← the performance well
+- [x] **C5** — SIMD (AVX2/FMA) + multithreading (OpenMP). Double-accum dot products
+      (`simd.hpp`, scalar fallback) + output-channel/head parallelism — parity-preserving
+      (logits unchanged: 4.24e-5 vs nanoinfer, greedy token-for-token). ~7.6× prefill,
+      ~2.1× decode (memory-bound) on 20 cores; `run_bench` reports tok/s. NEON is a
+      labeled `#elif` extension point. ← the performance well
 
 ## Fusion (→ mini-vLLM)
 - [ ] **F6** — pybind11: expose the C++ core to Python

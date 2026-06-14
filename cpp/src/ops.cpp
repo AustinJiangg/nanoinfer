@@ -6,6 +6,9 @@
 #include <utility>
 #include <vector>
 
+#include "parallel.hpp"
+#include "simd.hpp"
+
 namespace ni {
 
 namespace {
@@ -44,13 +47,21 @@ Tensor linear(const Tensor& x, const Tensor& weight, const Tensor* bias) {
     if (bias) require(bias->numel() == out, "linear: bias must match out-features");
 
     Tensor y({m, out});
+    const float* wp = weight.data();
+    const float* bp = bias ? bias->data() : nullptr;
     for (int64_t i = 0; i < m; ++i) {
         const float* xr = x.data() + i * in;
+        float* yr = y.data() + i * out;
+        // Threaded over output channels: each output o is computed in full by one
+        // thread (no shared accumulator), so the result is identical to the serial
+        // reduction. dot_f32 vectorizes the inner product, accumulating in double.
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if (out >= kParallelMinRows)
+#endif
         for (int64_t o = 0; o < out; ++o) {
-            const float* wr = weight.data() + o * in;  // row o = the o-th output's weights
-            double acc = bias ? double((*bias)[o]) : 0.0;
-            for (int64_t p = 0; p < in; ++p) acc += double(xr[p]) * wr[p];
-            y.at(i, o) = float(acc);
+            double acc = simd::dot_f32(xr, wp + o * in, in);  // row o = output o's weights
+            if (bp) acc += double(bp[o]);
+            yr[o] = float(acc);
         }
     }
     return y;
@@ -187,19 +198,31 @@ Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, bool causal,
 
     const float scale = 1.0f / std::sqrt(float(dim));
     Tensor out({heads, sq, dim});
-    std::vector<float> scores(static_cast<size_t>(sk));
+    const float* qp = q.data();
+    const float* kp = k.data();
+    const float* vp = v.data();
+    float* op = out.data();
 
+    // Threaded over heads: head h reads/writes only its own slices, so the per-head
+    // result is identical to serial. `scores` is declared per-iteration (was shared)
+    // so each thread has its own — a correctness requirement under threading.
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if (heads >= 2)
+#endif
     for (int64_t h = 0; h < heads; ++h) {
+        std::vector<float> scores(static_cast<size_t>(sk));
+        const float* qh = qp + h * sq * dim;
+        const float* kh = kp + h * sk * dim;
+        const float* vh = vp + h * sk * dim;
         for (int64_t i = 0; i < sq; ++i) {
+            const float* qi = qh + i * dim;
             // Query i is at absolute position query_offset+i and attends keys
             // 0..(query_offset+i). The invariant above guarantees limit <= sk.
             const int64_t limit = causal ? (query_offset + i + 1) : sk;
             // scores_j = scale * (q_i . k_j); track the max for stable softmax.
             float maxv = -std::numeric_limits<float>::infinity();
             for (int64_t j = 0; j < limit; ++j) {
-                double dot = 0.0;
-                for (int64_t d = 0; d < dim; ++d) dot += double(q.at(h, i, d)) * k.at(h, j, d);
-                const float s = float(dot) * scale;
+                const float s = float(simd::dot_f32(qi, kh + j * dim, dim)) * scale;
                 scores[static_cast<size_t>(j)] = s;
                 if (s > maxv) maxv = s;
             }
@@ -211,12 +234,13 @@ Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, bool causal,
                 denom += e;
             }
             const float inv = float(1.0 / denom);
-            // out_i = sum_j softmax_ij * v_j
+            // out_i = sum_j softmax_ij * v_j  (strided over keys, so kept scalar)
+            float* oi = op + (h * sq + i) * dim;
             for (int64_t d = 0; d < dim; ++d) {
                 double acc = 0.0;
                 for (int64_t j = 0; j < limit; ++j)
-                    acc += double(scores[static_cast<size_t>(j)]) * inv * v.at(h, j, d);
-                out.at(h, i, d) = float(acc);
+                    acc += double(scores[static_cast<size_t>(j)]) * inv * vh[j * dim + d];
+                oi[d] = float(acc);
             }
         }
     }
