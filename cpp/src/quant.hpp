@@ -43,7 +43,8 @@ Tensor linear_q8(const Tensor& x, const QTensor& w, const Tensor* bias = nullptr
 
 // An int4-quantized [out, in] weight (Q4): codes in [-7, 7] packed two per byte
 // (each stored as code+8, a nibble in [1, 15]), per row, plus one fp32 scale per
-// output row. ~8x smaller than fp32; ~18x coarser per weight than Q8.
+// output row. ~8x smaller than fp32; ~18x coarser per weight than Q8. Like Q8
+// this is weight-only — it saves memory, not compute (still an fp inner product).
 struct Q4Tensor {
     std::vector<uint8_t> q;    // [out * ceil(in/2)] packed nibbles
     std::vector<float> scale;  // [out]

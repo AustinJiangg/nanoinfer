@@ -132,6 +132,38 @@ int main() {
         }
     }
 
+    // Packed byte layout is exact (pins the +8 bias and the low/high nibble
+    // choice — a serialization contract once Q4 weights hit disk). w={7,-7} with
+    // absmax 7 -> scale 1 -> codes 7,-7 -> nibbles 15,1 -> byte 0x0F | (0x01<<4).
+    {
+        Tensor w = make({1, 2}, {7, -7});
+        ni::Q4Tensor q = ni::quantize_q4(w);
+        CHECK_CLOSE(q.scale[0], 1.0, 1e-9);
+        CHECK(q.q.size() == 1);
+        CHECK(q.q[0] == 0x1F);  // low nibble 0x0F (code 7), high nibble 0x10 (code -7)
+        Tensor dq = ni::dequantize_q4(q);
+        CHECK_CLOSE(dq.at(0, 0), 7.0, 1e-9);
+        CHECK_CLOSE(dq.at(0, 1), -7.0, 1e-9);
+    }
+
+    // Codes stay in [-7, 7] even with a huge outlier: |dequant| <= absmax per row.
+    {
+        Tensor w = make({1, 4}, {100, 1, -1, 0});
+        ni::Q4Tensor q = ni::quantize_q4(w);
+        Tensor dq = ni::dequantize_q4(q);
+        for (int64_t j = 0; j < 4; ++j) CHECK(std::fabs(dq.at(0, j)) <= 100.0 + 1e-4);
+    }
+
+    // All-zero Q4 row: scale 0, dequant 0 (no divide-by-zero).
+    {
+        Tensor w = make({2, 2}, {0, 0, 3, -3});
+        ni::Q4Tensor q = ni::quantize_q4(w);
+        CHECK_CLOSE(q.scale[0], 0.0, 1e-12);
+        Tensor dq = ni::dequantize_q4(q);
+        CHECK_CLOSE(dq.at(0, 0), 0.0, 1e-12);
+        CHECK_CLOSE(dq.at(0, 1), 0.0, 1e-12);
+    }
+
     // Odd in-features: the last byte uses only its low nibble; round-trip holds.
     {
         Tensor w = make({2, 3}, {1, -2, 4, 7, 0, -7});

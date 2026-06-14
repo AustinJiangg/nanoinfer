@@ -65,8 +65,8 @@ int main(int argc, char** argv) {
         int gen_mism = 0;
         for (size_t i = 0; i < ref_gen.size() && i < got.size(); ++i)
             if (ref_gen[i] != got[i]) ++gen_mism;
-        print_ids("fp32 greedy:", ref_gen);
-        print_ids("Q8   greedy:", got);
+        print_ids("fp32  greedy:", ref_gen);
+        print_ids((mode_str + " greedy:").c_str(), got);
         std::printf("greedy tokens matching fp32: %zu/%zu\n", ref_gen.size() - gen_mism,
                     ref_gen.size());
 
