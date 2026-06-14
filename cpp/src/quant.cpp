@@ -287,7 +287,7 @@ std::unique_ptr<QuantizedWeight> make_quantized(const Tensor& w, QuantMode mode)
     switch (mode) {
         case QuantMode::Q8: return std::make_unique<Q8Weight>(quantize_q8(w));
         case QuantMode::Q4: return std::make_unique<Q4Weight>(quantize_q4(w));
-        case QuantMode::Q4G: return std::make_unique<Q4GWeight>(quantize_q4g(w, 32));
+        case QuantMode::Q4G: return std::make_unique<Q4GWeight>(quantize_q4g(w));  // group 32
         case QuantMode::None: return nullptr;
     }
     return nullptr;

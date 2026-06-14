@@ -67,17 +67,20 @@ python tools/dump_reference.py  weights/qwen2.5-0.5b "The capital of France is"
 ./build/run_quant weights/qwen2.5-0.5b q4g
 ```
 
-Quantization modes (layer weights only; embedding/lm_head stay fp32):
+Quantization modes (layer weights only; embedding/lm_head stay fp32), measured
+on Qwen2.5-0.5B / "The capital of France is":
 
-| mode | what | memory | next-token vs fp32 |
-| --- | --- | --- | --- |
-| q8  | per-channel int8 | 2.2× | preserved |
-| q4  | per-channel int4 | 2.7× | **changed** (one row scale can't absorb outliers) |
-| q4g | group-wise int4 (32-block scales) | 2.6× | preserved |
+| mode | what | memory | 1st next-token | greedy match vs fp32 |
+| --- | --- | --- | --- | --- |
+| q8  | per-channel int8 | 2.2× | same | 11/12 |
+| q4  | per-channel int4 | 2.7× | **changed** | 0/12 |
+| q4g | group-wise int4 (32-block scales) | 2.6× | same | 5/12 |
 
 Per-channel int4 breaks the model — a single outlier inflates the whole row's
-scale and crushes the rest. Group-wise (llama.cpp's Q4_0 idea: one scale per
-32-element block) gives each block a local scale and recovers usability.
+scale and crushes the rest, so even the first token changes. Group-wise
+(llama.cpp's Q4_0 idea: one scale per 32-element block) gives each block a local
+scale and recovers the next token; the greedy continuation still drifts (4-bit is
+lossy), but far less than per-channel.
 
 The C++ logits match nanoinfer to ~4e-5 max abs diff (float accumulation order),
 argmax token-for-token. Greedy generation matches nanoinfer exactly — e.g. "The

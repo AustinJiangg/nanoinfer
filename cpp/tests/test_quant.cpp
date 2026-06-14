@@ -243,6 +243,40 @@ int main() {
                       q.scale[static_cast<size_t>(o * 3 + j / 4)] / 2.0 + 1e-6);
     }
 
+    // group == in collapses to per-channel: q4g(w, in) == q4(w) elementwise.
+    {
+        std::mt19937_64 rng(8);
+        std::normal_distribution<float> nd;
+        Tensor w({4, 16});
+        for (int64_t i = 0; i < w.numel(); ++i) w[i] = nd(rng);
+        Tensor a = ni::dequantize_q4g(ni::quantize_q4g(w, 16));  // one block per row
+        Tensor b = ni::dequantize_q4(ni::quantize_q4(w));
+        for (int64_t i = 0; i < a.numel(); ++i) CHECK_CLOSE(a[i], b[i], 1e-6);
+    }
+
+    // group == 1: each weight is its own block, so it maps to +-7 at its own
+    // absmax and dequant round-trips it exactly.
+    {
+        Tensor w = make({1, 5}, {3, -1, 0, 7, -2});
+        ni::Q4GTensor q = ni::quantize_q4g(w, 1);
+        CHECK(static_cast<int64_t>(q.scale.size()) == 5);
+        Tensor dq = ni::dequantize_q4g(q);
+        for (int64_t j = 0; j < 5; ++j) CHECK_CLOSE(dq.at(0, j), w[j], 1e-5);
+    }
+
+    // check_q4gtensor rejects a malformed tensor before indexing out of bounds.
+    {
+        ni::Q4GTensor bad;
+        bad.out = 2;
+        bad.in = 8;
+        bad.group = 4;
+        bad.q.assign(2 * 4, 0);    // ceil(8/2)=4 bytes/row -> ok
+        bad.scale.assign(1, 0.0f);  // wrong: should be out*ceil(in/group) = 2*2 = 4
+        bool threw = false;
+        try { ni::dequantize_q4g(bad); } catch (const std::exception&) { threw = true; }
+        CHECK(threw);
+    }
+
     // The polymorphic factory routes linear() to the matching free function.
     {
         std::mt19937_64 rng(7);

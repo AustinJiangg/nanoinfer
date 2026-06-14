@@ -50,6 +50,10 @@ Tensor linear_q8(const Tensor& x, const QTensor& w, const Tensor* bias = nullptr
 // (each stored as code+8, a nibble in [1, 15]), per row, plus one fp32 scale per
 // output row. ~8x smaller than fp32; ~18x coarser per weight than Q8. Like Q8
 // this is weight-only — it saves memory, not compute (still an fp inner product).
+//
+// Q4 is exactly Q4G (below) with group == in. It's kept as a separate, simpler
+// path on purpose: as a baseline that *demonstrates* per-channel int4 breaking on
+// real weights (one row scale can't absorb an outlier) — the motivation for Q4G.
 struct Q4Tensor {
     std::vector<uint8_t> q;    // [out * ceil(in/2)] packed nibbles
     std::vector<float> scale;  // [out]
@@ -73,6 +77,7 @@ struct Q4GTensor {
     int64_t group = 0;         // block size K
 };
 
+// group defaults to 32 — llama.cpp's Q4_0 block size (the memory/accuracy knob).
 Q4GTensor quantize_q4g(const Tensor& w, int64_t group = 32);
 Tensor dequantize_q4g(const Q4GTensor& w);
 Tensor linear_q4g(const Tensor& x, const Q4GTensor& w, const Tensor* bias = nullptr);
