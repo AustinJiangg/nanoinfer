@@ -40,9 +40,11 @@ struct RopeCache {
 RopeCache build_rope_cache(int64_t seq_len, int64_t head_dim, float theta);
 
 // Apply RoPE to a [heads, seq, head_dim] tensor (batch-1). cos/sin are
-// [>=seq, head_dim], aligned so row p is the rotation for position p. Returns a
-// new tensor; q and k are rotated by separate calls.
-Tensor apply_rope(const Tensor& x, const Tensor& cos, const Tensor& sin);
+// [>=pos_offset+seq, head_dim]; token i in x is at absolute position
+// pos_offset+i (pos_offset > 0 for cached decode, where the new token sits past
+// the cached prefix). Returns a new tensor; q and k are rotated by separate calls.
+Tensor apply_rope(const Tensor& x, const Tensor& cos, const Tensor& sin,
+                  int64_t pos_offset = 0);
 
 // --- Attention building blocks (batch-1; per-head tensors are [heads, seq, head_dim]) ---
 
@@ -58,9 +60,12 @@ Tensor merge_heads(const Tensor& x);
 Tensor repeat_kv(const Tensor& x, int64_t n_rep);
 
 // Scaled dot-product attention over [heads, seq, head_dim] q/k/v (k/v may be a
-// different seq length than q). scale = 1/sqrt(head_dim). causal=true is the
-// prefill mask — query i attends keys 0..i; decode/cache masking arrives in C3.
-Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, bool causal);
+// different seq length than q). scale = 1/sqrt(head_dim). With causal=true, query
+// i sits at absolute position query_offset+i and attends keys 0..(query_offset+i)
+// — query_offset=0 is prefill; query_offset>0 is cached decode, where one new
+// query attends the whole cached history.
+Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, bool causal,
+                 int64_t query_offset = 0);
 
 // RMSNorm over the last dimension: x / sqrt(mean(x^2) + eps) * weight.
 // x is [..., d] (treated as rows of length d); weight is [d]. Matches

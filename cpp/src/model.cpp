@@ -2,8 +2,8 @@
 
 #include <filesystem>
 #include <stdexcept>
+#include <utility>
 
-#include "ops.hpp"
 #include "serialize.hpp"
 
 namespace fs = std::filesystem;
@@ -21,6 +21,13 @@ Model::Model(const std::string& weights_dir) {
         }
     }
     if (w_.empty()) throw std::runtime_error("Model: no .bin weights in " + weights_dir);
+
+    // Build the RoPE tables once for the full context; forward slices them.
+    rope_ = build_rope_cache(cfg_.max_position_embeddings, cfg_.head_dim, cfg_.rope_theta);
+}
+
+KVCache Model::make_cache(int64_t max_seq) const {
+    return KVCache(cfg_.num_layers, cfg_.num_kv_heads, cfg_.head_dim, max_seq);
 }
 
 const Tensor& Model::W(const std::string& name) const {
@@ -29,13 +36,19 @@ const Tensor& Model::W(const std::string& name) const {
     return it->second;
 }
 
-Tensor Model::forward(const std::vector<int64_t>& ids) const {
+Tensor Model::forward(const std::vector<int64_t>& ids, KVCache* cache) const {
     const int64_t seq = static_cast<int64_t>(ids.size());
     const float eps = cfg_.rms_norm_eps;
 
-    // Embedding lookup, then the RoPE tables for positions 0..seq-1 (prefill).
+    // With a cache, the new tokens sit at positions start_pos.. (start_pos is the
+    // cache length before this pass — the same for every layer; advanced once at
+    // the end). Without a cache they run 0..seq-1.
+    const int64_t start_pos = cache ? cache->length() : 0;
+    if (start_pos + seq > rope_.cos.size(0))
+        throw std::runtime_error("forward: position " + std::to_string(start_pos + seq) +
+                                 " exceeds context length " + std::to_string(rope_.cos.size(0)));
+
     Tensor x = embedding(W("embed_tokens.weight"), ids);  // [seq, hidden]
-    RopeCache rope = build_rope_cache(seq, cfg_.head_dim, cfg_.rope_theta);
 
     for (int64_t i = 0; i < cfg_.num_layers; ++i) {
         const std::string L = "layers." + std::to_string(i) + ".";
@@ -50,13 +63,20 @@ Tensor Model::forward(const std::vector<int64_t>& ids) const {
         k = split_heads(k, cfg_.num_kv_heads, cfg_.head_dim);
         v = split_heads(v, cfg_.num_kv_heads, cfg_.head_dim);
 
-        q = apply_rope(q, rope.cos, rope.sin);
-        k = apply_rope(k, rope.cos, rope.sin);
+        // RoPE at absolute positions; cached keys are stored already rotated.
+        q = apply_rope(q, rope_.cos, rope_.sin, start_pos);
+        k = apply_rope(k, rope_.cos, rope_.sin, start_pos);
+
+        if (cache) {
+            auto kv = cache->update(i, k, v);  // append new K/V, read back the prefix
+            k = std::move(kv.first);
+            v = std::move(kv.second);
+        }
 
         k = repeat_kv(k, cfg_.n_rep());
         v = repeat_kv(v, cfg_.n_rep());
 
-        Tensor a = attention(q, k, v, /*causal=*/true);  // [n_heads, seq, head_dim]
+        Tensor a = attention(q, k, v, /*causal=*/true, /*query_offset=*/start_pos);
         a = merge_heads(a);                               // [seq, n_heads*head_dim]
         a = linear(a, W(L + "self_attn.o_proj.weight"));  // o_proj has no bias
         x = add(x, a);
@@ -68,6 +88,8 @@ Tensor Model::forward(const std::vector<int64_t>& ids) const {
         Tensor down = linear(mul(gate, up), W(L + "mlp.down_proj.weight"));
         x = add(x, down);
     }
+
+    if (cache) cache->advance(seq);
 
     x = rmsnorm(x, W("norm.weight"), eps);
     // Tied models share the embedding as the output projection, so the exporter

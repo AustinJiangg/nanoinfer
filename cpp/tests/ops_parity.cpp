@@ -121,6 +121,22 @@ int main(int argc, char** argv) {
             ni::Tensor expected = load_bin(dir + "attn_expected.bin");
             fails += compare_tensors(ni::attention(q, k, v, true), expected, 1e-5, "attention");
         }
+        // RoPE at a position offset (cached decode)
+        {
+            ni::Tensor q = load_bin(dir + "rope_off_q.bin");
+            ni::Tensor cos = load_bin(dir + "rope_off_cos.bin");
+            ni::Tensor sin = load_bin(dir + "rope_off_sin.bin");
+            ni::Tensor expected = load_bin(dir + "rope_off_expected.bin");
+            fails += compare_tensors(ni::apply_rope(q, cos, sin, 2), expected, 1e-5, "rope_offset");
+        }
+        // attention with query_offset (chunked decode)
+        {
+            ni::Tensor q = load_bin(dir + "attn_off_q.bin");
+            ni::Tensor k = load_bin(dir + "attn_off_k.bin");
+            ni::Tensor v = load_bin(dir + "attn_off_v.bin");
+            ni::Tensor expected = load_bin(dir + "attn_off_expected.bin");
+            fails += compare_tensors(ni::attention(q, k, v, true, 3), expected, 1e-5, "attention_offset");
+        }
     } catch (const std::exception& e) {
         std::printf("ops_parity: exception: %s\n", e.what());
         return 1;

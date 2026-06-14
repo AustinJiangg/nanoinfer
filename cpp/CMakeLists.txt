@@ -12,7 +12,7 @@ add_compile_options(-Wall -Wextra)
 # Core library. Kept as a plain C++ lib with a simple API so it can be wrapped by
 # pybind11 later (the F-stage fusion) without reshaping it.
 add_library(nicore
-  src/tensor.cpp src/ops.cpp src/serialize.cpp
+  src/tensor.cpp src/ops.cpp src/serialize.cpp src/cache.cpp
   src/config.cpp src/model.cpp src/sampling.cpp src/generate.cpp)
 target_include_directories(nicore PUBLIC src)
 
@@ -39,6 +39,11 @@ target_link_libraries(test_sampling PRIVATE nicore)
 target_include_directories(test_sampling PRIVATE tests)
 add_test(NAME test_sampling COMMAND test_sampling)
 
+add_executable(test_cache tests/test_cache.cpp)
+target_link_libraries(test_cache PRIVATE nicore)
+target_include_directories(test_cache PRIVATE tests)
+add_test(NAME test_cache COMMAND test_cache)
+
 # numpy parity: a setup test generates fixtures, then ops_parity checks against them.
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_executable(ops_parity tests/ops_parity.cpp)
@@ -62,3 +67,7 @@ target_include_directories(run_parity PRIVATE tests)
 add_executable(run_generate tests/run_generate.cpp)
 target_link_libraries(run_generate PRIVATE nicore)
 target_include_directories(run_generate PRIVATE tests)
+
+add_executable(run_cache tests/run_cache.cpp)
+target_link_libraries(run_cache PRIVATE nicore)
+target_include_directories(run_cache PRIVATE tests)

@@ -110,21 +110,24 @@ RopeCache build_rope_cache(int64_t seq_len, int64_t head_dim, float theta) {
     return {std::move(cos), std::move(sin)};
 }
 
-Tensor apply_rope(const Tensor& x, const Tensor& cos, const Tensor& sin) {
+Tensor apply_rope(const Tensor& x, const Tensor& cos, const Tensor& sin, int64_t pos_offset) {
     require(x.ndim() == 3, "apply_rope expects [heads, seq, head_dim]");
     const int64_t heads = x.size(0), seq = x.size(1), dim = x.size(2);
     const int64_t half = dim / 2;
-    require(cos.ndim() == 2 && cos.size(1) == dim && cos.size(0) >= seq, "apply_rope: cos shape");
-    require(sin.ndim() == 2 && sin.size(1) == dim && sin.size(0) >= seq, "apply_rope: sin shape");
+    require(cos.ndim() == 2 && cos.size(1) == dim && cos.size(0) >= pos_offset + seq,
+            "apply_rope: cos shape");
+    require(sin.ndim() == 2 && sin.size(1) == dim && sin.size(0) >= pos_offset + seq,
+            "apply_rope: sin shape");
 
     Tensor out({heads, seq, dim});
     for (int64_t h = 0; h < heads; ++h) {
         for (int64_t p = 0; p < seq; ++p) {
+            const int64_t pos = pos_offset + p;  // absolute position of token p
             for (int64_t d = 0; d < dim; ++d) {
                 // rotate_half(x) = [-x2, x1]: the first half pulls -(second half),
                 // the second half pulls +(first half).
                 const float rot = (d < half) ? -x.at(h, p, d + half) : x.at(h, p, d - half);
-                out.at(h, p, d) = x.at(h, p, d) * cos.at(p, d) + rot * sin.at(p, d);
+                out.at(h, p, d) = x.at(h, p, d) * cos.at(pos, d) + rot * sin.at(pos, d);
             }
         }
     }
@@ -167,7 +170,8 @@ Tensor repeat_kv(const Tensor& x, int64_t n_rep) {
     return out;
 }
 
-Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, bool causal) {
+Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, bool causal,
+                 int64_t query_offset) {
     require(q.ndim() == 3 && k.ndim() == 3 && v.ndim() == 3, "attention expects 3-D q/k/v");
     const int64_t heads = q.size(0), sq = q.size(1), dim = q.size(2);
     const int64_t sk = k.size(1);
@@ -181,8 +185,11 @@ Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, bool causal)
 
     for (int64_t h = 0; h < heads; ++h) {
         for (int64_t i = 0; i < sq; ++i) {
-            // Keys this query may attend: 0..i under the causal (prefill) mask.
-            const int64_t limit = causal ? (i + 1) : sk;
+            // Query i is at absolute position query_offset+i and may attend keys
+            // 0..(query_offset+i). For decode (one query past a cached prefix)
+            // that's the whole cache; clamp to the available keys for safety.
+            int64_t limit = causal ? (query_offset + i + 1) : sk;
+            if (limit > sk) limit = sk;
             // scores_j = scale * (q_i . k_j); track the max for stable softmax.
             float maxv = -std::numeric_limits<float>::infinity();
             for (int64_t j = 0; j < limit; ++j) {

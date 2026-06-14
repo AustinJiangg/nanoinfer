@@ -59,18 +59,21 @@ python tools/dump_reference.py  weights/qwen2.5-0.5b "The capital of France is"
 ./build/run_parity weights/qwen2.5-0.5b
 # 3b. generate: greedy parity vs nanoinfer + a sampled demo
 ./build/run_generate weights/qwen2.5-0.5b
+# 3c. cached forward == uncached full recompute (bit-identical)
+./build/run_cache weights/qwen2.5-0.5b
 ```
 
 The C++ logits match nanoinfer to ~4e-5 max abs diff (float accumulation order),
 argmax token-for-token. Greedy generation matches nanoinfer exactly — e.g. "The
 capital of France is" → " Paris. It is the largest city in Europe and the second".
-(No KV cache yet, so generation re-runs the full forward each step — that's C3.)
+Generation uses a KV cache (prefill + decode); cached output is bit-identical to
+the full recompute and ~7× faster.
 
 ## Status
 
 - [x] **C0** — Tensor + ops (matmul/rmsnorm/softmax/add), CMake, numpy parity
 - [x] **C1** — Qwen2.5 forward pass; NIT0 weight export, logit parity vs nanoinfer
 - [x] **C2** — sampling + generate loop; greedy generation matches nanoinfer token-for-token
-- [ ] **C3** — KV cache
+- [x] **C3** — KV cache (prefill/decode); bit-identical to full recompute, ~7× faster
 - [ ] **C4** — quantization (Q8/Q4)
 - [ ] **C5** — SIMD / multithreading

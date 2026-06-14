@@ -59,17 +59,21 @@ def repeat_kv(x: np.ndarray, n_rep: int) -> np.ndarray:
     return np.repeat(x, n_rep, axis=0)  # [H*n_rep, S, D]
 
 
-def attention(q: np.ndarray, k: np.ndarray, v: np.ndarray, causal: bool) -> np.ndarray:
+def attention(q: np.ndarray, k: np.ndarray, v: np.ndarray, causal: bool,
+              query_offset: int = 0) -> np.ndarray:
     h, sq, d = q.shape
     sk = k.shape[1]
     scale = 1.0 / np.sqrt(d)
     qd, kd, vd = q.astype(np.float64), k.astype(np.float64), v.astype(np.float64)
     out = np.zeros((h, sq, d), dtype=np.float64)
+    # query i is at absolute position query_offset+i and attends keys j <= that.
+    qpos = np.arange(sq)[:, None] + query_offset
+    kpos = np.arange(sk)[None, :]
+    drop = kpos > qpos  # [sq, sk]
     for hi in range(h):
         scores = (qd[hi] @ kd[hi].T) * scale  # [sq, sk]
         if causal:
-            mask = np.triu(np.ones((sq, sk), dtype=bool), k=1)  # j > i
-            scores = np.where(mask, -np.inf, scores)
+            scores = np.where(drop, -np.inf, scores)
         scores -= scores.max(axis=-1, keepdims=True)
         e = np.exp(scores)
         attn = e / e.sum(axis=-1, keepdims=True)
@@ -171,6 +175,26 @@ def main() -> None:
     save_bin(out / "attn_k.bin", ak)
     save_bin(out / "attn_v.bin", av)
     save_bin(out / "attn_expected.bin", attention(aq, ak, av, causal=True))
+
+    # RoPE applied at a position offset (cached decode): cos/sin built for
+    # offset+t positions, q rotated at rows offset..offset+t-1.  off=2, t=3, D=8.
+    roff_cos, roff_sin = build_rope_cache(5, 8, 10000.0)
+    save_bin(out / "rope_off_cos.bin", roff_cos)
+    save_bin(out / "rope_off_sin.bin", roff_sin)
+    roff_q = rng.standard_normal((2, 3, 8)).astype(np.float32)
+    save_bin(out / "rope_off_q.bin", roff_q)
+    save_bin(out / "rope_off_expected.bin",
+             apply_rope(roff_q, roff_cos[2:5], roff_sin[2:5]))
+
+    # Attention with query_offset (chunked decode): 2 new queries past a 3-key
+    # prefix -> 5 keys; query 0 (pos 3) sees keys 0..3, query 1 (pos 4) sees 0..4.
+    oq = rng.standard_normal((2, 2, 4)).astype(np.float32)
+    ok = rng.standard_normal((2, 5, 4)).astype(np.float32)
+    ov = rng.standard_normal((2, 5, 4)).astype(np.float32)
+    save_bin(out / "attn_off_q.bin", oq)
+    save_bin(out / "attn_off_k.bin", ok)
+    save_bin(out / "attn_off_v.bin", ov)
+    save_bin(out / "attn_off_expected.bin", attention(oq, ok, ov, causal=True, query_offset=3))
 
     print(f"wrote fixtures to {out}")
 
