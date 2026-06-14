@@ -39,6 +39,7 @@ Config load_config(const std::string& path) {
     need(c.num_attention_heads, "num_attention_heads");
     need(c.num_kv_heads, "num_kv_heads");
     need(c.head_dim, "head_dim");
+    need(c.max_position_embeddings, "max_position_embeddings");
     if (c.num_attention_heads % c.num_kv_heads != 0)
         throw std::runtime_error("load_config: num_attention_heads must be divisible by num_kv_heads");
     return c;

@@ -178,6 +178,12 @@ Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, bool causal,
     require(k.size(0) == heads && v.size(0) == heads, "attention: head count must match");
     require(k.size(2) == dim && v.size(2) == dim, "attention: head_dim must match");
     require(v.size(1) == sk, "attention: k and v seq length must match");
+    // Causal invariant: the sq new queries are the last positions, so their
+    // absolute range [query_offset, query_offset+sq) must end exactly at the key
+    // count. A mismatch means a stale/wrong offset — fail loud, don't silently
+    // mask the wrong key set.
+    require(!causal || query_offset + sq == sk,
+            "attention: causal query_offset + query_len must equal key length");
 
     const float scale = 1.0f / std::sqrt(float(dim));
     Tensor out({heads, sq, dim});
@@ -185,11 +191,9 @@ Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, bool causal,
 
     for (int64_t h = 0; h < heads; ++h) {
         for (int64_t i = 0; i < sq; ++i) {
-            // Query i is at absolute position query_offset+i and may attend keys
-            // 0..(query_offset+i). For decode (one query past a cached prefix)
-            // that's the whole cache; clamp to the available keys for safety.
-            int64_t limit = causal ? (query_offset + i + 1) : sk;
-            if (limit > sk) limit = sk;
+            // Query i is at absolute position query_offset+i and attends keys
+            // 0..(query_offset+i). The invariant above guarantees limit <= sk.
+            const int64_t limit = causal ? (query_offset + i + 1) : sk;
             // scores_j = scale * (q_i . k_j); track the max for stable softmax.
             float maxv = -std::numeric_limits<float>::infinity();
             for (int64_t j = 0; j < limit; ++j) {

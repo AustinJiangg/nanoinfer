@@ -6,6 +6,8 @@ namespace ni {
 
 KVCache::KVCache(int64_t num_layers, int64_t n_kv_heads, int64_t head_dim, int64_t max_seq)
     : n_kv_heads_(n_kv_heads), head_dim_(head_dim), max_seq_(max_seq) {
+    if (num_layers <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_seq <= 0)
+        throw std::invalid_argument("KVCache: all dimensions must be positive");
     k_.reserve(static_cast<size_t>(num_layers));
     v_.reserve(static_cast<size_t>(num_layers));
     for (int64_t i = 0; i < num_layers; ++i) {
@@ -15,6 +17,8 @@ KVCache::KVCache(int64_t num_layers, int64_t n_kv_heads, int64_t head_dim, int64
 }
 
 std::pair<Tensor, Tensor> KVCache::update(int64_t layer, const Tensor& k, const Tensor& v) {
+    if (layer < 0 || static_cast<size_t>(layer) >= k_.size())
+        throw std::out_of_range("KVCache::update: layer index out of range");
     const int64_t t = k.size(1);
     const int64_t start = length_;     // same for every layer this forward
     const int64_t end = start + t;

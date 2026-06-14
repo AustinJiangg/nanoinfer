@@ -61,7 +61,22 @@ int main(int argc, char** argv) {
             if (d > maxd) maxd = d;
         }
 
-        std::printf("cached vs uncached: max|diff|=%g over %lld positions (split=%lld)\n",
+        // Chunked decode: prefill `split`, then feed the remaining tokens as ONE
+        // multi-token chunk at a nonzero cache length (t>1, start_pos>0) — the
+        // path single-token decode never exercises.
+        {
+            ni::KVCache c2 = model.make_cache(seq);
+            std::vector<int64_t> pre(ids.begin(), ids.begin() + split);
+            model.forward(pre, &c2);
+            std::vector<int64_t> chunk(ids.begin() + split, ids.end());
+            ni::Tensor lc = model.forward(chunk, &c2);  // [seq-split, vocab]
+            for (int64_t r = 0; r < seq - split; ++r) {
+                const double d = row_maxdiff(lc, r, ref, split + r, vocab);
+                if (d > maxd) maxd = d;
+            }
+        }
+
+        std::printf("cached vs uncached: max|diff|=%g over %lld positions (split=%lld, +chunk)\n",
                     maxd, (long long)seq, (long long)split);
         const bool ok = maxd < 1e-3;
         std::printf(ok ? "run_cache: ok\n" : "run_cache: FAIL\n");

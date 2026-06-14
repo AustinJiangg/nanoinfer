@@ -27,6 +27,13 @@ class KVCache {
 public:
     KVCache(int64_t num_layers, int64_t n_kv_heads, int64_t head_dim, int64_t max_seq);
 
+    // Move-only: the per-layer buffers are large and a copy is never intended;
+    // make an accidental copy a compile error rather than a silent deep clone.
+    KVCache(const KVCache&) = delete;
+    KVCache& operator=(const KVCache&) = delete;
+    KVCache(KVCache&&) = default;
+    KVCache& operator=(KVCache&&) = default;
+
     int64_t length() const { return length_; }
     int64_t max_seq() const { return max_seq_; }
 
