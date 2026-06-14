@@ -27,11 +27,14 @@ token. This is the single biggest correctness-preserving speedup.
 token-for-token and HF greedy decoding, and is measurably faster. The stage-0
 full-recompute path stays reachable via `--no-cache` for A/B.
 
-## Stage 2 — Sampling strategies
-- [ ] temperature, top-k, top-p (nucleus), repetition penalty
-- [ ] Seeded RNG for reproducible sampling
-- [ ] `--temperature`, `--top-k`, `--top-p` CLI flags
-- [ ] Tests: temperature=0 == greedy; top-k=1 == greedy; distribution sanity
+## Stage 2 — Sampling strategies  ✅ landed
+- [x] temperature, top-k, top-p (nucleus), repetition penalty — `sampling.py`
+- [x] Seeded RNG for reproducible sampling (`torch.Generator`)
+- [x] `--temperature`, `--top-k`, `--top-p`, `--repetition-penalty`, `--seed` CLI flags
+- [x] Tests: temperature=0 == greedy; top-k=1 == greedy; distribution sanity
+**Done when:** `SamplingParams()` defaults to greedy (so prior behavior is
+unchanged), the warpers compose in HF order, and a seed makes sampling
+reproducible. temperature 0 short-circuits to argmax; top-k 1 collapses to greedy.
 
 ## Stage 3 — Continuous batching
 Serve multiple prompts at once; admit/evict sequences as they finish, don't wait

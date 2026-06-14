@@ -49,6 +49,16 @@ Completion:  Paris. It is the largest city in Europe and the second largest in t
 
 The first run downloads the model weights (~1 GB) from the Hugging Face Hub.
 
+Decoding defaults to greedy (deterministic). Pass sampling flags to vary output:
+
+```bash
+python -m nanoinfer.generate --prompt "Once upon a time" \
+    --temperature 0.8 --top-p 0.95 --top-k 50 --seed 1234
+```
+
+`--temperature 0` (the default) is greedy; a `--seed` makes sampling
+reproducible. `--repetition-penalty 1.3` discourages repeats.
+
 ## Test
 
 ```bash
@@ -70,11 +80,13 @@ nanoinfer/
   weights.py    load an HF checkpoint -> our own state-dict naming
   layers.py     rmsnorm, rope, attention, swiglu, transformer block
   cache.py      per-layer KV cache for incremental decoding (stage 1)
+  sampling.py   temperature / top-k / top-p / repetition penalty (stage 2)
   model.py      assembles the blocks; forward(input_ids, cache=None) -> logits
   generate.py   the autoregressive loop + CLI entry point
 tests/
   test_layers.py    shape + numerical-parity tests vs HF
   test_cache.py     cached decode == stage-0 full recompute, token-for-token
+  test_sampling.py  warpers + greedy-equivalence invariants
   test_generate.py  end-to-end: greedy output matches HF, deterministic
 ROADMAP.md      the staged plan
 CLAUDE.md       how we develop here: the golden rule, conventions, sharp edges
@@ -82,12 +94,12 @@ CLAUDE.md       how we develop here: the golden rule, conventions, sharp edges
 
 ## Status & roadmap
 
-Stages 0 and 1 are complete and verified against Hugging Face. See
+Stages 0–2 are complete and verified against Hugging Face. See
 [ROADMAP.md](ROADMAP.md) for the full plan.
 
 - [x] **Stage 0** — naive forward pass + greedy decoding (full recompute, no cache)
 - [x] **Stage 1** — KV cache (prefill / decode split); ~2.4× faster, same tokens
-- [ ] **Stage 2** — sampling: temperature, top-k, top-p, repetition penalty
+- [x] **Stage 2** — sampling: temperature, top-k, top-p, repetition penalty (seeded)
 - [ ] **Stage 3** — continuous batching
 - [ ] **Stage 4** — paged attention (vLLM-style block KV cache)
 - [ ] **Stage 5** — quantization / custom kernels (stretch)

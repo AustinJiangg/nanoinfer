@@ -78,3 +78,47 @@ def test_greedy_is_deterministic():
     a = generate(model, tokenizer, "Hello, my name is", max_tokens=8)
     b = generate(model, tokenizer, "Hello, my name is", max_tokens=8)
     assert a == b
+
+
+@pytest.mark.slow
+def test_temperature_zero_matches_default_greedy():
+    # Explicit temperature=0 sampling must reproduce the default greedy path
+    # end-to-end (same tokens), confirming the greedy short-circuit.
+    from transformers import AutoTokenizer
+
+    from nanoinfer.generate import generate
+    from nanoinfer.sampling import SamplingParams
+    from nanoinfer.weights import load_model
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL)
+    model, _ = load_model(MODEL, dtype=torch.float32, device="cpu")
+    prompt = "The capital of France is"
+
+    greedy = generate(model, tokenizer, prompt, max_tokens=10)
+    sampled = generate(
+        model, tokenizer, prompt, max_tokens=10,
+        sampling=SamplingParams(temperature=0.0),
+    )
+    assert greedy == sampled
+
+
+@pytest.mark.slow
+def test_seeded_sampling_is_reproducible():
+    # Same seed + same params -> identical text; sampling is on (temperature > 0).
+    from transformers import AutoTokenizer
+
+    from nanoinfer.generate import generate
+    from nanoinfer.sampling import SamplingParams
+    from nanoinfer.weights import load_model
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL)
+    model, _ = load_model(MODEL, dtype=torch.float32, device="cpu")
+    prompt = "Once upon a time"
+
+    def run():
+        return generate(
+            model, tokenizer, prompt, max_tokens=12,
+            sampling=SamplingParams(temperature=0.8, top_p=0.95, top_k=50, seed=1234),
+        )
+
+    assert run() == run()
