@@ -140,6 +140,44 @@ MATCH bar, driven from Python. Like them it needs the weight export + reference
 dump first, so it isn't wired into `ctest`. Greedy is deterministic and matches
 nanoinfer; sampled output is not token-identical (the C++ RNG differs from torch).
 
+### Continuous batching (F7)
+
+`python/scheduler.py` is the serving layer: a `Scheduler` that runs many requests
+at once over the F6 kernels. Each request gets its own KV cache; every step decodes
+the running set by one token, evicts finished sequences, and admits queued ones into
+the freed slots — *continuous* batching, so a short request never waits behind a
+long one and slots stay full while there's work. Token selection is in Python
+(numpy), the same warpers/order as nanoinfer/sampling.py.
+
+```python
+import sys; sys.path.insert(0, "build"); sys.path.insert(0, "python")
+import nicpp
+from scheduler import Request, Scheduler
+
+model = nicpp.Model("weights/qwen2.5-0.5b")
+sched = Scheduler(model, max_batch=4)
+sched.add(Request("a", [785, 6722, 315, 9625, 374], max_tokens=16))   # one cache each
+sched.add(Request("b", [785, 6722, 315], max_tokens=8))
+outputs = sched.run()        # {request_id: output_ids}; or call sched.step() yourself
+```
+
+```bash
+# greedy output is token-identical to standalone generate at every batch size,
+# incl. a repetition-penalty request (per-sequence context tracked independently)
+python tests/run_serve.py weights/qwen2.5-0.5b
+# serve several prompts at once (HF tokenize -> scheduler -> HF decode)
+python tools/serve.py --max-batch 2 --max-tokens 16 \
+    --prompt "The capital of France is" --prompt "Once upon a time" --prompt "Water boils at"
+```
+
+Honest scope: this is the *scheduling* layer. The kernels are still batch-1, so
+`step()` loops one `forward()` per running sequence — it does not yet fuse the
+per-sequence GEMMs into one batched matmul, so on a single box it is compute-
+equivalent to running the requests in sequence (the win is latency / slot
+utilization / no head-of-line blocking, not raw throughput). A batched C++ forward
+kernel — the throughput lever — slots in *under* this scheduler without changing it,
+and pairs with the F8 paged-attention read path (per-sequence cache lengths).
+
 ## Performance (C5: SIMD + threads)
 
 The hot kernels (`linear`, the quant linears, attention) reduce through the AVX2/FMA
@@ -194,3 +232,9 @@ prefill, an uncommon path).
       to Python, `forward()` → numpy logits, `generate()` → ids, GIL dropped during
       the kernels. Parity-tested through the binding and a text demo (HF tokenize →
       C++ kernels → HF decode). See "Use from Python" below. The F7 substrate.
+- [x] **F7** — Python serving layer: a continuous-batching `Scheduler`
+      (`python/scheduler.py`) over the F6 kernels — per-sequence KV cache, one-token
+      decode per step, dynamic admit/evict (no head-of-line blocking). Greedy output
+      is token-identical to standalone generate at every batch size
+      (`tests/run_serve.py`); `tools/serve.py` serves several prompts at once. The
+      *scheduling* win; batched-GEMM throughput is the next kernel step.

@@ -99,7 +99,18 @@ API simple/C-style so the later binding is cheap.
       text demo (`tools/generate.py`: HF tokenize → our C++ kernels → HF decode) —
       the first end-to-end fusion, the vLLM shape in miniature. These are the exact
       primitives F7 builds a scheduler on (per-sequence KVCache + forward).
-- [ ] **F7** — Python serving layer: scheduler + continuous batching over C++ kernels
+- [x] **F7** — Python serving layer: a continuous-batching `Scheduler`
+      (`cpp/python/scheduler.py`) over the F6 kernels. Each request gets its own KV
+      cache; each step decodes the running set by one token, evicts the finished, and
+      admits queued requests into the freed slots (iteration-level batching — no
+      head-of-line blocking, evict+admit overlap in one step). Token selection is in
+      Python (numpy), same warpers/order as nanoinfer/sampling.py. Tested
+      (`tests/run_serve.py`): interleaved greedy output is token-identical to
+      standalone generate at every batch size, incl. a repetition-penalty request
+      (per-sequence context tracked independently). Honest scope: the kernels are
+      still batch-1 (one forward per sequence per step), so this is the *scheduling*
+      win (latency/utilization), not yet batched-GEMM throughput — a batched C++
+      forward slots in under the same scheduler (pairs with F8).
 - [ ] **F8** — paged attention (C++ kernel + Python block scheduler) — the merge point
 
 ## Reference reading
