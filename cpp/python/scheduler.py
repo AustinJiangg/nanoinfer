@@ -133,9 +133,13 @@ class Scheduler:
     yourself to interleave with other work (an event loop, request arrivals, ...).
     """
 
-    def __init__(self, model, max_batch: int = 8):
+    def __init__(self, model, max_batch: int = 8, batched: bool = True):
         self.model = model
         self.max_batch = max_batch
+        # batched=True decodes the whole running set in one forward_batch call (F8a:
+        # the per-sequence projection GEMMs fuse into one matmul). False keeps the
+        # per-sequence forward() loop (F7) — same tokens, for A/B and parity checks.
+        self.batched = batched
         self.waiting: deque[Request] = deque()
         self.running: list[Sequence] = []
         self.finished: dict[str, list[int]] = {}
@@ -165,11 +169,20 @@ class Scheduler:
         return len(seq.output_ids) >= seq.req.max_tokens
 
     def step(self) -> None:
-        # 1. Decode: advance each running sequence by one token (a 1-token forward).
-        for seq in self.running:
-            logits = self.model.forward([seq.last_token], seq.cache)  # [1, vocab]
-            if self._emit(seq, logits[-1]):
-                self._finish(seq)
+        # 1. Decode the running set by one token. Batched: one forward_batch over all
+        #    N sequences (fused projections). Else: a forward() per sequence. Either
+        #    way row i belongs to running[i], so the emit/stop logic is shared.
+        if self.running:
+            if self.batched:
+                tokens = [s.last_token for s in self.running]
+                caches = [s.cache for s in self.running]
+                logits = self.model.forward_batch(tokens, caches)  # [N, vocab]
+                rows = [logits[i] for i in range(len(self.running))]
+            else:
+                rows = [self.model.forward([s.last_token], s.cache)[-1] for s in self.running]
+            for seq, row in zip(self.running, rows):
+                if self._emit(seq, row):
+                    self._finish(seq)
 
         # 2. Evict the finished, freeing their slots.
         self.running = [s for s in self.running if s.state is State.RUNNING]

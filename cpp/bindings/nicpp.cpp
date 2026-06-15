@@ -136,6 +136,25 @@ PYBIND11_MODULE(nicpp, m) {
             py::arg("ids"), py::arg("cache") = static_cast<KVCache*>(nullptr),
             "Token ids -> logits [seq, vocab] (numpy). With a KVCache, `ids` is the "
             "new token(s), placed at positions cache.length..; the cache advances after.")
+        .def(
+            "forward_batch",
+            [](const Model& self, const std::vector<int64_t>& tokens, py::list caches_list) {
+                // One new token per sequence, each with its own cache. Cast the
+                // KVCache handles to pointers here (GIL held) before releasing.
+                std::vector<KVCache*> caches;
+                caches.reserve(caches_list.size());
+                for (const py::handle h : caches_list) caches.push_back(h.cast<KVCache*>());
+                Tensor logits;
+                {
+                    py::gil_scoped_release release;
+                    logits = self.forward_batch(tokens, caches);
+                }
+                return tensor_to_numpy(logits);
+            },
+            py::arg("tokens"), py::arg("caches"),
+            "Batched single-token decode (F8a): N new tokens + their N KVCaches -> "
+            "logits [N, vocab]. Row s equals forward([tokens[s]], caches[s]); each "
+            "cache advances by 1. The projection GEMMs are fused over the N rows.")
         .def("make_cache", &Model::make_cache, py::arg("max_seq"),
              "Allocate a KV cache sized for this model.")
         .def(

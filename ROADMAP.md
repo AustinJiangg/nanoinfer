@@ -111,7 +111,17 @@ API simple/C-style so the later binding is cheap.
       still batch-1 (one forward per sequence per step), so this is the *scheduling*
       win (latency/utilization), not yet batched-GEMM throughput — a batched C++
       forward slots in under the same scheduler (pairs with F8).
-- [ ] **F8** — paged attention (C++ kernel + Python block scheduler) — the merge point
+- [x] **F8a** — batched decode kernel: `Model::forward_batch` runs N sequences'
+      one-token decode in a single pass — the per-sequence projection GEMMs fuse over
+      the N rows (each weight streamed once, reused across tokens; the same lever that
+      makes prefill compute-bound), while attention stays a per-sequence loop (each
+      token attends only its own cache). Bit-identical to N standalone forwards
+      (`tests/run_batch.cpp`, `max|diff|=0`), wired under the F7 scheduler
+      (`batched=True`, parity re-checked in `tests/run_serve.py`); ~2.5× aggregate
+      decode tok/s at batch 16 on 20 cores — the throughput lever F7 was missing.
+- [ ] **F8b** — paged attention: KV cache in fixed-size blocks + a block table per
+      sequence + a paged attention read path (C++ kernel + Python block scheduler).
+      The vLLM merge point; output matches the contiguous-cache path.
 
 ## Reference reading
 - PagedAttention / vLLM paper — KV memory management

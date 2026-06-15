@@ -140,7 +140,7 @@ MATCH bar, driven from Python. Like them it needs the weight export + reference
 dump first, so it isn't wired into `ctest`. Greedy is deterministic and matches
 nanoinfer; sampled output is not token-identical (the C++ RNG differs from torch).
 
-### Continuous batching (F7)
+### Continuous batching (F7) + batched decode (F8a)
 
 `python/scheduler.py` is the serving layer: a `Scheduler` that runs many requests
 at once over the F6 kernels. Each request gets its own KV cache; every step decodes
@@ -148,6 +148,15 @@ the running set by one token, evicts finished sequences, and admits queued ones 
 the freed slots — *continuous* batching, so a short request never waits behind a
 long one and slots stay full while there's work. Token selection is in Python
 (numpy), the same warpers/order as nanoinfer/sampling.py.
+
+By default (`batched=True`) the scheduler decodes the whole running set in one
+`Model.forward_batch(tokens, caches)` call (stage **F8a**): the per-sequence
+projection GEMMs (q/k/v/o/gate/up/down) fuse into one matmul over the N rows, so each
+weight is streamed once and reused across all N tokens — the same row-reuse that
+makes prefill compute-bound, now applied to decode. Attention stays a per-sequence
+loop (each token attends only its own cache, at its own position). Row s is
+bit-identical to a standalone `forward([tokens[s]], caches[s])`, so output is
+unchanged — `batched=False` keeps the per-sequence `forward()` loop (F7) for A/B.
 
 ```python
 import sys; sys.path.insert(0, "build"); sys.path.insert(0, "python")
@@ -162,21 +171,29 @@ outputs = sched.run()        # {request_id: output_ids}; or call sched.step() yo
 ```
 
 ```bash
-# greedy output is token-identical to standalone generate at every batch size,
-# incl. a repetition-penalty request (per-sequence context tracked independently)
+# F8a kernel: batched decode == N standalone forwards (bit-identical) + a tok/s sweep
+./build/run_batch weights/qwen2.5-0.5b
+# greedy output is token-identical to standalone generate at every batch size and on
+# both decode paths (batched / per-sequence), incl. a repetition-penalty request
 python tests/run_serve.py weights/qwen2.5-0.5b
 # serve several prompts at once (HF tokenize -> scheduler -> HF decode)
 python tools/serve.py --max-batch 2 --max-tokens 16 \
     --prompt "The capital of France is" --prompt "Once upon a time" --prompt "Water boils at"
 ```
 
-Honest scope: this is the *scheduling* layer. The kernels are still batch-1, so
-`step()` loops one `forward()` per running sequence — it does not yet fuse the
-per-sequence GEMMs into one batched matmul, so on a single box it is compute-
-equivalent to running the requests in sequence (the win is latency / slot
-utilization / no head-of-line blocking, not raw throughput). A batched C++ forward
-kernel — the throughput lever — slots in *under* this scheduler without changing it,
-and pairs with the F8 paged-attention read path (per-sequence cache lengths).
+Batched decode throughput (`run_batch`, Qwen2.5-0.5B, 20-core CPU, aggregate tok/s):
+
+| batch | 1 | 2 | 4 | 8 | 16 |
+| --- | --- | --- | --- | --- | --- |
+| decode tok/s | 21.7 | 33.6 | 45.9 | 49.6 | 53.4 |
+| speedup | 1.0× | 1.5× | 2.1× | 2.3× | 2.5× |
+
+The win comes from weight reuse: batch-1 decode streams every weight to emit one
+token (memory-bound), while batched decode streams it once for N tokens. It tapers
+as the fused GEMMs turn the step compute-bound — the same wall prefill hits. Still
+left for **F8b**: paged attention (block KV cache + block table + paged read path),
+the vLLM merge point — `forward_batch` here uses each sequence's own contiguous
+cache; paging removes the contiguous-memory requirement for high KV utilization.
 
 ## Performance (C5: SIMD + threads)
 
@@ -238,3 +255,8 @@ prefill, an uncommon path).
       is token-identical to standalone generate at every batch size
       (`tests/run_serve.py`); `tools/serve.py` serves several prompts at once. The
       *scheduling* win; batched-GEMM throughput is the next kernel step.
+- [x] **F8a** — batched decode kernel: `Model::forward_batch` decodes N sequences in
+      one pass, fusing the per-sequence projection GEMMs over the N rows (attention
+      stays a per-sequence loop). Bit-identical to N standalone forwards
+      (`tests/run_batch.cpp`), driven under the scheduler (`batched=True`); ~2.5×
+      aggregate decode tok/s at batch 16. The throughput lever F7 was missing.

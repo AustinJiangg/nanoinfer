@@ -67,19 +67,22 @@ def main() -> int:
     ref = {r.request_id: standalone(model, r) for r in reqs}
 
     ok = True
-    # max_batch 1 (fully serial through the scheduler) and 2 and a roomy 8 must all
-    # agree with standalone — greedy output is invariant to how sequences are packed.
-    for max_batch in (1, 2, 8):
-        sched = Scheduler(model, max_batch=max_batch)
-        for r in reqs:
-            sched.add(r)
-        out = sched.run()
+    # Both decode paths (batched=F8a forward_batch, and the per-sequence F7 loop), at
+    # several batch sizes, must agree with standalone — greedy output is invariant to
+    # how sequences are packed AND to whether the projections are fused.
+    for batched in (False, True):
+        for max_batch in (1, 2, 8):
+            sched = Scheduler(model, max_batch=max_batch, batched=batched)
+            for r in reqs:
+                sched.add(r)
+            out = sched.run()
 
-        mism = [rid for rid in ref if out.get(rid) != ref[rid]]
-        match = not mism
-        ok = ok and match and len(out) == len(reqs)
-        print(f"max_batch={max_batch}: steps={sched.steps} peak_batch={sched.peak_batch} "
-              f"-> {'MATCH' if match else 'MISMATCH ' + str(mism)}")
+            mism = [rid for rid in ref if out.get(rid) != ref[rid]]
+            match = not mism
+            ok = ok and match and len(out) == len(reqs)
+            print(f"batched={batched!s:5} max_batch={max_batch}: steps={sched.steps} "
+                  f"peak_batch={sched.peak_batch} "
+                  f"-> {'MATCH' if match else 'MISMATCH ' + str(mism)}")
 
     # Show one interleaving concretely (the smallest batch that actually queues).
     print("\nper-request greedy output (vs standalone):")

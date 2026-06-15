@@ -18,6 +18,21 @@ bool is_layer_proj(const std::string& name) {
     return name.rfind("layers.", 0) == 0 && name.size() > suffix.size() &&
            name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
+
+// forward_batch helpers: move one token between the batched [n, heads*dim]
+// projection layout and the [heads, 1, dim] per-token layout the attention ops use.
+// Row s of a projection -> [heads, 1, dim] (split_heads specialized to one token).
+Tensor row_to_heads(const Tensor& x, int64_t s, int64_t heads, int64_t dim) {
+    Tensor out({heads, 1, dim});
+    for (int64_t h = 0; h < heads; ++h)
+        for (int64_t d = 0; d < dim; ++d) out.at(h, 0, d) = x.at(s, h * dim + d);
+    return out;
+}
+// Write a merged-head [1, width] row back into row s of a [n, width] tensor.
+void write_row(Tensor& dst, int64_t s, const Tensor& row) {
+    const int64_t width = dst.size(1);
+    for (int64_t c = 0; c < width; ++c) dst.at(s, c) = row.at(0, c);
+}
 }  // namespace
 
 Model::Model(const std::string& weights_dir, QuantMode mode) {
@@ -136,6 +151,77 @@ Tensor Model::forward(const std::vector<int64_t>& ids, KVCache* cache) const {
     // skips the duplicate lm_head.weight; fall back to embed_tokens here.
     const std::string lm = cfg_.tie_word_embeddings ? "embed_tokens.weight" : "lm_head.weight";
     return linear(x, W(lm));  // [seq, vocab]
+}
+
+Tensor Model::forward_batch(const std::vector<int64_t>& tokens,
+                            const std::vector<KVCache*>& caches) const {
+    const int64_t n = static_cast<int64_t>(tokens.size());
+    if (static_cast<int64_t>(caches.size()) != n)
+        throw std::invalid_argument("forward_batch: tokens and caches differ in size");
+    if (n == 0) return Tensor({0, cfg_.vocab_size});
+    const float eps = cfg_.rms_norm_eps;
+    const int64_t H = cfg_.num_attention_heads, KV = cfg_.num_kv_heads, D = cfg_.head_dim;
+
+    // Each sequence's new token sits at its own cache position. Capture every
+    // cache's pre-step length once: it is the RoPE position and the attention
+    // offset for that sequence this step, and (like single forward) the length is
+    // advanced only after all layers have written their slice.
+    std::vector<int64_t> pos(static_cast<size_t>(n));
+    for (int64_t s = 0; s < n; ++s) {
+        if (caches[s] == nullptr) throw std::invalid_argument("forward_batch: null cache");
+        pos[static_cast<size_t>(s)] = caches[s]->length();
+        if (pos[static_cast<size_t>(s)] + 1 > rope_.cos.size(0))
+            throw std::runtime_error("forward_batch: position " +
+                                     std::to_string(pos[static_cast<size_t>(s)] + 1) +
+                                     " exceeds context length " +
+                                     std::to_string(rope_.cos.size(0)));
+    }
+
+    Tensor x = embedding(W("embed_tokens.weight"), tokens);  // [n, hidden]
+
+    for (int64_t i = 0; i < cfg_.num_layers; ++i) {
+        const std::string L = "layers." + std::to_string(i) + ".";
+
+        // --- attention (pre-norm + residual) ---
+        Tensor h = rmsnorm(x, W(L + "input_layernorm.weight"), eps);  // [n, hidden]
+        // Batched projections: one matmul over all n rows, weights streamed once.
+        Tensor q = project(h, L + "self_attn.q_proj.weight", &W(L + "self_attn.q_proj.bias"));
+        Tensor k = project(h, L + "self_attn.k_proj.weight", &W(L + "self_attn.k_proj.bias"));
+        Tensor v = project(h, L + "self_attn.v_proj.weight", &W(L + "self_attn.v_proj.bias"));
+
+        // Per-sequence attention: each token has its own cache, length, and RoPE
+        // position, so this is a loop, not a batched matmul. Each iteration reuses
+        // the same single-token ops as forward(), guaranteeing row-for-row parity.
+        Tensor attn({n, H * D});
+        for (int64_t s = 0; s < n; ++s) {
+            Tensor qs = row_to_heads(q, s, H, D);   // [H, 1, D]
+            Tensor ks = row_to_heads(k, s, KV, D);  // [KV, 1, D]
+            Tensor vs = row_to_heads(v, s, KV, D);
+            qs = apply_rope(qs, rope_.cos, rope_.sin, pos[static_cast<size_t>(s)]);
+            ks = apply_rope(ks, rope_.cos, rope_.sin, pos[static_cast<size_t>(s)]);
+            auto kv = caches[s]->update(i, ks, vs);  // append; read back the prefix
+            Tensor kk = repeat_kv(kv.first, cfg_.n_rep());
+            Tensor vv = repeat_kv(kv.second, cfg_.n_rep());
+            Tensor as = attention(qs, kk, vv, /*causal=*/true,
+                                  /*query_offset=*/pos[static_cast<size_t>(s)]);  // [H,1,D]
+            write_row(attn, s, merge_heads(as));  // [1, H*D] -> row s
+        }
+        Tensor a = project(attn, L + "self_attn.o_proj.weight", nullptr);  // o_proj: no bias
+        x = add(x, a);
+
+        // --- SwiGLU MLP (pre-norm + residual), all batched over the n rows ---
+        Tensor hm = rmsnorm(x, W(L + "post_attention_layernorm.weight"), eps);
+        Tensor gate = silu(project(hm, L + "mlp.gate_proj.weight", nullptr));
+        Tensor up = project(hm, L + "mlp.up_proj.weight", nullptr);
+        Tensor down = project(mul(gate, up), L + "mlp.down_proj.weight", nullptr);
+        x = add(x, down);
+    }
+
+    for (int64_t s = 0; s < n; ++s) caches[s]->advance(1);
+
+    x = rmsnorm(x, W("norm.weight"), eps);
+    const std::string lm = cfg_.tie_word_embeddings ? "embed_tokens.weight" : "lm_head.weight";
+    return linear(x, W(lm));  // [n, vocab]
 }
 
 }  // namespace ni

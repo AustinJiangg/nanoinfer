@@ -30,6 +30,18 @@ public:
     // positions cache.length()..; the cache is advanced by t after the pass.
     Tensor forward(const std::vector<int64_t>& ids, KVCache* cache = nullptr) const;
 
+    // Batched single-token decode (F8a): N sequences, one new token each, at each
+    // sequence's own cache position. The projection GEMMs (q/k/v/o/gate/up/down) are
+    // fused over the N rows — every weight row is streamed once and reused across
+    // all N tokens (the throughput lever; the same row-inner reuse that makes prefill
+    // compute-bound). Attention stays a per-sequence loop: each token attends only
+    // its own cache, at its own RoPE position. Row s of the result equals a
+    // standalone forward({tokens[s]}, caches[s]) bit-for-bit (the rows are
+    // independent), so the serving layer can batch decode without changing outputs.
+    // Returns logits [N, vocab]; every cache advances by 1.
+    Tensor forward_batch(const std::vector<int64_t>& tokens,
+                         const std::vector<KVCache*>& caches) const;
+
     // Allocate a KV cache sized to this model.
     KVCache make_cache(int64_t max_seq) const;
 

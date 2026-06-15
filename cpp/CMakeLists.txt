@@ -120,6 +120,11 @@ add_executable(run_bench tests/run_bench.cpp)
 target_link_libraries(run_bench PRIVATE nicore)
 target_include_directories(run_bench PRIVATE tests)
 
+# F8a: batched decode parity (forward_batch == per-sequence forward) + throughput.
+add_executable(run_batch tests/run_batch.cpp)
+target_link_libraries(run_batch PRIVATE nicore)
+target_include_directories(run_batch PRIVATE tests)
+
 # F6: pybind11 module exposing the C++ core to Python — the vLLM-shape pivot
 # (Python orchestration over our own kernels). Optional and auto-located via the
 # already-found Python3 (`pip install pybind11`); skipped cleanly when pybind11 is
