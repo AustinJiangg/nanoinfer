@@ -91,7 +91,7 @@ const Tensor& Model::W(const std::string& name) const {
     return it->second;
 }
 
-Tensor Model::forward(const std::vector<int64_t>& ids, KVCache* cache) const {
+Tensor Model::forward(const std::vector<int64_t>& ids, KVCacheBase* cache) const {
     const int64_t seq = static_cast<int64_t>(ids.size());
     const float eps = cfg_.rms_norm_eps;
 
@@ -154,7 +154,7 @@ Tensor Model::forward(const std::vector<int64_t>& ids, KVCache* cache) const {
 }
 
 Tensor Model::forward_batch(const std::vector<int64_t>& tokens,
-                            const std::vector<KVCache*>& caches) const {
+                            const std::vector<KVCacheBase*>& caches) const {
     const int64_t n = static_cast<int64_t>(tokens.size());
     if (static_cast<int64_t>(caches.size()) != n)
         throw std::invalid_argument("forward_batch: tokens and caches differ in size");

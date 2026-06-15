@@ -32,7 +32,7 @@ find_package(OpenMP COMPONENTS CXX)
 # pybind11 later (the F-stage fusion) without reshaping it.
 add_library(nicore
   src/tensor.cpp src/ops.cpp src/serialize.cpp src/cache.cpp src/quant.cpp
-  src/config.cpp src/model.cpp src/sampling.cpp src/generate.cpp)
+  src/config.cpp src/model.cpp src/sampling.cpp src/generate.cpp src/paged.cpp)
 target_include_directories(nicore PUBLIC src)
 # PIC so the static core can be linked into the pybind11 shared module (F6); the
 # executables that also link nicore just become PIE, which is the modern default.
@@ -124,6 +124,11 @@ target_include_directories(run_bench PRIVATE tests)
 add_executable(run_batch tests/run_batch.cpp)
 target_link_libraries(run_batch PRIVATE nicore)
 target_include_directories(run_batch PRIVATE tests)
+
+# F8b: paged KV cache parity (paged forward == contiguous forward) + pool utilization.
+add_executable(run_paged tests/run_paged.cpp)
+target_link_libraries(run_paged PRIVATE nicore)
+target_include_directories(run_paged PRIVATE tests)
 
 # F6: pybind11 module exposing the C++ core to Python — the vLLM-shape pivot
 # (Python orchestration over our own kernels). Optional and auto-located via the

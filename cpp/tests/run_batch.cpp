@@ -62,7 +62,7 @@ int main(int argc, char** argv) {
 
         // Independent caches for each path; prefill seeds them identically.
         std::vector<ni::KVCache> single, batched;
-        std::vector<ni::KVCache*> batched_ptrs;
+        std::vector<ni::KVCacheBase*> batched_ptrs;
         std::vector<int64_t> cur(static_cast<size_t>(N));
         for (int64_t s = 0; s < N; ++s) {
             const int64_t cap = static_cast<int64_t>(prompts[s].size()) + STEPS + 1;
@@ -98,7 +98,7 @@ int main(int argc, char** argv) {
         // --- Throughput: decode tok/s vs batch size (the F8a win) ---
         {
             ni::KVCache warm = model.make_cache(static_cast<int64_t>(base.size()) + 2);
-            std::vector<ni::KVCache*> wp{&warm};
+            std::vector<ni::KVCacheBase*> wp{&warm};
             model.forward(base, &warm);
             model.forward_batch({base[0]}, wp);  // warm code paths before timing
         }
@@ -107,7 +107,7 @@ int main(int argc, char** argv) {
         double base_tps = 0.0;
         for (int64_t B : {1, 2, 4, 8, 16}) {
             std::vector<ni::KVCache> caches;
-            std::vector<ni::KVCache*> ptrs;
+            std::vector<ni::KVCacheBase*> ptrs;
             std::vector<int64_t> tok(static_cast<size_t>(B));
             const int64_t cap = static_cast<int64_t>(base.size()) + STEPS + 1;
             for (int64_t b = 0; b < B; ++b) caches.push_back(model.make_cache(cap));

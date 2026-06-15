@@ -28,7 +28,7 @@ public:
     // Token ids -> logits [seq, vocab]. Without a cache (C1) the whole sequence is
     // recomputed; with a cache (C3) `ids` is just the new token(s), placed at
     // positions cache.length()..; the cache is advanced by t after the pass.
-    Tensor forward(const std::vector<int64_t>& ids, KVCache* cache = nullptr) const;
+    Tensor forward(const std::vector<int64_t>& ids, KVCacheBase* cache = nullptr) const;
 
     // Batched single-token decode (F8a): N sequences, one new token each, at each
     // sequence's own cache position. The projection GEMMs (q/k/v/o/gate/up/down) are
@@ -40,7 +40,7 @@ public:
     // independent), so the serving layer can batch decode without changing outputs.
     // Returns logits [N, vocab]; every cache advances by 1.
     Tensor forward_batch(const std::vector<int64_t>& tokens,
-                         const std::vector<KVCache*>& caches) const;
+                         const std::vector<KVCacheBase*>& caches) const;
 
     // Allocate a KV cache sized to this model.
     KVCache make_cache(int64_t max_seq) const;

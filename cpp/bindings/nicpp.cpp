@@ -23,6 +23,7 @@
 #include "config.hpp"
 #include "generate.hpp"
 #include "model.hpp"
+#include "paged.hpp"
 #include "quant.hpp"
 #include "sampling.hpp"
 #include "tensor.hpp"
@@ -110,11 +111,30 @@ PYBIND11_MODULE(nicpp, m) {
                    ", repetition_penalty=" + std::to_string(p.repetition_penalty) + ")";
         });
 
-    // Opaque per-sequence KV cache. Created by Model.make_cache and fed back into
-    // forward(); move-only in C++, so no copy/constructor is exposed.
-    py::class_<KVCache>(m, "KVCache")
-        .def_property_readonly("length", &KVCache::length, "Filled positions so far.")
+    // KV cache interface: forward()/forward_batch() accept any subclass, so the same
+    // pass runs over the contiguous (C3) or paged (F8b) cache. Abstract — no init.
+    py::class_<KVCacheBase>(m, "KVCacheBase")
+        .def_property_readonly("length", &KVCacheBase::length, "Filled positions so far.");
+
+    // Contiguous per-sequence KV cache (C3). Created by Model.make_cache, fed back
+    // into forward(); move-only in C++, so no copy/constructor is exposed.
+    py::class_<KVCache, KVCacheBase>(m, "KVCache")
         .def_property_readonly("max_seq", &KVCache::max_seq);
+
+    // Paged KV cache (F8b): a shared pool of fixed-size blocks + a per-sequence
+    // block table. PagedKVCache draws/returns blocks from the pool (it frees them on
+    // destruction), so there is no per-sequence max_seq preallocation.
+    py::class_<BlockPool>(m, "BlockPool")
+        .def_property_readonly("num_blocks", &BlockPool::num_blocks)
+        .def_property_readonly("block_size", &BlockPool::block_size)
+        .def_property_readonly("free_blocks", &BlockPool::free_blocks)
+        .def_property_readonly("used_blocks", &BlockPool::used_blocks);
+
+    py::class_<PagedKVCache, KVCacheBase>(m, "PagedKVCache")
+        .def(py::init<BlockPool*>(), py::arg("pool"), py::keep_alive<1, 2>(),
+             "A sequence's view onto a BlockPool (keeps the pool alive).")
+        .def_property_readonly("num_blocks", &PagedKVCache::num_blocks,
+                               "Physical blocks this sequence currently holds.");
 
     py::class_<Model>(m, "Model")
         .def(py::init<const std::string&, QuantMode>(), py::arg("weights_dir"),
@@ -125,7 +145,7 @@ PYBIND11_MODULE(nicpp, m) {
             "Model dimensions (a copy of the Config).")
         .def(
             "forward",
-            [](const Model& self, const std::vector<int64_t>& ids, KVCache* cache) {
+            [](const Model& self, const std::vector<int64_t>& ids, KVCacheBase* cache) {
                 Tensor logits;
                 {
                     py::gil_scoped_release release;  // numpy build below needs the GIL
@@ -133,7 +153,7 @@ PYBIND11_MODULE(nicpp, m) {
                 }
                 return tensor_to_numpy(logits);
             },
-            py::arg("ids"), py::arg("cache") = static_cast<KVCache*>(nullptr),
+            py::arg("ids"), py::arg("cache") = static_cast<KVCacheBase*>(nullptr),
             "Token ids -> logits [seq, vocab] (numpy). With a KVCache, `ids` is the "
             "new token(s), placed at positions cache.length..; the cache advances after.")
         .def(
@@ -141,9 +161,9 @@ PYBIND11_MODULE(nicpp, m) {
             [](const Model& self, const std::vector<int64_t>& tokens, py::list caches_list) {
                 // One new token per sequence, each with its own cache. Cast the
                 // KVCache handles to pointers here (GIL held) before releasing.
-                std::vector<KVCache*> caches;
+                std::vector<KVCacheBase*> caches;
                 caches.reserve(caches_list.size());
-                for (const py::handle h : caches_list) caches.push_back(h.cast<KVCache*>());
+                for (const py::handle h : caches_list) caches.push_back(h.cast<KVCacheBase*>());
                 Tensor logits;
                 {
                     py::gil_scoped_release release;
@@ -156,7 +176,17 @@ PYBIND11_MODULE(nicpp, m) {
             "logits [N, vocab]. Row s equals forward([tokens[s]], caches[s]); each "
             "cache advances by 1. The projection GEMMs are fused over the N rows.")
         .def("make_cache", &Model::make_cache, py::arg("max_seq"),
-             "Allocate a KV cache sized for this model.")
+             "Allocate a contiguous KV cache sized for this model.")
+        .def(
+            "make_block_pool",
+            [](const Model& self, int64_t block_size, int64_t num_blocks) {
+                const Config& c = self.config();
+                return BlockPool(c.num_layers, c.num_kv_heads, c.head_dim, block_size,
+                                 num_blocks);
+            },
+            py::arg("block_size"), py::arg("num_blocks"),
+            "Allocate a paged-attention block pool (F8b): num_blocks blocks of "
+            "block_size tokens each, shared across sequences via PagedKVCache.")
         .def(
             "generate",
             [](const Model& self, const std::vector<int64_t>& prompt, int max_tokens,

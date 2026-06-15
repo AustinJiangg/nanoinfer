@@ -23,7 +23,29 @@
 
 namespace ni {
 
-class KVCache {
+// The cache interface forward()/forward_batch() drive — so the same forward pass
+// runs over either the contiguous cache (C3) or the paged cache (F8b) through one
+// pointer, the same polymorphism the QuantizedWeight interface uses for quant modes.
+// An implementation must return, from update(), a CONTIGUOUS [n_kv, length+t,
+// head_dim] view of the filled prefix, so the attention kernel stays cache-agnostic.
+class KVCacheBase {
+public:
+    virtual ~KVCacheBase() = default;
+
+    // Append `k`/`v` ([n_kv_heads, t, head_dim]) for one layer at the current
+    // length; return contiguous [n_kv_heads, length+t, head_dim] copies to attend.
+    virtual std::pair<Tensor, Tensor> update(int64_t layer, const Tensor& k,
+                                             const Tensor& v) = 0;
+
+    // Mark `t` more positions filled (once per forward, after all layers).
+    virtual void advance(int64_t t) = 0;
+
+    virtual int64_t length() const = 0;  // filled positions
+};
+
+// Contiguous KV cache (C3): each layer keeps a preallocated [n_kv_heads, max_seq,
+// head_dim] buffer for K and one for V.
+class KVCache : public KVCacheBase {
 public:
     KVCache(int64_t num_layers, int64_t n_kv_heads, int64_t head_dim, int64_t max_seq);
 
@@ -34,15 +56,12 @@ public:
     KVCache(KVCache&&) = default;
     KVCache& operator=(KVCache&&) = default;
 
-    int64_t length() const { return length_; }
+    int64_t length() const override { return length_; }
     int64_t max_seq() const { return max_seq_; }
 
-    // Append `k`/`v` ([n_kv_heads, t, head_dim]) for one layer at the current
-    // length; return contiguous [n_kv_heads, length+t, head_dim] copies to attend.
-    std::pair<Tensor, Tensor> update(int64_t layer, const Tensor& k, const Tensor& v);
-
-    // Mark `t` more positions filled (once per forward, after all layers).
-    void advance(int64_t t);
+    std::pair<Tensor, Tensor> update(int64_t layer, const Tensor& k,
+                                     const Tensor& v) override;
+    void advance(int64_t t) override;
 
 private:
     std::vector<Tensor> k_;  // per layer: [n_kv_heads, max_seq, head_dim]
