@@ -28,6 +28,10 @@ and uses OpenMP if found. Both are optional and degrade to the same numbers:
 `-DNI_NATIVE=OFF` falls back to the scalar inner products, and a toolchain
 without OpenMP runs single-threaded. Cap threads with `OMP_NUM_THREADS=N`.
 
+If `pybind11` is importable (`pip install pybind11`), the build also produces the
+`nicpp` Python module (stage F6) in `build/`; it's skipped cleanly otherwise, the
+same graceful degrade. See "Use from Python" below.
+
 ## Layout
 
 ```
@@ -97,6 +101,45 @@ capital of France is" → " Paris. It is the largest city in Europe and the seco
 Generation uses a KV cache (prefill + decode); cached output is bit-identical to
 the full recompute and ~7× faster.
 
+## Use from Python (F6: the pybind11 binding)
+
+The `nicpp` module is the pivot from "pure C++ engine" to the vLLM shape — Python
+orchestration over our own C++ kernels. It stays thin: it hands Python the same
+objects the C++ drivers use (`Model`, `KVCache`, `SamplingParams`), with
+`forward()` returning logits as a numpy array and `generate()` returning token ids.
+The kernels run with the GIL released. Tokenization stays in Python (HF, allowed by
+the golden rule); the core works purely on token ids.
+
+```python
+import sys; sys.path.insert(0, "build")     # the .so lands in build/
+import nicpp
+
+model = nicpp.Model("weights/qwen2.5-0.5b")          # or nicpp.quant_mode("q8")
+ids = [785, 6722, 315, 9625, 374]                     # "The capital of France is"
+logits = model.forward(ids)                           # numpy [seq, vocab]
+
+cache = model.make_cache(len(ids) + 32)               # per-sequence KV cache
+model.forward(ids, cache)                             # prefill; cache.length advances
+out = model.generate(ids, max_tokens=20)              # greedy ids (uses a KV cache)
+```
+
+`forward(ids, cache)` + `make_cache` are exactly the per-sequence primitives the F7
+scheduler will drive (one cache per sequence, batched orchestration in Python).
+
+```bash
+# parity through the binding: logits + greedy match nanoinfer, cached==uncached
+python tests/run_binding.py weights/qwen2.5-0.5b
+# text in/out on the C++ engine (HF tokenize -> our kernels -> HF decode)
+python tools/generate.py --prompt "The capital of France is" --max-tokens 20
+python tools/generate.py --prompt "Once upon a time" --temperature 0.8 --top-p 0.95 --seed 1234
+python tools/generate.py --prompt "..." --quant q8     # run quantized weights
+```
+
+`run_binding.py` is the F6 analogue of `run_parity` / `run_generate` — the same
+MATCH bar, driven from Python. Like them it needs the weight export + reference
+dump first, so it isn't wired into `ctest`. Greedy is deterministic and matches
+nanoinfer; sampled output is not token-identical (the C++ RNG differs from torch).
+
 ## Performance (C5: SIMD + threads)
 
 The hot kernels (`linear`, the quant linears, attention) reduce through the AVX2/FMA
@@ -147,3 +190,7 @@ prefill, an uncommon path).
       over output channels/heads + once-per-call weight streaming (row loop inner).
       Parity-preserving: logits unchanged (4.24e-5 vs nanoinfer, greedy
       token-for-token); ~16× prefill, ~2.1× decode (memory-bound) on 20 cores.
+- [x] **F6** — pybind11 binding (`nicpp`): Model / KVCache / SamplingParams exposed
+      to Python, `forward()` → numpy logits, `generate()` → ids, GIL dropped during
+      the kernels. Parity-tested through the binding and a text demo (HF tokenize →
+      C++ kernels → HF decode). See "Use from Python" below. The F7 substrate.

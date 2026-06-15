@@ -34,6 +34,9 @@ add_library(nicore
   src/tensor.cpp src/ops.cpp src/serialize.cpp src/cache.cpp src/quant.cpp
   src/config.cpp src/model.cpp src/sampling.cpp src/generate.cpp)
 target_include_directories(nicore PUBLIC src)
+# PIC so the static core can be linked into the pybind11 shared module (F6); the
+# executables that also link nicore just become PIE, which is the modern default.
+set_target_properties(nicore PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(OpenMP_CXX_FOUND)
   # PUBLIC so the -fopenmp flag (and _OPENMP define) and runtime propagate to the
   # test/bench executables that include parallel.hpp.
@@ -116,3 +119,29 @@ target_include_directories(run_quant PRIVATE tests)
 add_executable(run_bench tests/run_bench.cpp)
 target_link_libraries(run_bench PRIVATE nicore)
 target_include_directories(run_bench PRIVATE tests)
+
+# F6: pybind11 module exposing the C++ core to Python — the vLLM-shape pivot
+# (Python orchestration over our own kernels). Optional and auto-located via the
+# already-found Python3 (`pip install pybind11`); skipped cleanly when pybind11 is
+# absent, the same graceful degrade as OpenMP / -march=native. The .so lands in the
+# build dir; tests/tools add it to sys.path (a pip-installable wheel is a later step).
+execute_process(
+  COMMAND ${Python3_EXECUTABLE} -m pybind11 --cmakedir
+  OUTPUT_VARIABLE NI_PYBIND11_DIR
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  RESULT_VARIABLE NI_PYBIND11_QUERY
+  ERROR_QUIET)
+if(NI_PYBIND11_QUERY EQUAL 0)
+  find_package(pybind11 CONFIG QUIET PATHS "${NI_PYBIND11_DIR}")
+endif()
+# pybind11_add_module needs the Development.Module component (the Python3 find above
+# requested only Interpreter, to keep the C++-only build dependency-light); add it
+# here, optionally, so python3_add_library is defined when the headers are present.
+find_package(Python3 COMPONENTS Interpreter Development.Module QUIET)
+if(pybind11_FOUND AND Python3_Development.Module_FOUND)
+  pybind11_add_module(nicpp bindings/nicpp.cpp)
+  target_link_libraries(nicpp PRIVATE nicore)
+  message(STATUS "pybind11 ${pybind11_VERSION} found: building Python module 'nicpp'")
+else()
+  message(STATUS "pybind11 / Python dev headers not found: skipping Python module")
+endif()

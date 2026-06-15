@@ -91,7 +91,14 @@ API simple/C-style so the later binding is cheap.
       performance well
 
 ## Fusion (→ mini-vLLM)
-- [ ] **F6** — pybind11: expose the C++ core to Python
+- [x] **F6** — pybind11: expose the C++ core to Python. The `nicpp` module binds
+      Model / KVCache / SamplingParams / Config / QuantMode; `forward()` returns
+      logits as a numpy array and `generate()` returns token ids — the heavy calls
+      drop the GIL. Parity-tested *through the binding* (`tests/run_binding.py`:
+      logits 4.24e-5 vs nanoinfer, greedy token-for-token, cached==uncached) and a
+      text demo (`tools/generate.py`: HF tokenize → our C++ kernels → HF decode) —
+      the first end-to-end fusion, the vLLM shape in miniature. These are the exact
+      primitives F7 builds a scheduler on (per-sequence KVCache + forward).
 - [ ] **F7** — Python serving layer: scheduler + continuous batching over C++ kernels
 - [ ] **F8** — paged attention (C++ kernel + Python block scheduler) — the merge point
 
