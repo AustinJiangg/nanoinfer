@@ -32,10 +32,15 @@ class KVCacheBase {
 public:
     virtual ~KVCacheBase() = default;
 
-    // Append `k`/`v` ([n_kv_heads, t, head_dim]) for one layer at the current
-    // length; return contiguous [n_kv_heads, length+t, head_dim] copies to attend.
-    virtual std::pair<Tensor, Tensor> update(int64_t layer, const Tensor& k,
-                                             const Tensor& v) = 0;
+    // Append the new `k`/`v` ([n_kv_heads, t, head_dim]) for one layer at the current
+    // length, then attend: queries `q` ([n_heads, t, head_dim], post-RoPE) over the
+    // whole cached history, returning [n_heads, t, head_dim]. Query i sits at absolute
+    // position query_offset+i. GQA (n_rep) is folded in, so a paged cache reads each
+    // KV head once without materializing repeats. The cache owns the read path: the
+    // contiguous cache gathers + reuses the attention op; the paged cache indexes
+    // blocks directly (true paged attention). Both give bit-identical results.
+    virtual Tensor attend(int64_t layer, const Tensor& q, const Tensor& k, const Tensor& v,
+                          int64_t n_rep, bool causal, int64_t query_offset) = 0;
 
     // Mark `t` more positions filled (once per forward, after all layers).
     virtual void advance(int64_t t) = 0;
@@ -59,8 +64,11 @@ public:
     int64_t length() const override { return length_; }
     int64_t max_seq() const { return max_seq_; }
 
-    std::pair<Tensor, Tensor> update(int64_t layer, const Tensor& k,
-                                     const Tensor& v) override;
+    // Append `k`/`v` and return contiguous [n_kv_heads, length+t, head_dim] copies of
+    // the filled prefix. Used by attend() and by the cache unit test directly.
+    std::pair<Tensor, Tensor> update(int64_t layer, const Tensor& k, const Tensor& v);
+    Tensor attend(int64_t layer, const Tensor& q, const Tensor& k, const Tensor& v,
+                  int64_t n_rep, bool causal, int64_t query_offset) override;
     void advance(int64_t t) override;
 
 private:

@@ -122,16 +122,19 @@ Tensor Model::forward(const std::vector<int64_t>& ids, KVCacheBase* cache) const
         q = apply_rope(q, rope_.cos, rope_.sin, start_pos);
         k = apply_rope(k, rope_.cos, rope_.sin, start_pos);
 
+        // Cached: the cache appends K/V and attends over its whole history, folding
+        // in GQA (the paged cache reads blocks directly; the contiguous one gathers).
+        // Uncached (stage-0 full recompute): no cache object, so expand the KV heads
+        // and attend over the fresh K/V right here, at offset 0.
+        Tensor a;
         if (cache) {
-            auto kv = cache->update(i, k, v);  // append new K/V, read back the prefix
-            k = std::move(kv.first);
-            v = std::move(kv.second);
+            a = cache->attend(i, q, k, v, cfg_.n_rep(), /*causal=*/true,
+                              /*query_offset=*/start_pos);
+        } else {
+            Tensor kk = repeat_kv(k, cfg_.n_rep());
+            Tensor vv = repeat_kv(v, cfg_.n_rep());
+            a = attention(q, kk, vv, /*causal=*/true, /*query_offset=*/0);
         }
-
-        k = repeat_kv(k, cfg_.n_rep());
-        v = repeat_kv(v, cfg_.n_rep());
-
-        Tensor a = attention(q, k, v, /*causal=*/true, /*query_offset=*/start_pos);
         a = merge_heads(a);                                 // [seq, n_heads*head_dim]
         a = project(a, L + "self_attn.o_proj.weight", nullptr);  // o_proj has no bias
         x = add(x, a);
@@ -199,11 +202,9 @@ Tensor Model::forward_batch(const std::vector<int64_t>& tokens,
             Tensor vs = row_to_heads(v, s, KV, D);
             qs = apply_rope(qs, rope_.cos, rope_.sin, pos[static_cast<size_t>(s)]);
             ks = apply_rope(ks, rope_.cos, rope_.sin, pos[static_cast<size_t>(s)]);
-            auto kv = caches[s]->update(i, ks, vs);  // append; read back the prefix
-            Tensor kk = repeat_kv(kv.first, cfg_.n_rep());
-            Tensor vv = repeat_kv(kv.second, cfg_.n_rep());
-            Tensor as = attention(qs, kk, vv, /*causal=*/true,
-                                  /*query_offset=*/pos[static_cast<size_t>(s)]);  // [H,1,D]
+            // Append this token's K/V and attend over the sequence's own history.
+            Tensor as = caches[s]->attend(i, qs, ks, vs, cfg_.n_rep(), /*causal=*/true,
+                                          /*query_offset=*/pos[static_cast<size_t>(s)]);  // [H,1,D]
             write_row(attn, s, merge_heads(as));  // [1, H*D] -> row s
         }
         Tensor a = project(attn, L + "self_attn.o_proj.weight", nullptr);  // o_proj: no bias

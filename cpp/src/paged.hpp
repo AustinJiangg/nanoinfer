@@ -7,12 +7,12 @@
 // sequence returns its blocks to the pool for reuse — the high KV-utilization win.
 //
 // PagedKVCache implements the same KVCacheBase interface as the contiguous KVCache:
-// update() writes the new tokens into the sequence's blocks (allocating as it crosses
-// a block boundary) and gathers the filled prefix back into a contiguous
-// [n_kv, length+t, head_dim], so the existing attention kernel runs unchanged and
-// paged output is bit-identical to the contiguous cache (run_paged.cpp). Fusing that
-// gather into the attention read — true paged attention, skipping the copy — is the
-// next optimization; the memory management here is the actual PagedAttention idea.
+// attend() writes the new tokens into the sequence's blocks (allocating as it crosses
+// a block boundary) and then attends directly over those blocks — the kernel indexes
+// K/V by the block table, folding GQA into the read, so there is no gather into a
+// contiguous buffer and no repeat_kv expansion. It mirrors the ops attention()
+// arithmetic exactly (same dot/softmax order), so paged output is bit-identical to
+// the contiguous cache (run_paged.cpp) while touching far less memory for the K/V.
 #pragma once
 
 #include <cstdint>
@@ -76,8 +76,12 @@ public:
         return *this;
     }
 
-    std::pair<Tensor, Tensor> update(int64_t layer, const Tensor& k,
-                                     const Tensor& v) override;
+    // Write the new k/v into this sequence's blocks and attend directly over them —
+    // no gather, no repeat_kv (GQA is folded into the read). Bit-identical to the
+    // contiguous cache's gather + attention (run_paged.cpp). This is the true paged
+    // attention read path: the kernel indexes blocks via the block table.
+    Tensor attend(int64_t layer, const Tensor& q, const Tensor& k, const Tensor& v,
+                  int64_t n_rep, bool causal, int64_t query_offset) override;
     void advance(int64_t t) override { length_ += t; }
     int64_t length() const override { return length_; }
     int64_t num_blocks() const { return static_cast<int64_t>(block_table_.size()); }

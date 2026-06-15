@@ -1,6 +1,9 @@
 #include "cache.hpp"
 
 #include <stdexcept>
+#include <utility>
+
+#include "ops.hpp"
 
 namespace ni {
 
@@ -47,6 +50,16 @@ std::pair<Tensor, Tensor> KVCache::update(int64_t layer, const Tensor& k, const 
                 vo.at(h, s, d) = vbuf.at(h, s, d);
             }
     return {std::move(ko), std::move(vo)};
+}
+
+Tensor KVCache::attend(int64_t layer, const Tensor& q, const Tensor& k, const Tensor& v,
+                       int64_t n_rep, bool causal, int64_t query_offset) {
+    // Contiguous storage: gather the prefix, expand KV heads (GQA), reuse the
+    // attention op. The paged cache (paged.cpp) does this without the copies.
+    auto kv = update(layer, k, v);
+    Tensor kk = repeat_kv(kv.first, n_rep);
+    Tensor vv = repeat_kv(kv.second, n_rep);
+    return attention(q, kk, vv, causal, query_offset);
 }
 
 void KVCache::advance(int64_t t) { length_ += t; }

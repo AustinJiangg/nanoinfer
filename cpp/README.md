@@ -208,6 +208,14 @@ request only when the pool can reserve its worst case (so lazily-allocated block
 can't over-commit), and frees its blocks when it finishes — token-identical to
 standalone, with admission now gated on KV blocks rather than just slots.
 
+The paged `attend()` is a true paged-attention kernel: each query head reads K/V
+straight from the blocks via the block table, mapping query head → KV head inline so
+GQA needs no `repeat_kv` copy and no contiguous gather. It mirrors the attention op's
+arithmetic exactly (same simd dot, double-accumulated softmax and value sum, same key
+order), so it stays bit-identical to the contiguous path while moving far less memory
+per step — `run_paged` measures ~1.5× decode at context 128, a gap that widens with
+context since the skipped gather/repeat copies scale with it.
+
 ```python
 sched = Scheduler(model, max_batch=8, block_size=16, num_blocks=256)  # paged
 sched.add(Request("a", [785, 6722, 315, 9625, 374], max_tokens=64))
@@ -222,10 +230,12 @@ python tools/serve.py --block-size 16 --num-blocks 64 --max-batch 4 \
     --prompt "The capital of France is" --prompt "Once upon a time"
 ```
 
-Deliberately left for later: fusing the gather into the attention read — true paged
-attention that indexes blocks in the kernel and skips the contiguous copy. The
-memory management (the actual PagedAttention contribution) is here; that step is a
-kernel-level IO optimization, the paged analogue of C5's "update returns copies".
+With F8b the Fusion track is complete — a mini-vLLM: Python orchestration (continuous
+batching + paged block scheduler) over our own C++ kernels (batched decode + paged
+attention), parity-locked end to end. Deliberately left for later: prefix sharing
+(the block table is the natural home — share blocks across sequences with a common
+prefix, the RadixAttention idea), batched sampling (the draw is still per-sequence in
+Python), and a true int8×int8→int32 GEMM (C4 quant is still weight-only).
 
 ## Performance (C5: SIMD + threads)
 
@@ -293,8 +303,9 @@ prefill, an uncommon path).
       (`tests/run_batch.cpp`), driven under the scheduler (`batched=True`); ~2.5×
       aggregate decode tok/s at batch 16. The throughput lever F7 was missing.
 - [x] **F8b** — paged attention: a shared `BlockPool` of fixed-size KV blocks + a
-      per-sequence block table (`PagedKVCache`), behind a `KVCacheBase` interface so
-      `forward`/`forward_batch` drive either cache. Bit-identical to the contiguous
-      cache (`tests/run_paged.cpp`); the Python block scheduler (`block_size=...`)
-      gates admission on KV blocks and frees them on finish — no per-sequence max_seq
-      preallocation. The vLLM merge point.
+      per-sequence block table (`PagedKVCache`), behind a `KVCacheBase::attend()`
+      interface so `forward`/`forward_batch` drive either cache. The paged kernel
+      indexes K/V straight from the blocks (no gather, no repeat_kv) — bit-identical
+      to the contiguous cache (`tests/run_paged.cpp`), ~1.5× decode at context 128.
+      The Python block scheduler (`block_size=...`) gates admission on KV blocks and
+      frees them on finish — no per-sequence max_seq preallocation. The vLLM merge point.

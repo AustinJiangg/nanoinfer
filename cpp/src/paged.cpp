@@ -1,7 +1,16 @@
 #include "paged.hpp"
 
+#include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
+
+#include "simd.hpp"
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace ni {
 
@@ -75,8 +84,9 @@ void PagedKVCache::ensure_capacity(int64_t positions) {
         block_table_.push_back(pool_->allocate());
 }
 
-std::pair<Tensor, Tensor> PagedKVCache::update(int64_t layer, const Tensor& k,
-                                               const Tensor& v) {
+Tensor PagedKVCache::attend(int64_t layer, const Tensor& q, const Tensor& k,
+                            const Tensor& v, int64_t n_rep, bool causal,
+                            int64_t query_offset) {
     const int64_t t = k.size(1);
     const int64_t n_kv = pool_->n_kv_heads(), hd = pool_->head_dim(), bs = pool_->block_size();
     const int64_t start = length_, end = start + t;
@@ -99,23 +109,58 @@ std::pair<Tensor, Tensor> PagedKVCache::update(int64_t layer, const Tensor& k,
         }
     }
 
-    // Gather the filled prefix [n_kv, end, head_dim] from the blocks (the paged
-    // read). Contiguous, so the attention kernel is unchanged and the result is
-    // bit-identical to the contiguous cache's read-back.
-    Tensor ko({n_kv, end, hd}), vo({n_kv, end, hd});
-    for (int64_t s = 0; s < end; ++s) {
-        const int64_t blk = block_table_[static_cast<size_t>(s / bs)];
-        const int64_t off = s % bs;
-        for (int64_t h = 0; h < n_kv; ++h) {
-            const float* kp = pool_->k_at(layer, blk, h, off);
-            const float* vp = pool_->v_at(layer, blk, h, off);
-            for (int64_t d = 0; d < hd; ++d) {
-                ko.at(h, s, d) = kp[d];
-                vo.at(h, s, d) = vp[d];
+    // Paged attention: each query head reads K/V straight from the blocks via the
+    // block table — no contiguous gather, no repeat_kv (query head h uses KV head
+    // h/n_rep). The arithmetic mirrors ops::attention() exactly (simd dot product,
+    // double-accumulated softmax + value sum, same key order), so the result is
+    // bit-identical to the contiguous cache's gather + attention. Threaded over query
+    // heads (each is one thread's complete reduction → deterministic).
+    const int64_t n_heads = q.size(0), sq = q.size(1), dim = q.size(2);
+    const float scale = 1.0f / std::sqrt(float(dim));
+    constexpr float kNegInf = -std::numeric_limits<float>::infinity();
+    Tensor out({n_heads, sq, dim});
+    const float* qp = q.data();
+    float* op = out.data();
+
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if (n_heads >= 2)
+#endif
+    for (int64_t h = 0; h < n_heads; ++h) {
+        const int64_t kvh = h / n_rep;  // GQA: this query head's KV head
+        std::vector<float> scores(static_cast<size_t>(end));
+        const float* qh = qp + h * sq * dim;
+        for (int64_t i = 0; i < sq; ++i) {
+            const float* qi = qh + i * dim;
+            // Query i is at absolute position query_offset+i; attend keys 0..that.
+            const int64_t limit = causal ? (query_offset + i + 1) : end;
+            float maxv = kNegInf;
+            for (int64_t j = 0; j < limit; ++j) {
+                const int64_t blk = block_table_[static_cast<size_t>(j / bs)];
+                const float* kj = pool_->k_at(layer, blk, kvh, j % bs);
+                const float s = float(simd::dot_f32(qi, kj, dim)) * scale;
+                scores[static_cast<size_t>(j)] = s;
+                if (s > maxv) maxv = s;
+            }
+            double denom = 0.0;
+            for (int64_t j = 0; j < limit; ++j) {
+                const float e = std::exp(scores[static_cast<size_t>(j)] - maxv);
+                scores[static_cast<size_t>(j)] = e;
+                denom += e;
+            }
+            const float inv = float(1.0 / denom);
+            float* oi = op + (h * sq + i) * dim;
+            for (int64_t d = 0; d < dim; ++d) {
+                double acc = 0.0;
+                for (int64_t j = 0; j < limit; ++j) {
+                    const int64_t blk = block_table_[static_cast<size_t>(j / bs)];
+                    acc += double(scores[static_cast<size_t>(j)]) * inv *
+                           pool_->v_at(layer, blk, kvh, j % bs)[d];
+                }
+                oi[d] = float(acc);
             }
         }
     }
-    return {std::move(ko), std::move(vo)};
+    return out;
 }
 
 }  // namespace ni

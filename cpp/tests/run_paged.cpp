@@ -14,6 +14,7 @@
 //   python ../tools/export_weights.py weights/qwen2.5-0.5b
 //   ./build/run_paged weights/qwen2.5-0.5b
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -153,6 +154,38 @@ int main(int argc, char** argv) {
             }
             std::printf("  seq A freed      free=%lld\n", (long long)pool.free_blocks());
             ok = ok && (pool.free_blocks() == pool.num_blocks());
+        }
+
+        // --- 4. Throughput: paged attend (block-indexed) vs contiguous (gather +
+        //     repeat_kv). Same projections; the difference is the K/V read path. The
+        //     paged kernel skips the per-step gather and the n_rep-fold KV copy, so
+        //     the gap widens with context length. ---
+        {
+            using Clock = std::chrono::steady_clock;
+            const int64_t P = 64, D = 64;  // prefill P tokens, time D decode steps
+            std::vector<int64_t> prompt(static_cast<size_t>(P));
+            for (int64_t i = 0; i < P; ++i) prompt[static_cast<size_t>(i)] = base[i % base.size()];
+
+            auto bench = [&](ni::KVCacheBase* cache) {
+                model.forward(prompt, cache);  // prefill (untimed)
+                int64_t tok = base[0];
+                Clock::time_point t0 = Clock::now();
+                for (int64_t s = 0; s < D; ++s)
+                    tok = argmax_row(model.forward({tok}, cache), 0, vocab);
+                return std::chrono::duration<double>(Clock::now() - t0).count();
+            };
+
+            { ni::KVCache warm = model.make_cache(P + 2); model.forward(prompt, &warm); }
+            ni::KVCache cont = model.make_cache(P + D + 1);
+            ni::BlockPool pool(cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, 16, 64);
+            ni::PagedKVCache paged(&pool);
+            const double cont_s = bench(&cont);
+            const double paged_s = bench(&paged);
+            std::printf("\ndecode throughput (prefill %lld, %lld steps, context -> %lld):\n",
+                        (long long)P, (long long)D, (long long)(P + D));
+            std::printf("  contiguous (gather + repeat_kv): %.1f tok/s\n", D / cont_s);
+            std::printf("  paged (block-indexed attend)   : %.1f tok/s  (%.2fx)\n",
+                        D / paged_s, cont_s / paged_s);
         }
 
         std::printf(ok ? "\nrun_paged: ok\n" : "\nrun_paged: FAIL\n");
