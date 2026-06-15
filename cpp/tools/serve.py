@@ -42,6 +42,8 @@ def main() -> None:
                    help="paged KV cache (F8b) with blocks of this size; 0 = contiguous")
     p.add_argument("--num-blocks", type=int, default=256,
                    help="paged pool size in blocks (used when --block-size > 0)")
+    p.add_argument("--prefix-sharing", action="store_true",
+                   help="reuse shared prompt-prefix KV across requests (needs --block-size)")
     p.add_argument("--quant", default="fp32", choices=["fp32", "q8", "q4", "q4g"])
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--top-k", type=int, default=0)
@@ -60,7 +62,7 @@ def main() -> None:
     eos_id = model.config.eos_token_id
 
     sched = Scheduler(model, max_batch=args.max_batch, block_size=args.block_size,
-                      num_blocks=args.num_blocks)
+                      num_blocks=args.num_blocks, prefix_sharing=args.prefix_sharing)
     prompts = {}
     for i, text in enumerate(args.prompts):
         rid = f"req{i}"
@@ -79,7 +81,9 @@ def main() -> None:
     n_tok = sum(len(v) for v in out.values())
     cache = (f"paged(block_size={args.block_size}, {args.num_blocks} blocks)"
              if sched.paged else "contiguous")
-    print(f"served {len(prompts)} prompts, max_batch={args.max_batch}, cache={cache}: "
+    shared = (f", shared {sched.shared_prefill_tokens} prefill tok"
+              if sched.prefix_cache is not None else "")
+    print(f"served {len(prompts)} prompts, max_batch={args.max_batch}, cache={cache}{shared}: "
           f"{sched.steps} steps, peak_batch={sched.peak_batch}, "
           f"{n_tok} tokens in {dt:.2f}s ({n_tok / dt:.1f} tok/s)\n")
     for rid, text in prompts.items():

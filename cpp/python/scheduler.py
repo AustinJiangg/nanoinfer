@@ -8,13 +8,15 @@ admits queued requests into the freed slots — *continuous* batching: the batch
 composition changes every iteration, so a short request never waits behind a long
 one (no head-of-line blocking) and slots stay full while there's work.
 
-Two knobs select how the kernels back that scheduling, each parity-preserving:
+Three knobs select how the kernels back that scheduling, each parity-preserving:
   - batched (F8a, default): decode the whole running set in one forward_batch call —
     the per-sequence projection GEMMs fuse into one matmul. batched=False keeps the
     per-sequence forward() loop (F7) for A/B.
   - block_size>0 (F8b): a paged KV cache — one shared BlockPool, a PagedKVCache per
     sequence (no per-sequence max_seq preallocation), admission gated on KV blocks.
     block_size=0 keeps the contiguous cache.
+  - prefix_sharing (paged only): a PrefixCache lets requests reuse a shared prefix's
+    KV blocks (RadixAttention) instead of recomputing them — skipping that prefill.
 
 Token selection happens here in Python (numpy) over the logits the C++ forward
 returns — greedy by default, with the same repetition-penalty / temperature / top-k
@@ -127,15 +129,65 @@ def sample_token(logits: np.ndarray, req: Request, context: list[int], rng) -> i
     return int(rng.choice(logits.shape[0], p=probs))
 
 
+class PrefixCache:
+    """A radix-style cache of computed KV prefix blocks (the RadixAttention idea, on
+    the F8b block table), keyed by the block-aligned token prefix. A new request can
+    reuse another's prefix KV instead of recomputing it — skipping that prefill and
+    sharing the blocks. The cache holds a reference to each block it stores (incref),
+    so blocks survive after the producing sequence finishes; clear() releases them.
+
+    Correctness: a token's K/V depends only on the tokens up to it (causal attention),
+    so two requests with an identical block-aligned prefix have identical KV there —
+    sharing is exact and output is unchanged (run_serve.py checks it vs standalone)."""
+
+    def __init__(self, pool, block_size: int):
+        self.pool = pool
+        self.block_size = block_size
+        self._blocks: dict[tuple, int] = {}  # prefix-key (tokens) -> physical block id
+
+    @property
+    def held_blocks(self) -> int:
+        return len(self._blocks)
+
+    def match(self, tokens: list[int]) -> tuple[list[int], int]:
+        """Longest run of cached leading blocks for `tokens` -> (block_ids, length).
+        length is block-aligned and < len(tokens) (a suffix always remains, since the
+        logits need at least the last token recomputed). No incref — the caller's
+        share_prefix() takes the borrowing reference."""
+        bs = self.block_size
+        shared: list[int] = []
+        for k in range((len(tokens) - 1) // bs):  # leave >= 1 token for the suffix
+            b = self._blocks.get(tuple(tokens[: (k + 1) * bs]))
+            if b is None:
+                break
+            shared.append(b)
+        return shared, len(shared) * bs
+
+    def register(self, tokens: list[int], block_table: list[int]) -> None:
+        """Cache a sequence's complete prompt blocks for later reuse, increfing each
+        newly cached block. A partial trailing block isn't shareable, so skip it."""
+        bs = self.block_size
+        for k in range(min(len(tokens) // bs, len(block_table))):
+            key = tuple(tokens[: (k + 1) * bs])
+            if key not in self._blocks:
+                self._blocks[key] = block_table[k]
+                self.pool.incref(block_table[k])
+
+    def clear(self) -> None:
+        for b in self._blocks.values():
+            self.pool.free(b)
+        self._blocks.clear()
+
+
 class Scheduler:
-    """Continuous-batching scheduler over the C++ (batch-1) kernels.
+    """Continuous-batching scheduler over the C++ kernels (F7/F8a/F8b).
 
     Usage: add() requests, then run() to drive them to completion, or call step()
     yourself to interleave with other work (an event loop, request arrivals, ...).
     """
 
     def __init__(self, model, max_batch: int = 8, batched: bool = True,
-                 block_size: int = 0, num_blocks: int = 0):
+                 block_size: int = 0, num_blocks: int = 0, prefix_sharing: bool = False):
         self.model = model
         self.max_batch = max_batch
         # batched=True decodes the whole running set in one forward_batch call (F8a:
@@ -149,7 +201,12 @@ class Scheduler:
         # contiguous cache. Either way the tokens are identical (paged is bit-exact).
         self.paged = block_size > 0
         self.pool = model.make_block_pool(block_size, num_blocks) if self.paged else None
+        # prefix_sharing reuses a cached prefix's KV blocks across requests (paged only).
+        if prefix_sharing and not self.paged:
+            raise ValueError("prefix_sharing requires paged mode (block_size > 0)")
+        self.prefix_cache = PrefixCache(self.pool, block_size) if prefix_sharing else None
         self.reserved = 0  # KV blocks reserved by running sequences (paged only)
+        self.shared_prefill_tokens = 0  # prompt tokens skipped via prefix sharing
         self.waiting: deque[Request] = deque()
         self.running: list[Sequence] = []
         self.finished: dict[str, list[int]] = {}
@@ -215,18 +272,31 @@ class Scheduler:
                 continue
 
             reserved = 0
+            shared_blocks: list[int] = []
+            shared_len = 0
             if self.paged:
                 bs = self.pool.block_size
-                # Reserve each sequence's worst case (prompt + all decode tokens) so
-                # lazily-allocated blocks can never exceed the pool mid-generation.
-                reserved = (len(req.prompt_ids) + max(req.max_tokens, 1) + bs - 1) // bs
-                if reserved > self.pool.num_blocks:
+                # Prefix sharing: reuse a cached prefix's blocks if one matches, so we
+                # prefill (and reserve) only the suffix past it.
+                if self.prefix_cache is not None:
+                    shared_blocks, shared_len = self.prefix_cache.match(req.prompt_ids)
+                # Reserve the worst case (prompt + all decode tokens), minus the shared
+                # blocks (already allocated), so lazy allocation can't exceed the pool.
+                worst = (len(req.prompt_ids) + max(req.max_tokens, 1) + bs - 1) // bs
+                reserved = worst - len(shared_blocks)
+                if worst > self.pool.num_blocks:
                     raise ValueError(
-                        f"request {req.request_id} needs {reserved} blocks; pool has "
+                        f"request {req.request_id} needs {worst} blocks; pool has "
                         f"{self.pool.num_blocks} (raise num_blocks or block_size)")
-                if self.reserved + reserved > self.pool.num_blocks:
+                # Owned reservations of running seqs + blocks the prefix cache holds
+                # must fit the pool (held counted conservatively — never over-commits).
+                held = self.prefix_cache.held_blocks if self.prefix_cache else 0
+                if self.reserved + held + reserved > self.pool.num_blocks:
                     break  # not enough free KV blocks right now; keep it queued
                 cache = nicpp.PagedKVCache(self.pool)
+                if shared_blocks:
+                    cache.share_prefix(shared_blocks, shared_len)
+                    self.shared_prefill_tokens += shared_len
                 self.reserved += reserved
             else:
                 cache = self.model.make_cache(len(req.prompt_ids) + max(req.max_tokens, 1))
@@ -235,7 +305,12 @@ class Scheduler:
             seq = Sequence(req, cache)
             seq.reserved_blocks = reserved
             seq.state = State.RUNNING
-            logits = self.model.forward(req.prompt_ids, cache)  # prefill
+            # Prefill only the suffix past the shared prefix (shared_len=0 if none); its
+            # last position is the prompt's last token, so the first emitted token is
+            # the same as a full prefill.
+            logits = self.model.forward(req.prompt_ids[shared_len:], cache)
+            if self.prefix_cache is not None:
+                self.prefix_cache.register(req.prompt_ids, cache.block_table)
             if req.max_tokens <= 0 or self._emit(seq, logits[-1]):
                 self._finish(seq)
             else:
@@ -249,3 +324,9 @@ class Scheduler:
         while self.has_work():
             self.step()
         return self.finished
+
+    def clear_prefix_cache(self) -> None:
+        """Release every block the prefix cache holds, returning them to the pool
+        (e.g. between batches, or to reclaim KV memory). No-op without prefix sharing."""
+        if self.prefix_cache is not None:
+            self.prefix_cache.clear()

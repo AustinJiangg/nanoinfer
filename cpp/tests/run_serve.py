@@ -98,6 +98,30 @@ def main() -> int:
         print(f"{name}: steps={sched.steps} peak_batch={sched.peak_batch}{extra} "
               f"-> {'MATCH' if match else 'MISMATCH ' + str(mism)}")
 
+    # Prefix sharing (RadixAttention): several requests share a long common prompt
+    # prefix; the scheduler reuses its KV blocks (skipping re-prefill) — output must
+    # still match standalone, and the cache's blocks must all free on clear.
+    shared_prefix = [base[i % len(base)] for i in range(24)]  # 24-token common prefix
+    pre_reqs = [
+        Request("s0", shared_prefix + [11], max_tokens=8),
+        Request("s1", shared_prefix + [785], max_tokens=8),
+        Request("s2", shared_prefix + [11, 1933], max_tokens=6),
+    ]
+    pref_ref = {r.request_id: standalone(model, r) for r in pre_reqs}
+    psched = Scheduler(model, max_batch=4, batched=True, block_size=4, num_blocks=128,
+                       prefix_sharing=True)
+    for r in pre_reqs:
+        psched.add(r)
+    pout = psched.run()
+    share_match = all(pout[r.request_id] == pref_ref[r.request_id] for r in pre_reqs)
+    held = psched.prefix_cache.held_blocks
+    psched.clear_prefix_cache()
+    freed = psched.pool.free_blocks == psched.pool.num_blocks
+    ok = ok and share_match and freed
+    print(f"\nprefix sharing: {len(pre_reqs)} reqs share a {len(shared_prefix)}-tok prefix; "
+          f"skipped {psched.shared_prefill_tokens} prefill tok, cache held {held} blocks "
+          f"-> {'MATCH' if share_match else 'MISMATCH'}, freed_on_clear={freed}")
+
     # Show one interleaving concretely — paged + batched, max_batch=2 (so it queues).
     print("\nper-request greedy output (paged, vs standalone):")
     sched = Scheduler(model, max_batch=2, batched=True, block_size=16, num_blocks=64)

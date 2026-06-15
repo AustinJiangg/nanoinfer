@@ -230,12 +230,32 @@ python tools/serve.py --block-size 16 --num-blocks 64 --max-batch 4 \
     --prompt "The capital of France is" --prompt "Once upon a time"
 ```
 
-With F8b the Fusion track is complete — a mini-vLLM: Python orchestration (continuous
-batching + paged block scheduler) over our own C++ kernels (batched decode + paged
-attention), parity-locked end to end. Deliberately left for later: prefix sharing
-(the block table is the natural home — share blocks across sequences with a common
-prefix, the RadixAttention idea), batched sampling (the draw is still per-sequence in
-Python), and a true int8×int8→int32 GEMM (C4 quant is still weight-only).
+### Prefix sharing (F8c: RadixAttention)
+
+`Scheduler(prefix_sharing=True)` lets requests reuse a shared prompt prefix's KV
+instead of recomputing it. KV blocks are reference-counted (`BlockPool`), and a
+`PrefixCache` keyed by the block-aligned token prefix maps prefixes to their physical
+blocks. On admit, the scheduler matches the longest cached prefix, seeds the sequence
+with those blocks (`PagedKVCache.share_prefix`, increfing them), and prefills **only
+the suffix**; on prefill it registers the sequence's complete blocks for later reuse.
+A block frees only when no holder (sequence or cache) remains.
+
+It's exact: a token's K/V depends only on the tokens up to it (causal attention), so a
+shared prefix's KV equals recomputing it — output is token-identical to standalone.
+The win is skipped prefill and shared memory: in `run_serve.py`, three requests with a
+24-token common prefix skip 48 prefill tokens and share 6 blocks, output unchanged.
+
+```bash
+python tools/serve.py --block-size 4 --num-blocks 128 --prefix-sharing --max-tokens 8 \
+    --prompt "The capital of France is the city of" \
+    --prompt "The capital of France is famous for"   # 2nd reuses the shared prefix
+```
+
+With F8c the Fusion track is a mini-vLLM: Python orchestration (continuous batching +
+paged block scheduler + prefix sharing) over our own C++ kernels (batched decode +
+paged attention), parity-locked end to end. Deliberately left for later: batched
+sampling (the draw is still per-sequence in Python) and a true int8×int8→int32 GEMM
+(C4 quant is still weight-only, so it saves memory, not compute).
 
 ## Performance (C5: SIMD + threads)
 
@@ -309,3 +329,8 @@ prefill, an uncommon path).
       to the contiguous cache (`tests/run_paged.cpp`), ~1.5× decode at context 128.
       The Python block scheduler (`block_size=...`) gates admission on KV blocks and
       frees them on finish — no per-sequence max_seq preallocation. The vLLM merge point.
+- [x] **F8c** — prefix sharing (RadixAttention): refcounted KV blocks + a `PrefixCache`
+      keyed by the block-aligned token prefix. A request reuses a cached prefix's
+      blocks (`PagedKVCache.share_prefix`) and prefills only its suffix
+      (`Scheduler(prefix_sharing=True)`) — bit-identical to standalone, the win being
+      skipped prefill + shared blocks (`tests/run_serve.py`, `tests/run_paged.cpp`).

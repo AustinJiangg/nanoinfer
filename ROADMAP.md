@@ -132,6 +132,15 @@ API simple/C-style so the later binding is cheap.
       on KV blocks (conservative worst-case reservation), and frees blocks on finish
       for reuse — token-identical to standalone (`tests/run_serve.py`), with no
       per-sequence max_seq preallocation. The vLLM merge point.
+- [x] **F8c** — prefix sharing (RadixAttention): KV blocks are reference-counted, and
+      a `PrefixCache` (`python/scheduler.py`) keyed by the block-aligned token prefix
+      lets a request reuse a cached prefix's blocks (`PagedKVCache.share_prefix`)
+      instead of recomputing them — prefilling only its suffix
+      (`Scheduler(prefix_sharing=True)`). The shared KV is bit-identical to recomputing
+      it (causal: a token's KV depends only on its prefix), so output stays
+      token-identical to standalone (`tests/run_serve.py`, `tests/run_paged.cpp`); the
+      win is skipped prefill + shared blocks. A shared block frees only when no holder
+      (sequence or cache) remains.
 
 ## Reference reading
 - PagedAttention / vLLM paper — KV memory management
