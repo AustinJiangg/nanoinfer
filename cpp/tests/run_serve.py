@@ -67,26 +67,40 @@ def main() -> int:
     ref = {r.request_id: standalone(model, r) for r in reqs}
 
     ok = True
-    # Both decode paths (batched=F8a forward_batch, and the per-sequence F7 loop), at
-    # several batch sizes, must agree with standalone — greedy output is invariant to
-    # how sequences are packed AND to whether the projections are fused.
-    for batched in (False, True):
-        for max_batch in (1, 2, 8):
-            sched = Scheduler(model, max_batch=max_batch, batched=batched)
-            for r in reqs:
-                sched.add(r)
-            out = sched.run()
+    # Every backing must produce the same tokens as standalone — greedy output is
+    # invariant to how sequences are packed (max_batch), whether the projections are
+    # fused (batched), and whether the KV cache is contiguous or paged (block_size).
+    # The tight paged pool (nb=8) forces block-aware queueing and block reuse.
+    configs = [
+        ("F7  per-seq  mb=2      ", dict(max_batch=2, batched=False)),
+        ("F7  per-seq  mb=8      ", dict(max_batch=8, batched=False)),
+        ("F8a batched  mb=1      ", dict(max_batch=1, batched=True)),
+        ("F8a batched  mb=2      ", dict(max_batch=2, batched=True)),
+        ("F8a batched  mb=8      ", dict(max_batch=8, batched=True)),
+        ("F8b paged    bs=4 nb=8 ", dict(max_batch=8, batched=True, block_size=4, num_blocks=8)),
+        ("F8b paged    bs=16 nb=64", dict(max_batch=8, batched=True, block_size=16, num_blocks=64)),
+    ]
+    for name, kw in configs:
+        sched = Scheduler(model, **kw)
+        for r in reqs:
+            sched.add(r)
+        out = sched.run()
 
-            mism = [rid for rid in ref if out.get(rid) != ref[rid]]
-            match = not mism
-            ok = ok and match and len(out) == len(reqs)
-            print(f"batched={batched!s:5} max_batch={max_batch}: steps={sched.steps} "
-                  f"peak_batch={sched.peak_batch} "
-                  f"-> {'MATCH' if match else 'MISMATCH ' + str(mism)}")
+        mism = [rid for rid in ref if out.get(rid) != ref[rid]]
+        match = not mism
+        ok = ok and match and len(out) == len(reqs)
+        extra = ""
+        if sched.paged:
+            # All blocks must return to the pool once every sequence has finished.
+            freed = sched.pool.free_blocks == sched.pool.num_blocks
+            ok = ok and freed
+            extra = f" pool_free={sched.pool.free_blocks}/{sched.pool.num_blocks}"
+        print(f"{name}: steps={sched.steps} peak_batch={sched.peak_batch}{extra} "
+              f"-> {'MATCH' if match else 'MISMATCH ' + str(mism)}")
 
-    # Show one interleaving concretely (the smallest batch that actually queues).
-    print("\nper-request greedy output (vs standalone):")
-    sched = Scheduler(model, max_batch=2)
+    # Show one interleaving concretely — paged + batched, max_batch=2 (so it queues).
+    print("\nper-request greedy output (paged, vs standalone):")
+    sched = Scheduler(model, max_batch=2, batched=True, block_size=16, num_blocks=64)
     for r in reqs:
         sched.add(r)
     out = sched.run()

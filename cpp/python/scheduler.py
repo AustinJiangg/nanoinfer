@@ -1,6 +1,6 @@
-"""F7 — Python serving layer: continuous (iteration-level) batching over the C++
-kernels exposed in F6 (the `nicpp` module). This is the vLLM shape taking form:
-Python orchestration, C++ compute.
+"""Python serving layer (stages F7–F8b): continuous (iteration-level) batching over
+the C++ kernels exposed in F6 (the `nicpp` module). The vLLM shape: Python
+orchestration, C++ compute.
 
 Each request gets its own KV cache and per-sequence state. The scheduler advances
 every running sequence by one token per step, evicts the ones that finished, and
@@ -8,20 +8,20 @@ admits queued requests into the freed slots — *continuous* batching: the batch
 composition changes every iteration, so a short request never waits behind a long
 one (no head-of-line blocking) and slots stay full while there's work.
 
+Two knobs select how the kernels back that scheduling, each parity-preserving:
+  - batched (F8a, default): decode the whole running set in one forward_batch call —
+    the per-sequence projection GEMMs fuse into one matmul. batched=False keeps the
+    per-sequence forward() loop (F7) for A/B.
+  - block_size>0 (F8b): a paged KV cache — one shared BlockPool, a PagedKVCache per
+    sequence (no per-sequence max_seq preallocation), admission gated on KV blocks.
+    block_size=0 keeps the contiguous cache.
+
 Token selection happens here in Python (numpy) over the logits the C++ forward
 returns — greedy by default, with the same repetition-penalty / temperature / top-k
 / top-p warpers, in the same order, as nanoinfer/sampling.py. Greedy is deterministic
 and operates on the float32 logits exactly as the C++ sampler does, so a sequence's
-output is identical whether it runs alone or interleaved with others — the parity
-test (tests/run_serve.py).
-
-Scope, stated honestly: this is the *scheduling* layer. The kernels are still
-batch-1, so step() loops one forward() per running sequence — it does not yet fuse
-the per-sequence GEMMs into a single batched matmul (the raw-throughput win). That
-needs a batched C++ forward kernel, and it slots in *under* this scheduler without
-changing it: the serving layer is decoupled from whether the kernel is batched. It
-pairs naturally with the F8 paged-attention read path (per-sequence cache lengths).
-"""
+output is identical whether it runs alone or interleaved, batched or paged — the
+parity test (tests/run_serve.py)."""
 
 from __future__ import annotations
 
@@ -70,6 +70,7 @@ class Sequence:
         self.cache = cache
         self.output_ids: list[int] = []
         self.state = State.WAITING
+        self.reserved_blocks = 0  # KV blocks reserved for it (paged mode)
         self._rng = np.random.default_rng(req.seed)
 
     @property
@@ -133,13 +134,22 @@ class Scheduler:
     yourself to interleave with other work (an event loop, request arrivals, ...).
     """
 
-    def __init__(self, model, max_batch: int = 8, batched: bool = True):
+    def __init__(self, model, max_batch: int = 8, batched: bool = True,
+                 block_size: int = 0, num_blocks: int = 0):
         self.model = model
         self.max_batch = max_batch
         # batched=True decodes the whole running set in one forward_batch call (F8a:
         # the per-sequence projection GEMMs fuse into one matmul). False keeps the
         # per-sequence forward() loop (F7) — same tokens, for A/B and parity checks.
         self.batched = batched
+        # block_size>0 enables the paged KV cache (F8b): one shared BlockPool, a
+        # PagedKVCache per sequence (no per-sequence max_seq preallocation). Admission
+        # is then gated on KV blocks (conservatively reserving each sequence's
+        # worst-case so the pool can't be over-committed). block_size=0 keeps the
+        # contiguous cache. Either way the tokens are identical (paged is bit-exact).
+        self.paged = block_size > 0
+        self.pool = model.make_block_pool(block_size, num_blocks) if self.paged else None
+        self.reserved = 0  # KV blocks reserved by running sequences (paged only)
         self.waiting: deque[Request] = deque()
         self.running: list[Sequence] = []
         self.finished: dict[str, list[int]] = {}
@@ -156,6 +166,11 @@ class Scheduler:
     def _finish(self, seq: Sequence) -> None:
         seq.state = State.FINISHED
         self.finished[seq.req.request_id] = seq.output_ids
+        if self.paged:
+            # Drop the reservation and the cache itself — its PagedKVCache destructor
+            # returns the sequence's blocks to the pool for the next request to reuse.
+            self.reserved -= seq.reserved_blocks
+            seq.cache = None
 
     def _emit(self, seq: Sequence, logits_row: np.ndarray) -> bool:
         """Sample one token from the last-position logits and apply the stop rules,
@@ -190,13 +205,35 @@ class Scheduler:
         # 3. Admit waiting requests into free slots, prefilling each (full-prompt
         #    forward). The first token is emitted from the prefill logits, so a
         #    newly admitted sequence has produced one token by the end of this step.
+        #    In paged mode admission is also gated on KV blocks (FCFS: if the head
+        #    request can't be reserved yet, wait rather than skip ahead).
         while len(self.running) < self.max_batch and self.waiting:
-            req = self.waiting.popleft()
+            req = self.waiting[0]
             if not req.prompt_ids:  # nothing to condition on (generate() returns [])
+                self.waiting.popleft()
                 self.finished[req.request_id] = []
                 continue
-            cache = self.model.make_cache(len(req.prompt_ids) + max(req.max_tokens, 1))
+
+            reserved = 0
+            if self.paged:
+                bs = self.pool.block_size
+                # Reserve each sequence's worst case (prompt + all decode tokens) so
+                # lazily-allocated blocks can never exceed the pool mid-generation.
+                reserved = (len(req.prompt_ids) + max(req.max_tokens, 1) + bs - 1) // bs
+                if reserved > self.pool.num_blocks:
+                    raise ValueError(
+                        f"request {req.request_id} needs {reserved} blocks; pool has "
+                        f"{self.pool.num_blocks} (raise num_blocks or block_size)")
+                if self.reserved + reserved > self.pool.num_blocks:
+                    break  # not enough free KV blocks right now; keep it queued
+                cache = nicpp.PagedKVCache(self.pool)
+                self.reserved += reserved
+            else:
+                cache = self.model.make_cache(len(req.prompt_ids) + max(req.max_tokens, 1))
+
+            self.waiting.popleft()
             seq = Sequence(req, cache)
+            seq.reserved_blocks = reserved
             seq.state = State.RUNNING
             logits = self.model.forward(req.prompt_ids, cache)  # prefill
             if req.max_tokens <= 0 or self._emit(seq, logits[-1]):

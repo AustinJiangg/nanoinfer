@@ -38,6 +38,10 @@ def main() -> None:
     p.add_argument("--model", default=DEFAULT_MODEL, help="HF id for the tokenizer only")
     p.add_argument("--max-tokens", type=int, default=32)
     p.add_argument("--max-batch", type=int, default=4, help="concurrent sequences")
+    p.add_argument("--block-size", type=int, default=0,
+                   help="paged KV cache (F8b) with blocks of this size; 0 = contiguous")
+    p.add_argument("--num-blocks", type=int, default=256,
+                   help="paged pool size in blocks (used when --block-size > 0)")
     p.add_argument("--quant", default="fp32", choices=["fp32", "q8", "q4", "q4g"])
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--top-k", type=int, default=0)
@@ -55,7 +59,8 @@ def main() -> None:
     model = nicpp.Model(args.weights_dir, nicpp.quant_mode(args.quant))
     eos_id = model.config.eos_token_id
 
-    sched = Scheduler(model, max_batch=args.max_batch)
+    sched = Scheduler(model, max_batch=args.max_batch, block_size=args.block_size,
+                      num_blocks=args.num_blocks)
     prompts = {}
     for i, text in enumerate(args.prompts):
         rid = f"req{i}"
@@ -72,7 +77,9 @@ def main() -> None:
     dt = time.perf_counter() - t0
 
     n_tok = sum(len(v) for v in out.values())
-    print(f"served {len(prompts)} prompts, max_batch={args.max_batch}: "
+    cache = (f"paged(block_size={args.block_size}, {args.num_blocks} blocks)"
+             if sched.paged else "contiguous")
+    print(f"served {len(prompts)} prompts, max_batch={args.max_batch}, cache={cache}: "
           f"{sched.steps} steps, peak_batch={sched.peak_batch}, "
           f"{n_tok} tokens in {dt:.2f}s ({n_tok / dt:.1f} tok/s)\n")
     for rid, text in prompts.items():

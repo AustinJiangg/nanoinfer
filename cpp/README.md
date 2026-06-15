@@ -190,10 +190,42 @@ Batched decode throughput (`run_batch`, Qwen2.5-0.5B, 20-core CPU, aggregate tok
 
 The win comes from weight reuse: batch-1 decode streams every weight to emit one
 token (memory-bound), while batched decode streams it once for N tokens. It tapers
-as the fused GEMMs turn the step compute-bound — the same wall prefill hits. Still
-left for **F8b**: paged attention (block KV cache + block table + paged read path),
-the vLLM merge point — `forward_batch` here uses each sequence's own contiguous
-cache; paging removes the contiguous-memory requirement for high KV utilization.
+as the fused GEMMs turn the step compute-bound — the same wall prefill hits.
+
+### Paged attention (F8b)
+
+`Scheduler(block_size=...)` switches the KV cache from contiguous to **paged** (the
+vLLM idea, `src/paged.hpp`): one shared `BlockPool` of fixed-size blocks, a
+per-sequence block table (`PagedKVCache`). Both implement a `KVCacheBase` interface,
+so `forward`/`forward_batch` drive either through one pointer — the paged `update()`
+gathers the filled prefix into the same contiguous view the attention kernel takes,
+so output is **bit-identical** to the contiguous cache (`run_paged.cpp`, `max|diff|=0`).
+
+The point is memory: no per-sequence `[max_seq]` preallocation. Blocks are drawn from
+the shared pool as a sequence grows and returned on finish, so memory tracks actual
+lengths and the pool is reused across requests. The Python block scheduler admits a
+request only when the pool can reserve its worst case (so lazily-allocated blocks
+can't over-commit), and frees its blocks when it finishes — token-identical to
+standalone, with admission now gated on KV blocks rather than just slots.
+
+```python
+sched = Scheduler(model, max_batch=8, block_size=16, num_blocks=256)  # paged
+sched.add(Request("a", [785, 6722, 315, 9625, 374], max_tokens=64))
+outputs = sched.run()   # PagedKVCache per sequence; blocks recycled through the pool
+```
+
+```bash
+# paged forward == contiguous forward (bit-identical, single + batched) + pool reuse
+./build/run_paged weights/qwen2.5-0.5b
+# serve with a paged KV cache (tight pool -> admission gated on blocks)
+python tools/serve.py --block-size 16 --num-blocks 64 --max-batch 4 \
+    --prompt "The capital of France is" --prompt "Once upon a time"
+```
+
+Deliberately left for later: fusing the gather into the attention read — true paged
+attention that indexes blocks in the kernel and skips the contiguous copy. The
+memory management (the actual PagedAttention contribution) is here; that step is a
+kernel-level IO optimization, the paged analogue of C5's "update returns copies".
 
 ## Performance (C5: SIMD + threads)
 
@@ -260,3 +292,9 @@ prefill, an uncommon path).
       stays a per-sequence loop). Bit-identical to N standalone forwards
       (`tests/run_batch.cpp`), driven under the scheduler (`batched=True`); ~2.5×
       aggregate decode tok/s at batch 16. The throughput lever F7 was missing.
+- [x] **F8b** — paged attention: a shared `BlockPool` of fixed-size KV blocks + a
+      per-sequence block table (`PagedKVCache`), behind a `KVCacheBase` interface so
+      `forward`/`forward_batch` drive either cache. Bit-identical to the contiguous
+      cache (`tests/run_paged.cpp`); the Python block scheduler (`block_size=...`)
+      gates admission on KV blocks and frees them on finish — no per-sequence max_seq
+      preallocation. The vLLM merge point.

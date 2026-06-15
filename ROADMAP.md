@@ -119,9 +119,17 @@ API simple/C-style so the later binding is cheap.
       (`tests/run_batch.cpp`, `max|diff|=0`), wired under the F7 scheduler
       (`batched=True`, parity re-checked in `tests/run_serve.py`); ~2.5× aggregate
       decode tok/s at batch 16 on 20 cores — the throughput lever F7 was missing.
-- [ ] **F8b** — paged attention: KV cache in fixed-size blocks + a block table per
-      sequence + a paged attention read path (C++ kernel + Python block scheduler).
-      The vLLM merge point; output matches the contiguous-cache path.
+- [x] **F8b** — paged attention: a shared `BlockPool` of fixed-size KV blocks + a
+      per-sequence block table (`PagedKVCache`), behind a `KVCacheBase` interface so
+      `forward`/`forward_batch` drive contiguous or paged caches through one pointer.
+      `update()` gathers the filled prefix into the contiguous view the attention
+      kernel already takes, so paged output is bit-identical to the contiguous cache
+      (`tests/run_paged.cpp`, `max|diff|=0`, single + batched). The Python block
+      scheduler (`Scheduler(block_size=...)`) gives each sequence a PagedKVCache, gates
+      admission on KV blocks (conservative worst-case reservation), and frees blocks on
+      finish for reuse — token-identical to standalone (`tests/run_serve.py`), the win
+      being no per-sequence max_seq preallocation. The vLLM merge point. (Next: fuse
+      the gather into the attention read — true paged attention, skipping the copy.)
 
 ## Reference reading
 - PagedAttention / vLLM paper — KV memory management
