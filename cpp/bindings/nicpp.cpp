@@ -128,13 +128,24 @@ PYBIND11_MODULE(nicpp, m) {
         .def_property_readonly("num_blocks", &BlockPool::num_blocks)
         .def_property_readonly("block_size", &BlockPool::block_size)
         .def_property_readonly("free_blocks", &BlockPool::free_blocks)
-        .def_property_readonly("used_blocks", &BlockPool::used_blocks);
+        .def_property_readonly("used_blocks", &BlockPool::used_blocks)
+        // Refcount primitives for the Python prefix cache (RadixAttention): hold a
+        // shared block with incref, release it with free.
+        .def("incref", &BlockPool::incref, py::arg("block"))
+        .def("free", &BlockPool::free, py::arg("block"))
+        .def("refcount", &BlockPool::refcount, py::arg("block"));
 
     py::class_<PagedKVCache, KVCacheBase>(m, "PagedKVCache")
         .def(py::init<BlockPool*>(), py::arg("pool"), py::keep_alive<1, 2>(),
              "A sequence's view onto a BlockPool (keeps the pool alive).")
         .def_property_readonly("num_blocks", &PagedKVCache::num_blocks,
-                               "Physical blocks this sequence currently holds.");
+                               "Physical blocks this sequence currently holds.")
+        .def_property_readonly("block_table", &PagedKVCache::block_table,
+                               "Logical->physical block ids (for the prefix cache).")
+        .def("share_prefix", &PagedKVCache::share_prefix, py::arg("blocks"),
+             py::arg("length"),
+             "Seed this (fresh) sequence with shared prefix blocks; length must be "
+             "blocks * block_size. The sequence then prefills only its suffix.");
 
     py::class_<Model>(m, "Model")
         .def(py::init<const std::string&, QuantMode>(), py::arg("weights_dir"),

@@ -38,13 +38,18 @@ public:
     BlockPool(BlockPool&&) = default;
     BlockPool& operator=(BlockPool&&) = default;
 
-    int64_t allocate();        // a free physical block id; throws when exhausted
-    void free(int64_t block);  // return a block to the pool
+    // Blocks are reference-counted so they can be SHARED (prefix sharing): allocate()
+    // hands out a block with refcount 1; incref() adds a holder; free() drops one and
+    // returns the block to the pool only at refcount 0.
+    int64_t allocate();        // a free physical block id (refcount 1); throws when exhausted
+    void incref(int64_t block);  // add a holder (a sharing sequence or the prefix cache)
+    void free(int64_t block);    // drop a holder; recycle the block when none remain
 
     int64_t num_blocks() const { return num_blocks_; }
     int64_t block_size() const { return block_size_; }
     int64_t free_blocks() const { return static_cast<int64_t>(free_list_.size()); }
     int64_t used_blocks() const { return num_blocks_ - free_blocks(); }
+    int64_t refcount(int64_t block) const { return refcount_[static_cast<size_t>(block)]; }
     int64_t n_kv_heads() const { return n_kv_heads_; }
     int64_t head_dim() const { return head_dim_; }
 
@@ -58,6 +63,7 @@ private:
     std::vector<std::vector<float>> k_;  // per layer: num_blocks * block_stride_
     std::vector<std::vector<float>> v_;
     std::vector<int64_t> free_list_;     // free block ids (a stack)
+    std::vector<int64_t> refcount_;      // holders per block (0 == free)
 };
 
 // One sequence's view onto a BlockPool: its block table + filled length. Frees its
@@ -85,6 +91,15 @@ public:
     void advance(int64_t t) override { length_ += t; }
     int64_t length() const override { return length_; }
     int64_t num_blocks() const { return static_cast<int64_t>(block_table_.size()); }
+
+    // Prefix sharing: seed a fresh sequence with already-computed prefix blocks
+    // (from another sequence / the prefix cache), increfing each. `length` must be a
+    // block boundary (blocks.size() * block_size); the sequence then writes its own
+    // blocks from there, so the shared blocks stay read-only — no copy-on-write.
+    void share_prefix(const std::vector<int64_t>& blocks, int64_t length);
+
+    // This sequence's logical->physical block table (for the prefix cache to register).
+    const std::vector<int64_t>& block_table() const { return block_table_; }
 
 private:
     void release();                            // free all blocks back to the pool

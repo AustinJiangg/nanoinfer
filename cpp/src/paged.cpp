@@ -31,6 +31,7 @@ BlockPool::BlockPool(int64_t num_layers, int64_t n_kv_heads, int64_t head_dim,
     // Free list as a stack; push high ids first so allocate() hands out 0,1,2,...
     free_list_.reserve(static_cast<size_t>(num_blocks_));
     for (int64_t i = num_blocks_ - 1; i >= 0; --i) free_list_.push_back(i);
+    refcount_.assign(static_cast<size_t>(num_blocks_), 0);  // all free
 }
 
 int64_t BlockPool::allocate() {
@@ -39,13 +40,24 @@ int64_t BlockPool::allocate() {
                                  " total) — raise num_blocks or evict a sequence");
     const int64_t b = free_list_.back();
     free_list_.pop_back();
+    refcount_[static_cast<size_t>(b)] = 1;  // one holder: the allocating sequence
     return b;
+}
+
+void BlockPool::incref(int64_t block) {
+    if (block < 0 || block >= num_blocks_)
+        throw std::out_of_range("BlockPool::incref: block id out of range");
+    if (refcount_[static_cast<size_t>(block)] <= 0)
+        throw std::runtime_error("BlockPool::incref: block is free");
+    ++refcount_[static_cast<size_t>(block)];
 }
 
 void BlockPool::free(int64_t block) {
     if (block < 0 || block >= num_blocks_)
         throw std::out_of_range("BlockPool::free: block id out of range");
-    free_list_.push_back(block);
+    int64_t& rc = refcount_[static_cast<size_t>(block)];
+    if (rc <= 0) throw std::runtime_error("BlockPool::free: double free");
+    if (--rc == 0) free_list_.push_back(block);  // last holder gone -> recycle
 }
 
 float* BlockPool::k_at(int64_t layer, int64_t block, int64_t head, int64_t off) {
@@ -82,6 +94,20 @@ void PagedKVCache::ensure_capacity(int64_t positions) {
     const int64_t bs = pool_->block_size();
     while (static_cast<int64_t>(block_table_.size()) * bs < positions)
         block_table_.push_back(pool_->allocate());
+}
+
+void PagedKVCache::share_prefix(const std::vector<int64_t>& blocks, int64_t length) {
+    if (!block_table_.empty() || length_ != 0)
+        throw std::runtime_error("share_prefix: must seed a fresh cache");
+    const int64_t bs = pool_->block_size();
+    if (length != static_cast<int64_t>(blocks.size()) * bs)
+        throw std::invalid_argument("share_prefix: length must be a block boundary "
+                                    "(blocks.size() * block_size)");
+    // Become a holder of each shared block; the sequence writes its own blocks past
+    // `length` (a block boundary), so the shared blocks are never mutated here.
+    block_table_ = blocks;
+    for (int64_t b : block_table_) pool_->incref(b);
+    length_ = length;
 }
 
 Tensor PagedKVCache::attend(int64_t layer, const Tensor& q, const Tensor& k,

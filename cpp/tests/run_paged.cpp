@@ -188,6 +188,45 @@ int main(int argc, char** argv) {
                         D / paged_s, cont_s / paged_s);
         }
 
+        // --- 5. Prefix sharing (RadixAttention): a sequence seeded with another's
+        //     prefix blocks, then prefilling only its suffix, must match a full fresh
+        //     prefill bit-for-bit (the shared KV equals recomputing it), and the
+        //     shared blocks are refcounted (held by both sequences). ---
+        {
+            const int64_t BS = 4;
+            std::vector<int64_t> prompt(16);
+            for (int64_t i = 0; i < 16; ++i) prompt[static_cast<size_t>(i)] = base[i % base.size()];
+            const int64_t SHARED = 2, shared_len = SHARED * BS;  // share 2 blocks = 8 tok
+
+            ni::BlockPool pool(cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, BS, 64);
+            // A prefills only the shared prefix; its blocks then hold that prefix's KV.
+            ni::PagedKVCache a(&pool);
+            model.forward(std::vector<int64_t>(prompt.begin(), prompt.begin() + shared_len), &a);
+            // B shares A's blocks and prefills only the suffix.
+            ni::PagedKVCache b(&pool);
+            b.share_prefix(a.block_table(), shared_len);
+            ni::Tensor lb = model.forward(
+                std::vector<int64_t>(prompt.begin() + shared_len, prompt.end()), &b);
+            // C is the reference: a full fresh prefill of the whole prompt.
+            ni::PagedKVCache c(&pool);
+            ni::Tensor lc = model.forward(prompt, &c);
+
+            double d = 0.0;  // compare the last-position logits (both at position 15)
+            for (int64_t j = 0; j < vocab; ++j)
+                d = std::max(d, std::fabs(double(lb.at(lb.size(0) - 1, j)) -
+                                          double(lc.at(lc.size(0) - 1, j))));
+            const int64_t rc = pool.refcount(a.block_table()[0]);
+            const bool pass = (d == 0.0) && (rc == 2) &&
+                              argmax_row(lb, lb.size(0) - 1, vocab) ==
+                                  argmax_row(lc, lc.size(0) - 1, vocab);
+            ok = ok && pass;
+            std::printf("\nprefix sharing: shared %lld blocks (%lld tok) + %lld suffix tok; "
+                        "last-row max|diff|=%g shared-block refcount=%lld -> %s\n",
+                        (long long)SHARED, (long long)shared_len,
+                        (long long)(16 - shared_len), d, (long long)rc,
+                        pass ? "BIT-IDENTICAL" : "MISMATCH");
+        }
+
         std::printf(ok ? "\nrun_paged: ok\n" : "\nrun_paged: FAIL\n");
         return ok ? 0 : 1;
     } catch (const std::exception& e) {
