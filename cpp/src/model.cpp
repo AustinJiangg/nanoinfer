@@ -8,6 +8,7 @@
 #include "serialize.hpp"
 
 #ifdef NI_CUDA
+#include "cuda/cuda.hpp"
 #include "cuda/cuda_backend.hpp"
 #endif
 
@@ -78,6 +79,18 @@ Model::Model(const std::string& weights_dir, QuantMode mode, Device device) {
             w_.erase(n);  // free the fp32 copy — the quantized weight is live now
         }
     }
+
+#ifdef NI_CUDA
+    // CUDA path: upload every resident weight + the RoPE tables to the GPU once, here,
+    // so the forward never copies a weight again — H2D only at load, the GPU analogue of
+    // C5's "stream each weight once". After this W() returns device tensors and every op
+    // in forward() runs on the GPU. (Quant stays on CPU, so this path uses fp32 weights.)
+    if (device == Device::CUDA) {
+        for (auto& kv : w_) kv.second = to_device(kv.second);
+        rope_.cos = to_device(rope_.cos);
+        rope_.sin = to_device(rope_.sin);
+    }
+#endif
 }
 
 KVCache Model::make_cache(int64_t max_seq) const {
@@ -174,7 +187,11 @@ Tensor Model::forward(const std::vector<int64_t>& ids, KVCacheBase* cache) const
     // Tied models share the embedding as the output projection, so the exporter
     // skips the duplicate lm_head.weight; fall back to embed_tokens here.
     const std::string lm = cfg_.tie_word_embeddings ? "embed_tokens.weight" : "lm_head.weight";
-    return backend_->linear(x, W(lm), nullptr);  // [seq, vocab]
+    Tensor logits = backend_->linear(x, W(lm), nullptr);  // [seq, vocab]
+#ifdef NI_CUDA
+    if (logits.device() == Device::CUDA) logits = to_host(logits);  // D2H only at the edge
+#endif
+    return logits;
 }
 
 Tensor Model::forward_batch(const std::vector<int64_t>& tokens,
@@ -243,7 +260,11 @@ Tensor Model::forward_batch(const std::vector<int64_t>& tokens,
 
     x = backend_->rmsnorm(x, W("norm.weight"), eps);
     const std::string lm = cfg_.tie_word_embeddings ? "embed_tokens.weight" : "lm_head.weight";
-    return backend_->linear(x, W(lm), nullptr);  // [n, vocab]
+    Tensor logits = backend_->linear(x, W(lm), nullptr);  // [n, vocab]
+#ifdef NI_CUDA
+    if (logits.device() == Device::CUDA) logits = to_host(logits);
+#endif
+    return logits;
 }
 
 }  // namespace ni

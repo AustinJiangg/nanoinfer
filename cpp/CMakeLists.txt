@@ -154,6 +154,12 @@ if(NI_CUDA)
   target_link_libraries(test_cuda PRIVATE nicore)
   target_include_directories(test_cuda PRIVATE tests)
   add_test(NAME test_cuda COMMAND test_cuda)
+
+  # G2: full GPU forward vs the nanoinfer reference (logits + greedy). Needs the weight
+  # export + ref dump (like run_parity), so it is built but not auto-run by ctest.
+  add_executable(run_cuda_parity tests/run_cuda_parity.cpp)
+  target_link_libraries(run_cuda_parity PRIVATE nicore)
+  target_include_directories(run_cuda_parity PRIVATE tests)
 endif()
 
 # F6: pybind11 module exposing the C++ core to Python — the vLLM-shape pivot
