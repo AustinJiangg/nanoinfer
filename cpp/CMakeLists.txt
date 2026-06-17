@@ -170,6 +170,11 @@ if(NI_CUDA)
   add_executable(run_cuda_batch tests/run_cuda_batch.cpp)
   target_link_libraries(run_cuda_batch PRIVATE nicore)
   target_include_directories(run_cuda_batch PRIVATE tests)
+
+  # G4b: paged KV cache on GPU — paged-attention kernel == contiguous cache.
+  add_executable(run_cuda_paged tests/run_cuda_paged.cpp)
+  target_link_libraries(run_cuda_paged PRIVATE nicore)
+  target_include_directories(run_cuda_paged PRIVATE tests)
 endif()
 
 # F6: pybind11 module exposing the C++ core to Python — the vLLM-shape pivot

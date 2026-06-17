@@ -224,6 +224,67 @@ __global__ void attention_kernel(const float* __restrict__ q, const float* __res
     for (int64_t d = 0; d < D; ++d) oi[d] = acc[d] * inv;
 }
 
+// Write the t new tokens' K/V ([n_kv, t, hd]) into this sequence's blocks for one layer.
+// One thread per (head, token, dim); the block + offset come from the block table.
+__global__ void paged_write_kernel(const float* __restrict__ k, const float* __restrict__ v,
+                                   float* __restrict__ Kbase, float* __restrict__ Vbase,
+                                   const int64_t* __restrict__ block_table, int64_t t, int64_t n_kv,
+                                   int64_t hd, int64_t block_size, int64_t start) {
+    const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= n_kv * t * hd) return;
+    const int64_t d = idx % hd, i = (idx / hd) % t, h = idx / (hd * t);
+    const int64_t pos = start + i;
+    const int64_t blk = block_table[pos / block_size], off = pos % block_size;
+    const int64_t dst = ((blk * n_kv + h) * block_size + off) * hd + d;
+    Kbase[dst] = k[idx];  // k/v are [n_kv, t, hd]: idx = (h*t+i)*hd + d
+    Vbase[dst] = v[idx];
+}
+
+// Paged attention: one thread per (head, query). Reads each key/value straight from the
+// blocks via the block table (logical pos -> block_table[pos/bs] at pos%bs), folding GQA
+// into the read (query head h uses KV head h/n_rep). Same two-pass max-subtract softmax
+// as attention_kernel, over the same keys in the same order, so the result is
+// bit-identical to the contiguous path — paging changes WHERE K/V live, not the math.
+__global__ void paged_attention_kernel(const float* __restrict__ q, const float* __restrict__ Kbase,
+                                       const float* __restrict__ Vbase,
+                                       const int64_t* __restrict__ block_table,
+                                       float* __restrict__ out, int64_t n_heads, int64_t sq,
+                                       int64_t hd, int64_t n_kv, int64_t n_rep, int64_t block_size,
+                                       int causal, int64_t query_offset, int64_t end, float scale) {
+    const int64_t hi = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (hi >= n_heads * sq) return;
+    const int64_t h = hi / sq, i = hi % sq;
+    const int64_t kvh = h / n_rep;  // GQA: this query head's KV head
+    const float* qi = q + (h * sq + i) * hd;
+    const int64_t limit = causal ? (query_offset + i + 1) : end;
+
+    float maxv = -INFINITY;
+    for (int64_t j = 0; j < limit; ++j) {
+        const int64_t blk = block_table[j / block_size], off = j % block_size;
+        const float* kj = Kbase + ((blk * n_kv + kvh) * block_size + off) * hd;
+        float s = 0.0f;
+        for (int64_t d = 0; d < hd; ++d) s += qi[d] * kj[d];
+        s *= scale;
+        if (s > maxv) maxv = s;
+    }
+    float acc[kMaxHeadDim];
+    for (int64_t d = 0; d < hd; ++d) acc[d] = 0.0f;
+    float denom = 0.0f;
+    for (int64_t j = 0; j < limit; ++j) {
+        const int64_t blk = block_table[j / block_size], off = j % block_size;
+        const float* kj = Kbase + ((blk * n_kv + kvh) * block_size + off) * hd;
+        float s = 0.0f;
+        for (int64_t d = 0; d < hd; ++d) s += qi[d] * kj[d];
+        const float e = expf(s * scale - maxv);
+        denom += e;
+        const float* vj = Vbase + ((blk * n_kv + kvh) * block_size + off) * hd;
+        for (int64_t d = 0; d < hd; ++d) acc[d] += e * vj[d];
+    }
+    const float inv = 1.0f / denom;
+    float* oi = out + (h * sq + i) * hd;
+    for (int64_t d = 0; d < hd; ++d) oi[d] = acc[d] * inv;
+}
+
 }  // namespace
 
 bool cuda_available() {
@@ -401,5 +462,101 @@ Tensor CudaKVCache::attend(int64_t layer, const Tensor& q, const Tensor& k, cons
 
 void CudaKVCache::advance(int64_t t) { length_ += t; }
 int64_t CudaKVCache::length() const { return length_; }
+
+// --- Paged KV cache (G4b) ---
+
+CudaBlockPool::CudaBlockPool(int64_t num_layers, int64_t n_kv_heads, int64_t head_dim,
+                            int64_t block_size, int64_t num_blocks)
+    : num_layers_(num_layers), n_kv_heads_(n_kv_heads), head_dim_(head_dim),
+      block_size_(block_size), num_blocks_(num_blocks) {
+    if (num_layers <= 0 || n_kv_heads <= 0 || head_dim <= 0 || block_size <= 0 || num_blocks <= 0)
+        throw std::invalid_argument("CudaBlockPool: all dimensions must be positive");
+    block_stride_ = n_kv_heads_ * block_size_ * head_dim_;
+    const size_t total = static_cast<size_t>(num_layers_) * num_blocks_ * block_stride_;
+    void* pk = nullptr;
+    void* pv = nullptr;
+    cuda_check(cudaMalloc(&pk, total * sizeof(float)), "CudaBlockPool K");
+    cuda_check(cudaMalloc(&pv, total * sizeof(float)), "CudaBlockPool V");
+    cuda_check(cudaMemset(pk, 0, total * sizeof(float)), "CudaBlockPool K zero");
+    cuda_check(cudaMemset(pv, 0, total * sizeof(float)), "CudaBlockPool V zero");
+    dK_ = std::shared_ptr<void>(pk, [](void* q) { cudaFree(q); });
+    dV_ = std::shared_ptr<void>(pv, [](void* q) { cudaFree(q); });
+    free_list_.reserve(static_cast<size_t>(num_blocks_));
+    for (int64_t i = num_blocks_ - 1; i >= 0; --i) free_list_.push_back(i);
+    refcount_.assign(static_cast<size_t>(num_blocks_), 0);
+}
+
+int64_t CudaBlockPool::allocate() {
+    if (free_list_.empty())
+        throw std::runtime_error("CudaBlockPool: out of blocks — raise num_blocks or evict");
+    const int64_t b = free_list_.back();
+    free_list_.pop_back();
+    refcount_[static_cast<size_t>(b)] = 1;
+    return b;
+}
+
+void CudaBlockPool::incref(int64_t block) {
+    if (block < 0 || block >= num_blocks_) throw std::out_of_range("CudaBlockPool::incref");
+    if (refcount_[static_cast<size_t>(block)] <= 0)
+        throw std::runtime_error("CudaBlockPool::incref: block is free");
+    ++refcount_[static_cast<size_t>(block)];
+}
+
+void CudaBlockPool::free(int64_t block) {
+    if (block < 0 || block >= num_blocks_) throw std::out_of_range("CudaBlockPool::free");
+    int64_t& rc = refcount_[static_cast<size_t>(block)];
+    if (rc <= 0) throw std::runtime_error("CudaBlockPool::free: double free");
+    if (--rc == 0) free_list_.push_back(block);
+}
+
+CudaPagedKVCache::CudaPagedKVCache(CudaBlockPool* pool) : pool_(pool) {
+    if (pool == nullptr) throw std::invalid_argument("CudaPagedKVCache: null pool");
+}
+
+CudaPagedKVCache::~CudaPagedKVCache() {
+    if (pool_)
+        for (int64_t b : block_table_) pool_->free(b);
+}
+
+void CudaPagedKVCache::ensure_capacity(int64_t positions) {
+    const int64_t bs = pool_->block_size();
+    while (static_cast<int64_t>(block_table_.size()) * bs < positions)
+        block_table_.push_back(pool_->allocate());
+}
+
+Tensor CudaPagedKVCache::attend(int64_t layer, const Tensor& q, const Tensor& k, const Tensor& v,
+                                int64_t n_rep, bool causal, int64_t query_offset) {
+    const int64_t t = k.size(1);
+    const int64_t n_kv = pool_->n_kv_heads(), hd = pool_->head_dim(), bs = pool_->block_size();
+    const int64_t start = length_, end = start + t;
+    ensure_capacity(end);  // idempotent across layers (length_ advances once per forward)
+
+    // Upload the (small) block table for the two kernels.
+    const int64_t nbt = static_cast<int64_t>(block_table_.size());
+    int64_t* d_bt = nullptr;
+    cuda_check(cudaMalloc(&d_bt, nbt * sizeof(int64_t)), "paged block_table malloc");
+    cuda_check(cudaMemcpy(d_bt, block_table_.data(), nbt * sizeof(int64_t), cudaMemcpyHostToDevice),
+               "paged block_table H2D");
+
+    float* Kbase = pool_->k_base() + layer * pool_->layer_stride();
+    float* Vbase = pool_->v_base() + layer * pool_->layer_stride();
+
+    paged_write_kernel<<<grid1d(n_kv * t * hd, kBlock), kBlock>>>(dptr(k), dptr(v), Kbase, Vbase,
+                                                                 d_bt, t, n_kv, hd, bs, start);
+    sync_check("paged_write_kernel");
+
+    const int64_t n_heads = q.size(0), sq = q.size(1), D = q.size(2);
+    if (D > kMaxHeadDim)
+        throw std::runtime_error("CudaPagedKVCache::attend: head_dim > 128 not supported (G4b)");
+    Tensor out = device_alloc({n_heads, sq, D});
+    const float scale = 1.0f / sqrtf(static_cast<float>(D));
+    paged_attention_kernel<<<grid1d(n_heads * sq, kBlock), kBlock>>>(
+        dptr(q), Kbase, Vbase, d_bt, dptr(out), n_heads, sq, D, n_kv, n_rep, bs, causal ? 1 : 0,
+        query_offset, end, scale);
+    sync_check("paged_attention_kernel");
+
+    cudaFree(d_bt);
+    return out;
+}
 
 }  // namespace ni

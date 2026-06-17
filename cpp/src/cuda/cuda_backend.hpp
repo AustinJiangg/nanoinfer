@@ -66,4 +66,66 @@ private:
     int64_t length_ = 0;
 };
 
+// A pool of fixed-size physical KV blocks on the GPU, shared across sequences (G4b).
+// Mirrors the CPU BlockPool's allocator (a free list + refcounts — pure host-side
+// bookkeeping), but stores K/V in one big device buffer each (laid out
+// [num_layers, num_blocks, n_kv_heads, block_size, head_dim]); the paged-attention
+// kernel indexes that buffer by the block table. K/V never leave the device.
+class CudaBlockPool {
+public:
+    CudaBlockPool(int64_t num_layers, int64_t n_kv_heads, int64_t head_dim, int64_t block_size,
+                  int64_t num_blocks);
+    CudaBlockPool(const CudaBlockPool&) = delete;
+    CudaBlockPool& operator=(const CudaBlockPool&) = delete;
+    CudaBlockPool(CudaBlockPool&&) = default;
+    CudaBlockPool& operator=(CudaBlockPool&&) = default;
+
+    int64_t allocate();          // a free block id (refcount 1); throws when exhausted
+    void incref(int64_t block);  // add a holder (prefix sharing)
+    void free(int64_t block);    // drop a holder; recycle at refcount 0
+
+    int64_t num_blocks() const { return num_blocks_; }
+    int64_t block_size() const { return block_size_; }
+    int64_t free_blocks() const { return static_cast<int64_t>(free_list_.size()); }
+    int64_t used_blocks() const { return num_blocks_ - free_blocks(); }
+    int64_t n_kv_heads() const { return n_kv_heads_; }
+    int64_t head_dim() const { return head_dim_; }
+
+    // Device buffers + strides for the kernels (a layer's slice is base + layer*layer_stride).
+    float* k_base() const { return static_cast<float*>(dK_.get()); }
+    float* v_base() const { return static_cast<float*>(dV_.get()); }
+    int64_t layer_stride() const { return num_blocks_ * block_stride_; }
+    int64_t block_stride() const { return block_stride_; }
+
+private:
+    int64_t num_layers_, n_kv_heads_, head_dim_, block_size_, num_blocks_, block_stride_;
+    std::shared_ptr<void> dK_, dV_;  // device K/V buffers, RAII-freed (cudaFree deleter)
+    std::vector<int64_t> free_list_, refcount_;
+};
+
+// One sequence's paged KV cache on the GPU (G4b): a block table into a CudaBlockPool,
+// frees its blocks back on destruction. attend() writes the new K/V into the sequence's
+// blocks and attends directly over them via the paged-attention kernel — no gather, no
+// repeat_kv (GQA folded into the read). Bit-identical to the contiguous CudaKVCache.
+class CudaPagedKVCache : public KVCacheBase {
+public:
+    explicit CudaPagedKVCache(CudaBlockPool* pool);
+    ~CudaPagedKVCache() override;
+    CudaPagedKVCache(const CudaPagedKVCache&) = delete;
+    CudaPagedKVCache& operator=(const CudaPagedKVCache&) = delete;
+
+    Tensor attend(int64_t layer, const Tensor& q, const Tensor& k, const Tensor& v, int64_t n_rep,
+                  bool causal, int64_t query_offset) override;
+    void advance(int64_t t) override { length_ += t; }
+    int64_t length() const override { return length_; }
+    int64_t num_blocks() const { return static_cast<int64_t>(block_table_.size()); }
+    const std::vector<int64_t>& block_table() const { return block_table_; }
+
+private:
+    void ensure_capacity(int64_t positions);  // grow the block table to cover positions
+    CudaBlockPool* pool_;
+    std::vector<int64_t> block_table_;  // logical block i -> physical block id
+    int64_t length_ = 0;
+};
+
 }  // namespace ni
