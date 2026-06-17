@@ -97,6 +97,15 @@ KVCache Model::make_cache(int64_t max_seq) const {
     return KVCache(cfg_.num_layers, cfg_.num_kv_heads, cfg_.head_dim, max_seq);
 }
 
+std::unique_ptr<KVCacheBase> Model::make_kv_cache(int64_t max_seq) const {
+#ifdef NI_CUDA
+    if (backend_->device() == Device::CUDA)
+        return std::make_unique<CudaKVCache>(backend_.get(), cfg_.num_layers, cfg_.num_kv_heads,
+                                             cfg_.head_dim);
+#endif
+    return std::make_unique<KVCache>(cfg_.num_layers, cfg_.num_kv_heads, cfg_.head_dim, max_seq);
+}
+
 Tensor Model::project(const Tensor& x, const std::string& name, const Tensor* bias) const {
     // Quantized projections keep their own (CPU) path for now — GPU quant is post-G5.
     // The fp32 path goes through the backend, so it runs on whatever device backend_ is.

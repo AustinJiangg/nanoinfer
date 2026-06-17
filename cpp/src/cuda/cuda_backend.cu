@@ -47,6 +47,36 @@ Tensor device_alloc(const std::vector<int64_t>& shape) {
     return d;
 }
 
+// Concatenate two [n_kv, *, head_dim] tensors along the seq (middle) axis into a fresh
+// device buffer — how the GPU KV cache appends new tokens to a layer's history. `a` is
+// the existing history ([] on the first append); `b` is the new token(s) [n_kv, t, hd].
+Tensor cat_seq(const Tensor& a, const Tensor& b) {
+    const int64_t nkv = b.size(0), t = b.size(1), hd = b.size(2);
+    if (a.numel() == 0) {  // first token(s): copy b into an owned device buffer
+        Tensor out = device_alloc({nkv, t, hd});
+        cuda_check(cudaMemcpy(out.device_ptr(), b.device_ptr(),
+                              static_cast<size_t>(b.numel()) * sizeof(float),
+                              cudaMemcpyDeviceToDevice),
+                   "cat_seq copy");
+        return out;
+    }
+    const int64_t L = a.size(1), newL = L + t;
+    Tensor out = device_alloc({nkv, newL, hd});
+    // Per head: the old L rows, then the new t rows. (Heads interleave in memory, so this
+    // is one device-to-device copy per head per side, not a single contiguous copy.)
+    for (int64_t h = 0; h < nkv; ++h) {
+        cuda_check(cudaMemcpy(dptr(out) + h * newL * hd, dptr(a) + h * L * hd,
+                              static_cast<size_t>(L * hd) * sizeof(float),
+                              cudaMemcpyDeviceToDevice),
+                   "cat_seq old");
+        cuda_check(cudaMemcpy(dptr(out) + (h * newL + L) * hd, dptr(b) + h * t * hd,
+                              static_cast<size_t>(t * hd) * sizeof(float),
+                              cudaMemcpyDeviceToDevice),
+                   "cat_seq new");
+    }
+    return out;
+}
+
 // Round a flat element count up to a whole number of `block`-sized 1-D grid blocks.
 int grid1d(int64_t total, int block) { return static_cast<int>((total + block - 1) / block); }
 constexpr int kBlock = 256;
@@ -329,5 +359,28 @@ Tensor CudaBackend::attention(const Tensor& q, const Tensor& k, const Tensor& v,
     sync_check("attention_kernel");
     return out;
 }
+
+// --- Device-resident KV cache (G3) ---
+
+CudaKVCache::CudaKVCache(Backend* backend, int64_t num_layers, int64_t n_kv_heads,
+                        int64_t head_dim)
+    : backend_(backend), n_kv_heads_(n_kv_heads), head_dim_(head_dim),
+      k_(static_cast<size_t>(num_layers)), v_(static_cast<size_t>(num_layers)) {}
+
+Tensor CudaKVCache::attend(int64_t layer, const Tensor& q, const Tensor& k, const Tensor& v,
+                           int64_t n_rep, bool causal, int64_t query_offset) {
+    // Append this layer's new K/V to its growing history, then attend over the whole
+    // history — the same append + repeat_kv + attention the CPU cache does, on the GPU.
+    Tensor& kh = k_[static_cast<size_t>(layer)];
+    Tensor& vh = v_[static_cast<size_t>(layer)];
+    kh = cat_seq(kh, k);
+    vh = cat_seq(vh, v);
+    Tensor kk = backend_->repeat_kv(kh, n_rep);
+    Tensor vv = backend_->repeat_kv(vh, n_rep);
+    return backend_->attention(q, kk, vv, causal, query_offset);
+}
+
+void CudaKVCache::advance(int64_t t) { length_ += t; }
+int64_t CudaKVCache::length() const { return length_; }
 
 }  // namespace ni

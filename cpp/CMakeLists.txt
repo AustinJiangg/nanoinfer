@@ -160,6 +160,11 @@ if(NI_CUDA)
   add_executable(run_cuda_parity tests/run_cuda_parity.cpp)
   target_link_libraries(run_cuda_parity PRIVATE nicore)
   target_include_directories(run_cuda_parity PRIVATE tests)
+
+  # G3: device-resident KV cache — cached==uncached + real incremental greedy decode.
+  add_executable(run_cuda_cache tests/run_cuda_cache.cpp)
+  target_link_libraries(run_cuda_cache PRIVATE nicore)
+  target_include_directories(run_cuda_cache PRIVATE tests)
 endif()
 
 # F6: pybind11 module exposing the C++ core to Python — the vLLM-shape pivot

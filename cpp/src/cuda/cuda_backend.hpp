@@ -12,7 +12,11 @@
 // premature full GPU forward fails loudly rather than silently producing garbage.
 #pragma once
 
+#include <cstdint>
+#include <vector>
+
 #include "backend.hpp"
+#include "cache.hpp"
 
 namespace ni {
 
@@ -35,6 +39,28 @@ public:
                       int64_t pos_offset) override;
     Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, bool causal,
                      int64_t query_offset) override;
+};
+
+// Device-resident KV cache (G3). Each layer's K/V is a contiguous [n_kv, len, head_dim]
+// tensor that lives on the GPU and grows by concatenation as tokens arrive; attend()
+// appends the new K/V, then reuses the backend's repeat_kv + attention kernels over the
+// whole history — semantically identical to the CPU KVCache's gather + attend. The CPU
+// KVCache (cache.cpp) is left untouched (and bit-identical); this is its GPU sibling,
+// the same KVCacheBase the forward already drives through one pointer.
+class CudaKVCache : public KVCacheBase {
+public:
+    CudaKVCache(Backend* backend, int64_t num_layers, int64_t n_kv_heads, int64_t head_dim);
+    Tensor attend(int64_t layer, const Tensor& q, const Tensor& k, const Tensor& v,
+                  int64_t n_rep, bool causal, int64_t query_offset) override;
+    void advance(int64_t t) override;
+    int64_t length() const override;
+
+private:
+    Backend* backend_;
+    int64_t n_kv_heads_;
+    int64_t head_dim_;
+    std::vector<Tensor> k_, v_;  // per layer, growing [n_kv, len, head_dim] on the device
+    int64_t length_ = 0;
 };
 
 }  // namespace ni

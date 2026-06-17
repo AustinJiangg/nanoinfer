@@ -49,6 +49,11 @@ public:
     // Allocate a KV cache sized to this model.
     KVCache make_cache(int64_t max_seq) const;
 
+    // Allocate a KV cache matching this model's device — the contiguous CPU cache, or a
+    // device-resident cache (G3) for the CUDA backend — returned through the base so the
+    // caller drives either via one pointer (the polymorphism forward() already uses).
+    std::unique_ptr<KVCacheBase> make_kv_cache(int64_t max_seq) const;
+
     const Config& config() const { return cfg_; }
 
     // {actual weight bytes, bytes if everything were fp32} — for the Q8 report.
