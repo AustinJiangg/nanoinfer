@@ -165,6 +165,11 @@ if(NI_CUDA)
   add_executable(run_cuda_cache tests/run_cuda_cache.cpp)
   target_link_libraries(run_cuda_cache PRIVATE nicore)
   target_include_directories(run_cuda_cache PRIVATE tests)
+
+  # G4a: batched decode on GPU — forward_batch == N standalone forwards + throughput.
+  add_executable(run_cuda_batch tests/run_cuda_batch.cpp)
+  target_link_libraries(run_cuda_batch PRIVATE nicore)
+  target_include_directories(run_cuda_batch PRIVATE tests)
 endif()
 
 # F6: pybind11 module exposing the C++ core to Python — the vLLM-shape pivot

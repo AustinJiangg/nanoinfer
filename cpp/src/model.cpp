@@ -24,21 +24,6 @@ bool is_layer_proj(const std::string& name) {
     return name.rfind("layers.", 0) == 0 && name.size() > suffix.size() &&
            name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
-
-// forward_batch helpers: move one token between the batched [n, heads*dim]
-// projection layout and the [heads, 1, dim] per-token layout the attention ops use.
-// Row s of a projection -> [heads, 1, dim] (split_heads specialized to one token).
-Tensor row_to_heads(const Tensor& x, int64_t s, int64_t heads, int64_t dim) {
-    Tensor out({heads, 1, dim});
-    for (int64_t h = 0; h < heads; ++h)
-        for (int64_t d = 0; d < dim; ++d) out.at(h, 0, d) = x.at(s, h * dim + d);
-    return out;
-}
-// Write a merged-head [1, width] row back into row s of a [n, width] tensor.
-void write_row(Tensor& dst, int64_t s, const Tensor& row) {
-    const int64_t width = dst.size(1);
-    for (int64_t c = 0; c < width; ++c) dst.at(s, c) = row.at(0, c);
-}
 }  // namespace
 
 Model::Model(const std::string& weights_dir, QuantMode mode, Device device) {
@@ -242,17 +227,17 @@ Tensor Model::forward_batch(const std::vector<int64_t>& tokens,
         // Per-sequence attention: each token has its own cache, length, and RoPE
         // position, so this is a loop, not a batched matmul. Each iteration reuses
         // the same single-token ops as forward(), guaranteeing row-for-row parity.
-        Tensor attn({n, H * D});
+        Tensor attn = backend_->alloc({n, H * D});
         for (int64_t s = 0; s < n; ++s) {
-            Tensor qs = row_to_heads(q, s, H, D);   // [H, 1, D]
-            Tensor ks = row_to_heads(k, s, KV, D);  // [KV, 1, D]
-            Tensor vs = row_to_heads(v, s, KV, D);
+            Tensor qs = backend_->extract_row(q, s, H, D);   // [H, 1, D]
+            Tensor ks = backend_->extract_row(k, s, KV, D);  // [KV, 1, D]
+            Tensor vs = backend_->extract_row(v, s, KV, D);
             qs = backend_->apply_rope(qs, rope_.cos, rope_.sin, pos[static_cast<size_t>(s)]);
             ks = backend_->apply_rope(ks, rope_.cos, rope_.sin, pos[static_cast<size_t>(s)]);
             // Append this token's K/V and attend over the sequence's own history.
             Tensor as = caches[s]->attend(i, qs, ks, vs, cfg_.n_rep(), /*causal=*/true,
                                           /*query_offset=*/pos[static_cast<size_t>(s)]);  // [H,1,D]
-            write_row(attn, s, backend_->merge_heads(as));  // [1, H*D] -> row s
+            backend_->place_row(attn, s, backend_->merge_heads(as));  // [1, H*D] -> row s
         }
         Tensor a = project(attn, L + "self_attn.o_proj.weight", nullptr);  // o_proj: no bias
         x = backend_->add(x, a);

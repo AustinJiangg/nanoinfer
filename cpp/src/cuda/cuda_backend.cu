@@ -360,6 +360,25 @@ Tensor CudaBackend::attention(const Tensor& q, const Tensor& k, const Tensor& v,
     return out;
 }
 
+Tensor CudaBackend::alloc(const std::vector<int64_t>& shape) { return device_alloc(shape); }
+
+Tensor CudaBackend::extract_row(const Tensor& x, int64_t s, int64_t heads, int64_t dim) {
+    // Row s of [n, heads*dim] is contiguous and equals [heads,1,dim] flattened — one D2D copy.
+    const int64_t width = heads * dim;
+    Tensor out = device_alloc({heads, 1, dim});
+    cuda_check(cudaMemcpy(out.device_ptr(), dptr(x) + s * width,
+                          static_cast<size_t>(width) * sizeof(float), cudaMemcpyDeviceToDevice),
+               "extract_row");
+    return out;
+}
+
+void CudaBackend::place_row(Tensor& dst, int64_t s, const Tensor& row) {
+    const int64_t width = dst.size(1);
+    cuda_check(cudaMemcpy(dptr(dst) + s * width, row.device_ptr(),
+                          static_cast<size_t>(width) * sizeof(float), cudaMemcpyDeviceToDevice),
+               "place_row");
+}
+
 // --- Device-resident KV cache (G3) ---
 
 CudaKVCache::CudaKVCache(Backend* backend, int64_t num_layers, int64_t n_kv_heads,

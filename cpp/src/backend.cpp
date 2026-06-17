@@ -35,4 +35,20 @@ Tensor CpuBackend::attention(const Tensor& q, const Tensor& k, const Tensor& v, 
     return ni::attention(q, k, v, causal, query_offset);
 }
 
+// Batched-decode row plumbing (the former model.cpp row_to_heads / write_row, now a
+// backend op so forward_batch is device-agnostic). On CPU these are plain host loops.
+Tensor CpuBackend::alloc(const std::vector<int64_t>& shape) { return Tensor(shape); }
+
+Tensor CpuBackend::extract_row(const Tensor& x, int64_t s, int64_t heads, int64_t dim) {
+    Tensor out({heads, 1, dim});
+    for (int64_t h = 0; h < heads; ++h)
+        for (int64_t d = 0; d < dim; ++d) out.at(h, 0, d) = x.at(s, h * dim + d);
+    return out;
+}
+
+void CpuBackend::place_row(Tensor& dst, int64_t s, const Tensor& row) {
+    const int64_t width = dst.size(1);
+    for (int64_t c = 0; c < width; ++c) dst.at(s, c) = row.at(0, c);
+}
+
 }  // namespace ni

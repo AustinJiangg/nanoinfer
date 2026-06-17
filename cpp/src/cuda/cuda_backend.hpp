@@ -39,6 +39,9 @@ public:
                       int64_t pos_offset) override;
     Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, bool causal,
                      int64_t query_offset) override;
+    Tensor alloc(const std::vector<int64_t>& shape) override;
+    Tensor extract_row(const Tensor& x, int64_t s, int64_t heads, int64_t dim) override;
+    void place_row(Tensor& dst, int64_t s, const Tensor& row) override;
 };
 
 // Device-resident KV cache (G3). Each layer's K/V is a contiguous [n_kv, len, head_dim]

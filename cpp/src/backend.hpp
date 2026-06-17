@@ -38,6 +38,16 @@ public:
                               int64_t pos_offset) = 0;
     virtual Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, bool causal,
                              int64_t query_offset) = 0;
+
+    // --- batched decode (F8a / G4) plumbing: forward_batch builds its per-sequence
+    // attention output one row at a time, so these move a row between the [n, heads*dim]
+    // batched layout and the [heads, 1, dim] per-token layout, on the backend's device. ---
+    // Allocate an (uninitialized) tensor on this backend's device; the caller fills it.
+    virtual Tensor alloc(const std::vector<int64_t>& shape) = 0;
+    // Row s of a [n, heads*dim] projection as a [heads, 1, dim] per-head tensor.
+    virtual Tensor extract_row(const Tensor& x, int64_t s, int64_t heads, int64_t dim) = 0;
+    // Write a merged-head [1, width] row back into row s of dst [n, width], in place.
+    virtual void place_row(Tensor& dst, int64_t s, const Tensor& row) = 0;
 };
 
 // The CPU backend: every method forwards to the corresponding free function in
@@ -60,6 +70,9 @@ public:
                       int64_t pos_offset) override;
     Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, bool causal,
                      int64_t query_offset) override;
+    Tensor alloc(const std::vector<int64_t>& shape) override;
+    Tensor extract_row(const Tensor& x, int64_t s, int64_t heads, int64_t dim) override;
+    void place_row(Tensor& dst, int64_t s, const Tensor& row) override;
 };
 
 }  // namespace ni
