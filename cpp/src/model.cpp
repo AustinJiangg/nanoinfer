@@ -7,6 +7,10 @@
 
 #include "serialize.hpp"
 
+#ifdef NI_CUDA
+#include "cuda/cuda_backend.hpp"
+#endif
+
 namespace fs = std::filesystem;
 
 namespace ni {
@@ -42,8 +46,13 @@ Model::Model(const std::string& weights_dir, QuantMode mode, Device device) {
     // their backends land (G1+), so callers fail loudly rather than silently on CPU.
     if (device == Device::CPU) {
         backend_ = std::make_unique<CpuBackend>();
+#ifdef NI_CUDA
+    } else if (device == Device::CUDA) {
+        backend_ = std::make_unique<CudaBackend>();
+#endif
     } else {
-        throw std::runtime_error("Model: backend for this device is not built yet (G1+)");
+        throw std::runtime_error(
+            "Model: backend for this device is not built — rebuild with -DNI_CUDA=ON");
     }
 
     cfg_ = load_config(weights_dir + "/config.txt");
