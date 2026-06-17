@@ -5,11 +5,13 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "backend.hpp"
 #include "cache.hpp"
 #include "config.hpp"
 #include "ops.hpp"
@@ -22,8 +24,10 @@ class Model {
 public:
     // Load config.txt and every <name>.bin in `weights_dir`. With a quant mode,
     // the per-layer projection weights are stored as Q8 (int8, ~4x) or Q4 (int4,
-    // ~8x); the embedding, lm_head, norms, and biases stay fp32.
-    explicit Model(const std::string& weights_dir, QuantMode mode = QuantMode::None);
+    // ~8x); the embedding, lm_head, norms, and biases stay fp32. `device` selects
+    // the compute backend (G0): CPU is wired now, CUDA/Metal land in G1+.
+    explicit Model(const std::string& weights_dir, QuantMode mode = QuantMode::None,
+                   Device device = Device::CPU);
 
     // Token ids -> logits [seq, vocab]. Without a cache (C1) the whole sequence is
     // recomputed; with a cache (C3) `ids` is just the new token(s), placed at
@@ -55,6 +59,9 @@ private:
     // A linear projection that dispatches to the Q8 path when `name` is quantized.
     Tensor project(const Tensor& x, const std::string& name, const Tensor* bias) const;
 
+    // Device-dispatch seam (G0): forward() runs every op through this. CpuBackend
+    // wraps the free ops in ops.cpp; CUDA/Metal backends override them (G1+).
+    std::unique_ptr<Backend> backend_;
     Config cfg_;
     std::unordered_map<std::string, Tensor> w_;  // fp32 weights
     // Quantized layer-projection weights (any mode), via the polymorphic wrapper.

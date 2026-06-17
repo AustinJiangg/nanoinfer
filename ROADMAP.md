@@ -74,6 +74,14 @@ it via pybind11 and rebuild the serving layer in Python on top of our own kernel
 — the vLLM shape (Python orchestration + C++ kernels). Keep the C++ core's public
 API simple/C-style so the later binding is cheap.
 
+Beyond the fusion the engine goes **multi-backend** behind a `Backend` abstraction
+(`backend.hpp`) over a device-aware `Tensor` (ggml-style — one Tensor type, one model
+forward, a `Device` tag picks where it runs). `CpuBackend` wraps the existing ops; a
+`CudaBackend` (RTX 4070S) and `MetalBackend` / NEON (Mac M4) slot in behind the same
+interface, so the same Python serving layer runs on CPU, CUDA, or Metal. The CPU
+backend (HF-parity-locked) is the oracle for the accelerator backends. See the
+**Multi-backend (G-track)** stages below.
+
 ## Pure C++ core
 - [x] **C0** — Tensor + ops (matmul/rmsnorm/softmax/add), CMake, numpy parity
 - [x] **C1** — Qwen2.5 forward pass; NIT0 weight export, logit parity vs nanoinfer (~4e-5)
@@ -141,6 +149,36 @@ API simple/C-style so the later binding is cheap.
       token-identical to standalone (`tests/run_serve.py`, `tests/run_paged.cpp`); the
       win is skipped prefill + shared blocks. A shared block frees only when no holder
       (sequence or cache) remains.
+
+## Multi-backend (G-track → CPU / CUDA / Metal)
+
+A `Backend` abstraction lets one model forward run on CPU, CUDA, or Metal. The CPU
+backend is the parity oracle; GPU reductions reorder float adds, so the bar becomes
+**CUDA ≈ CPU within ~1e-3..1e-4 + golden tokens**, not bit-identical (see CLAUDE.md).
+Direction set 2026-06-17: learn the GPU deeply first (4070S), then cross-platform (M4).
+The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/`) stay.
+
+- [x] **G0** — Backend seam + device-aware Tensor. `backend.hpp`/`backend.cpp`
+      (`Backend` + `CpuBackend` wrapping the free ops), a `Device` tag on `Tensor`,
+      and `Model` routing every op through `backend_`. Pure refactor: CPU stays
+      bit-identical (logits 4.24e-5 vs nanoinfer, every self-parity `max|diff|=0`,
+      binding + scheduler MATCH). `-DNI_CUDA` CMake option (OFF) reserved.
+- [ ] **G1** — CudaBackend skeleton: device alloc/free, H2D/D2H, a naive `__global__`
+      GEMM; cuBLAS linked as a yardstick / cross-check. Single linear ≈ CpuBackend (~1e-3).
+- [ ] **G2** — full forward on GPU; every weight uploaded once and resident on device.
+      `run_cuda_parity.cpp`: logits ≈ CPU backend + golden greedy tokens.
+- [ ] **G3** — KV cache + single-stream decode on GPU (inject the Backend into the
+      cache, deferred from G0). cached == uncached within tolerance.
+- [ ] **G4** — batched decode + a paged-attention CUDA kernel; drive the existing
+      Python scheduler with the CUDA-backed Model. Throughput tok/s × batch on the 4070S.
+- [ ] **G5** — optimize one kernel (shared-memory tiling / warp reductions / occupancy),
+      closing the gap to cuBLAS. Optional stretch: fp16/bf16 + tensor cores (wmma).
+
+## Cross-platform (portability proof, after the GPU is learned)
+- [ ] **NEON** — fill `simd.hpp`'s `#elif` NEON path so `CpuBackend` runs on Apple ARM
+      (M4 on CPU — the cheapest path to running on the Mac).
+- [ ] **Metal** — a `MetalBackend` on the M4 GPU; unified memory removes most H2D. The
+      same Python serving layer on a third backend = the Backend boundary proven real.
 
 ## Reference reading
 - PagedAttention / vLLM paper — KV memory management

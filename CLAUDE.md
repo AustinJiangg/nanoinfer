@@ -53,3 +53,12 @@ we're skipping the part we're here to learn.
 - **Weight naming**: HF Qwen2 uses `model.layers.{i}.self_attn.q_proj` etc.
   `weights.py` is the one place that knows HF's names; the rest of the code uses
   our naming. Keep that boundary clean.
+- **GPU parity is not bit-identical** (G1+, `cpp/` multi-backend): a CUDA/Metal
+  backend reorders the float reductions in matmul/attention, so its logits differ
+  from the CPU backend by ~1e-4 *even when the math is right* — `max|diff|=0` is a
+  CPU-only luxury. The bar for accelerator backends is **tolerance + tokens**: CUDA
+  ≈ CPU within ~1e-3..1e-4 AND greedy token-for-token against the golden dump. The
+  CPU backend (itself HF-parity-locked) is the oracle. Two companion GPU rules:
+  upload each weight to the device **once** at load (never per forward — the GPU
+  version of C5's "stream each weight once"), and keep activations resident on
+  device (H2D/D2H only at the token-id input and the logits output).

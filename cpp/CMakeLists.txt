@@ -32,7 +32,8 @@ find_package(OpenMP COMPONENTS CXX)
 # pybind11 later (the F-stage fusion) without reshaping it.
 add_library(nicore
   src/tensor.cpp src/ops.cpp src/serialize.cpp src/cache.cpp src/quant.cpp
-  src/config.cpp src/model.cpp src/sampling.cpp src/generate.cpp src/paged.cpp)
+  src/config.cpp src/model.cpp src/sampling.cpp src/generate.cpp src/paged.cpp
+  src/backend.cpp)
 target_include_directories(nicore PUBLIC src)
 # PIC so the static core can be linked into the pybind11 shared module (F6); the
 # executables that also link nicore just become PIE, which is the modern default.
@@ -41,6 +42,17 @@ if(OpenMP_CXX_FOUND)
   # PUBLIC so the -fopenmp flag (and _OPENMP define) and runtime propagate to the
   # test/bench executables that include parallel.hpp.
   target_link_libraries(nicore PUBLIC OpenMP::OpenMP_CXX)
+endif()
+
+# G0/G1: the CUDA backend seam. OFF by default — the C++ core builds and runs on CPU
+# with no CUDA toolkit (the same graceful-degrade as OpenMP / -march=native). When ON,
+# enable the CUDA language, define NI_CUDA so the CudaBackend compiles in, and (G1+)
+# add src/cuda/*.cu to nicore. The Backend interface keeps model.cpp unchanged either way.
+option(NI_CUDA "Build the CUDA backend (requires the NVIDIA CUDA toolkit; G1+)" OFF)
+if(NI_CUDA)
+  enable_language(CUDA)
+  target_compile_definitions(nicore PUBLIC NI_CUDA)
+  # src/cuda/*.cu sources are added to nicore here in G1.
 endif()
 
 enable_testing()

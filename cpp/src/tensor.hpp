@@ -13,6 +13,13 @@
 
 namespace ni {
 
+// Where a Tensor's data lives. CPU is the default and the only device wired in
+// stage G0; CUDA / METAL arrive with their backends (G1+ / cross-platform). The
+// Device tag is what lets ONE Tensor type and ONE model forward pass span CPU and
+// accelerators (the ggml-style approach): a Backend operates on tensors resident on
+// its own device. G0 only carries the tag; the device-side buffer lands in G1.
+enum class Device { CPU, CUDA, METAL };
+
 class Tensor {
 public:
     Tensor() = default;
@@ -24,6 +31,7 @@ public:
     int64_t ndim() const { return static_cast<int64_t>(shape_.size()); }
     int64_t numel() const { return numel_; }
     int64_t size(int64_t dim) const { return shape_[dim]; }
+    Device device() const { return device_; }
 
     float* data() { return data_.data(); }
     const float* data() const { return data_.data(); }
@@ -44,6 +52,7 @@ private:
     std::vector<int64_t> strides_;
     std::vector<float> data_;
     int64_t numel_ = 0;
+    Device device_ = Device::CPU;  // host storage above; device buffers arrive in G1.
 };
 
 }  // namespace ni

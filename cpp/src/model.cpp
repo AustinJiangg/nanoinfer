@@ -1,6 +1,7 @@
 #include "model.hpp"
 
 #include <filesystem>
+#include <memory>
 #include <stdexcept>
 #include <utility>
 
@@ -35,7 +36,16 @@ void write_row(Tensor& dst, int64_t s, const Tensor& row) {
 }
 }  // namespace
 
-Model::Model(const std::string& weights_dir, QuantMode mode) {
+Model::Model(const std::string& weights_dir, QuantMode mode, Device device) {
+    // The Backend is the device-dispatch seam (G0): forward() below is written once
+    // against it. CPU is the only backend wired in G0; CUDA/Metal throw here until
+    // their backends land (G1+), so callers fail loudly rather than silently on CPU.
+    if (device == Device::CPU) {
+        backend_ = std::make_unique<CpuBackend>();
+    } else {
+        throw std::runtime_error("Model: backend for this device is not built yet (G1+)");
+    }
+
     cfg_ = load_config(weights_dir + "/config.txt");
     for (const auto& entry : fs::directory_iterator(weights_dir)) {
         const fs::path& p = entry.path();
@@ -66,9 +76,11 @@ KVCache Model::make_cache(int64_t max_seq) const {
 }
 
 Tensor Model::project(const Tensor& x, const std::string& name, const Tensor* bias) const {
+    // Quantized projections keep their own (CPU) path for now — GPU quant is post-G5.
+    // The fp32 path goes through the backend, so it runs on whatever device backend_ is.
     auto it = qweights_.find(name);
     if (it != qweights_.end()) return it->second->linear(x, bias);
-    return linear(x, W(name), bias);
+    return backend_->linear(x, W(name), bias);
 }
 
 std::pair<int64_t, int64_t> Model::weight_bytes() const {
@@ -103,24 +115,24 @@ Tensor Model::forward(const std::vector<int64_t>& ids, KVCacheBase* cache) const
         throw std::runtime_error("forward: position " + std::to_string(start_pos + seq) +
                                  " exceeds context length " + std::to_string(rope_.cos.size(0)));
 
-    Tensor x = embedding(W("embed_tokens.weight"), ids);  // [seq, hidden]
+    Tensor x = backend_->embedding(W("embed_tokens.weight"), ids);  // [seq, hidden]
 
     for (int64_t i = 0; i < cfg_.num_layers; ++i) {
         const std::string L = "layers." + std::to_string(i) + ".";
 
         // --- attention (pre-norm + residual) ---
-        Tensor h = rmsnorm(x, W(L + "input_layernorm.weight"), eps);
+        Tensor h = backend_->rmsnorm(x, W(L + "input_layernorm.weight"), eps);
         Tensor q = project(h, L + "self_attn.q_proj.weight", &W(L + "self_attn.q_proj.bias"));
         Tensor k = project(h, L + "self_attn.k_proj.weight", &W(L + "self_attn.k_proj.bias"));
         Tensor v = project(h, L + "self_attn.v_proj.weight", &W(L + "self_attn.v_proj.bias"));
 
-        q = split_heads(q, cfg_.num_attention_heads, cfg_.head_dim);
-        k = split_heads(k, cfg_.num_kv_heads, cfg_.head_dim);
-        v = split_heads(v, cfg_.num_kv_heads, cfg_.head_dim);
+        q = backend_->split_heads(q, cfg_.num_attention_heads, cfg_.head_dim);
+        k = backend_->split_heads(k, cfg_.num_kv_heads, cfg_.head_dim);
+        v = backend_->split_heads(v, cfg_.num_kv_heads, cfg_.head_dim);
 
         // RoPE at absolute positions; cached keys are stored already rotated.
-        q = apply_rope(q, rope_.cos, rope_.sin, start_pos);
-        k = apply_rope(k, rope_.cos, rope_.sin, start_pos);
+        q = backend_->apply_rope(q, rope_.cos, rope_.sin, start_pos);
+        k = backend_->apply_rope(k, rope_.cos, rope_.sin, start_pos);
 
         // Cached: the cache appends K/V and attends over its whole history, folding
         // in GQA (the paged cache reads blocks directly; the contiguous one gathers).
@@ -131,29 +143,29 @@ Tensor Model::forward(const std::vector<int64_t>& ids, KVCacheBase* cache) const
             a = cache->attend(i, q, k, v, cfg_.n_rep(), /*causal=*/true,
                               /*query_offset=*/start_pos);
         } else {
-            Tensor kk = repeat_kv(k, cfg_.n_rep());
-            Tensor vv = repeat_kv(v, cfg_.n_rep());
-            a = attention(q, kk, vv, /*causal=*/true, /*query_offset=*/0);
+            Tensor kk = backend_->repeat_kv(k, cfg_.n_rep());
+            Tensor vv = backend_->repeat_kv(v, cfg_.n_rep());
+            a = backend_->attention(q, kk, vv, /*causal=*/true, /*query_offset=*/0);
         }
-        a = merge_heads(a);                                 // [seq, n_heads*head_dim]
+        a = backend_->merge_heads(a);                            // [seq, n_heads*head_dim]
         a = project(a, L + "self_attn.o_proj.weight", nullptr);  // o_proj has no bias
-        x = add(x, a);
+        x = backend_->add(x, a);
 
         // --- SwiGLU MLP (pre-norm + residual) ---
-        Tensor hm = rmsnorm(x, W(L + "post_attention_layernorm.weight"), eps);
-        Tensor gate = silu(project(hm, L + "mlp.gate_proj.weight", nullptr));
+        Tensor hm = backend_->rmsnorm(x, W(L + "post_attention_layernorm.weight"), eps);
+        Tensor gate = backend_->silu(project(hm, L + "mlp.gate_proj.weight", nullptr));
         Tensor up = project(hm, L + "mlp.up_proj.weight", nullptr);
-        Tensor down = project(mul(gate, up), L + "mlp.down_proj.weight", nullptr);
-        x = add(x, down);
+        Tensor down = project(backend_->mul(gate, up), L + "mlp.down_proj.weight", nullptr);
+        x = backend_->add(x, down);
     }
 
     if (cache) cache->advance(seq);
 
-    x = rmsnorm(x, W("norm.weight"), eps);
+    x = backend_->rmsnorm(x, W("norm.weight"), eps);
     // Tied models share the embedding as the output projection, so the exporter
     // skips the duplicate lm_head.weight; fall back to embed_tokens here.
     const std::string lm = cfg_.tie_word_embeddings ? "embed_tokens.weight" : "lm_head.weight";
-    return linear(x, W(lm));  // [seq, vocab]
+    return backend_->linear(x, W(lm), nullptr);  // [seq, vocab]
 }
 
 Tensor Model::forward_batch(const std::vector<int64_t>& tokens,
@@ -180,13 +192,13 @@ Tensor Model::forward_batch(const std::vector<int64_t>& tokens,
                                      std::to_string(rope_.cos.size(0)));
     }
 
-    Tensor x = embedding(W("embed_tokens.weight"), tokens);  // [n, hidden]
+    Tensor x = backend_->embedding(W("embed_tokens.weight"), tokens);  // [n, hidden]
 
     for (int64_t i = 0; i < cfg_.num_layers; ++i) {
         const std::string L = "layers." + std::to_string(i) + ".";
 
         // --- attention (pre-norm + residual) ---
-        Tensor h = rmsnorm(x, W(L + "input_layernorm.weight"), eps);  // [n, hidden]
+        Tensor h = backend_->rmsnorm(x, W(L + "input_layernorm.weight"), eps);  // [n, hidden]
         // Batched projections: one matmul over all n rows, weights streamed once.
         Tensor q = project(h, L + "self_attn.q_proj.weight", &W(L + "self_attn.q_proj.bias"));
         Tensor k = project(h, L + "self_attn.k_proj.weight", &W(L + "self_attn.k_proj.bias"));
@@ -200,29 +212,29 @@ Tensor Model::forward_batch(const std::vector<int64_t>& tokens,
             Tensor qs = row_to_heads(q, s, H, D);   // [H, 1, D]
             Tensor ks = row_to_heads(k, s, KV, D);  // [KV, 1, D]
             Tensor vs = row_to_heads(v, s, KV, D);
-            qs = apply_rope(qs, rope_.cos, rope_.sin, pos[static_cast<size_t>(s)]);
-            ks = apply_rope(ks, rope_.cos, rope_.sin, pos[static_cast<size_t>(s)]);
+            qs = backend_->apply_rope(qs, rope_.cos, rope_.sin, pos[static_cast<size_t>(s)]);
+            ks = backend_->apply_rope(ks, rope_.cos, rope_.sin, pos[static_cast<size_t>(s)]);
             // Append this token's K/V and attend over the sequence's own history.
             Tensor as = caches[s]->attend(i, qs, ks, vs, cfg_.n_rep(), /*causal=*/true,
                                           /*query_offset=*/pos[static_cast<size_t>(s)]);  // [H,1,D]
-            write_row(attn, s, merge_heads(as));  // [1, H*D] -> row s
+            write_row(attn, s, backend_->merge_heads(as));  // [1, H*D] -> row s
         }
         Tensor a = project(attn, L + "self_attn.o_proj.weight", nullptr);  // o_proj: no bias
-        x = add(x, a);
+        x = backend_->add(x, a);
 
         // --- SwiGLU MLP (pre-norm + residual), all batched over the n rows ---
-        Tensor hm = rmsnorm(x, W(L + "post_attention_layernorm.weight"), eps);
-        Tensor gate = silu(project(hm, L + "mlp.gate_proj.weight", nullptr));
+        Tensor hm = backend_->rmsnorm(x, W(L + "post_attention_layernorm.weight"), eps);
+        Tensor gate = backend_->silu(project(hm, L + "mlp.gate_proj.weight", nullptr));
         Tensor up = project(hm, L + "mlp.up_proj.weight", nullptr);
-        Tensor down = project(mul(gate, up), L + "mlp.down_proj.weight", nullptr);
-        x = add(x, down);
+        Tensor down = project(backend_->mul(gate, up), L + "mlp.down_proj.weight", nullptr);
+        x = backend_->add(x, down);
     }
 
     for (int64_t s = 0; s < n; ++s) caches[s]->advance(1);
 
-    x = rmsnorm(x, W("norm.weight"), eps);
+    x = backend_->rmsnorm(x, W("norm.weight"), eps);
     const std::string lm = cfg_.tie_word_embeddings ? "embed_tokens.weight" : "lm_head.weight";
-    return linear(x, W(lm));  // [n, vocab]
+    return backend_->linear(x, W(lm), nullptr);  // [n, vocab]
 }
 
 }  // namespace ni
