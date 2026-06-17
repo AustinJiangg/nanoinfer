@@ -148,9 +148,16 @@ PYBIND11_MODULE(nicpp, m) {
              "blocks * block_size. The sequence then prefills only its suffix.");
 
     py::class_<Model>(m, "Model")
-        .def(py::init<const std::string&, QuantMode>(), py::arg("weights_dir"),
-             py::arg("mode") = QuantMode::None,
-             "Load config.txt + every <name>.bin (NIT0) from weights_dir.")
+        .def(py::init([](const std::string& weights_dir, QuantMode mode, const std::string& device) {
+                 Device dev = Device::CPU;
+                 if (device == "cuda") dev = Device::CUDA;
+                 else if (device != "cpu")
+                     throw std::invalid_argument("device must be 'cpu' or 'cuda'");
+                 return std::make_unique<Model>(weights_dir, mode, dev);
+             }),
+             py::arg("weights_dir"), py::arg("mode") = QuantMode::None, py::arg("device") = "cpu",
+             "Load config.txt + every <name>.bin (NIT0) from weights_dir. device='cuda' runs "
+             "every op on the GPU (requires a CUDA build); 'cpu' is the default.")
         .def_property_readonly(
             "config", [](const Model& self) { return self.config(); },
             "Model dimensions (a copy of the Config).")
@@ -186,8 +193,11 @@ PYBIND11_MODULE(nicpp, m) {
             "Batched single-token decode (F8a): N new tokens + their N KVCaches -> "
             "logits [N, vocab]. Row s equals forward([tokens[s]], caches[s]); each "
             "cache advances by 1. The projection GEMMs are fused over the N rows.")
-        .def("make_cache", &Model::make_cache, py::arg("max_seq"),
-             "Allocate a contiguous KV cache sized for this model.")
+        .def("make_cache",
+             [](const Model& self, int64_t max_seq) { return self.make_kv_cache(max_seq); },
+             py::arg("max_seq"),
+             "Allocate a KV cache for this model on its device — the contiguous CPU cache, "
+             "or the device-resident cache for a CUDA model. Returned via KVCacheBase.")
         .def(
             "make_block_pool",
             [](const Model& self, int64_t block_size, int64_t num_blocks) {

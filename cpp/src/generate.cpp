@@ -1,5 +1,6 @@
 #include "generate.hpp"
 
+#include <memory>
 #include <utility>
 
 #include "tensor.hpp"
@@ -17,12 +18,14 @@ std::vector<int64_t> generate(const Model& model, const std::vector<int64_t>& pr
 
     // One KV cache sized to hold the prompt plus everything we'll emit. `cur` is
     // what we feed each step: the whole prompt on step 0 (prefill), then a single
-    // new token (decode) once the cache holds the past.
-    KVCache cache = model.make_cache(static_cast<int64_t>(prompt.size()) + cfg.max_tokens);
+    // new token (decode) once the cache holds the past. make_kv_cache() picks the
+    // cache for the model's device, so this loop runs unchanged on CPU or GPU.
+    std::unique_ptr<KVCacheBase> cache =
+        model.make_kv_cache(static_cast<int64_t>(prompt.size()) + cfg.max_tokens);
     std::vector<int64_t> cur = prompt;
 
     for (int step = 0; step < cfg.max_tokens; ++step) {
-        Tensor logits = model.forward(cur, &cache);
+        Tensor logits = model.forward(cur, cache.get());
         const int64_t seq = logits.size(0), vocab = logits.size(1);
 
         std::vector<float> last(static_cast<size_t>(vocab));
