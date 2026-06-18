@@ -75,6 +75,20 @@ def main() -> int:
         print(f"batched mb={mb:<2}: steps={sched.steps} peak_batch={sched.peak_batch} "
               f"-> {'MATCH' if match else 'MISMATCH'}")
 
+    # --- 1b. Paged + prefix-sharing parity (GPU). block_size=4 so the prompt spans a
+    # full block: r0/r2/r4 all start with `base`, so a prefix block is actually shared. ---
+    for label, kw in [("paged", dict(block_size=4, num_blocks=256)),
+                      ("paged+prefix", dict(block_size=4, num_blocks=256, prefix_sharing=True))]:
+        sched = Scheduler(model, max_batch=4, batched=True, **kw)
+        for r in reqs:
+            sched.add(r)
+        out = sched.run()
+        match = all(out[r.request_id] == ref[r.request_id] for r in reqs)
+        ok = ok and match
+        extra = f" shared_prefill={sched.shared_prefill_tokens}" if "prefix" in label else ""
+        sched.clear_prefix_cache()
+        print(f"{label:<13}: steps={sched.steps} -> {'MATCH' if match else 'MISMATCH'}{extra}")
+
     # --- 2. Throughput: fixed work (R x T) at increasing max_batch ---
     R, T = 32, 32
     work = [Request(f"w{i}", base, max_tokens=T) for i in range(R)]

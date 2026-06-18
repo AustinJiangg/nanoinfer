@@ -293,7 +293,7 @@ class Scheduler:
                 held = self.prefix_cache.held_blocks if self.prefix_cache else 0
                 if self.reserved + held + reserved > self.pool.num_blocks:
                     break  # not enough free KV blocks right now; keep it queued
-                cache = nicpp.PagedKVCache(self.pool)
+                cache = self.pool.make_cache()  # PagedKVCache or CudaPagedKVCache by device
                 if shared_blocks:
                     cache.share_prefix(shared_blocks, shared_len)
                     self.shared_prefill_tokens += shared_len

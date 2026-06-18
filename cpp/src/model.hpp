@@ -56,6 +56,9 @@ public:
 
     const Config& config() const { return cfg_; }
 
+    // The device this model computes on (CPU, or CUDA after a -DNI_CUDA build).
+    Device device() const { return backend_->device(); }
+
     // {actual weight bytes, bytes if everything were fp32} — for the Q8 report.
     std::pair<int64_t, int64_t> weight_bytes() const;
 

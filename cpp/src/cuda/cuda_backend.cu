@@ -524,6 +524,19 @@ void CudaPagedKVCache::ensure_capacity(int64_t positions) {
         block_table_.push_back(pool_->allocate());
 }
 
+void CudaPagedKVCache::share_prefix(const std::vector<int64_t>& blocks, int64_t length) {
+    if (!block_table_.empty() || length_ != 0)
+        throw std::runtime_error("CudaPagedKVCache::share_prefix: must seed a fresh cache");
+    const int64_t bs = pool_->block_size();
+    if (length != static_cast<int64_t>(blocks.size()) * bs)
+        throw std::invalid_argument("share_prefix: length must be a block boundary");
+    // Hold each shared block; the sequence writes its own blocks past `length` (a block
+    // boundary), so the shared blocks stay read-only — no copy-on-write.
+    block_table_ = blocks;
+    for (int64_t b : block_table_) pool_->incref(b);
+    length_ = length;
+}
+
 Tensor CudaPagedKVCache::attend(int64_t layer, const Tensor& q, const Tensor& k, const Tensor& v,
                                 int64_t n_rep, bool causal, int64_t query_offset) {
     const int64_t t = k.size(1);

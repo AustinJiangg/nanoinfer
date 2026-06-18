@@ -28,6 +28,10 @@
 #include "sampling.hpp"
 #include "tensor.hpp"
 
+#ifdef NI_CUDA
+#include "cuda/cuda_backend.hpp"
+#endif
+
 namespace py = pybind11;
 using namespace ni;
 
@@ -133,7 +137,10 @@ PYBIND11_MODULE(nicpp, m) {
         // shared block with incref, release it with free.
         .def("incref", &BlockPool::incref, py::arg("block"))
         .def("free", &BlockPool::free, py::arg("block"))
-        .def("refcount", &BlockPool::refcount, py::arg("block"));
+        .def("refcount", &BlockPool::refcount, py::arg("block"))
+        .def("make_cache", [](BlockPool& self) { return new PagedKVCache(&self); },
+             py::return_value_policy::take_ownership, py::keep_alive<0, 1>(),
+             "A fresh PagedKVCache drawing blocks from this pool (keeps the pool alive).");
 
     py::class_<PagedKVCache, KVCacheBase>(m, "PagedKVCache")
         .def(py::init<BlockPool*>(), py::arg("pool"), py::keep_alive<1, 2>(),
@@ -146,6 +153,28 @@ PYBIND11_MODULE(nicpp, m) {
              py::arg("length"),
              "Seed this (fresh) sequence with shared prefix blocks; length must be "
              "blocks * block_size. The sequence then prefills only its suffix.");
+
+#ifdef NI_CUDA
+    // GPU paged attention (G4b/G4d): device siblings of BlockPool / PagedKVCache, exposed
+    // with the SAME Python surface so the scheduler drives either device transparently —
+    // it calls pool.make_cache() and uses the KVCacheBase / share_prefix interface.
+    py::class_<CudaBlockPool>(m, "CudaBlockPool")
+        .def_property_readonly("num_blocks", &CudaBlockPool::num_blocks)
+        .def_property_readonly("block_size", &CudaBlockPool::block_size)
+        .def_property_readonly("free_blocks", &CudaBlockPool::free_blocks)
+        .def_property_readonly("used_blocks", &CudaBlockPool::used_blocks)
+        .def("incref", &CudaBlockPool::incref, py::arg("block"))
+        .def("free", &CudaBlockPool::free, py::arg("block"))
+        .def("refcount", &CudaBlockPool::refcount, py::arg("block"))
+        .def("make_cache", [](CudaBlockPool& self) { return new CudaPagedKVCache(&self); },
+             py::return_value_policy::take_ownership, py::keep_alive<0, 1>(),
+             "A fresh CudaPagedKVCache drawing blocks from this pool.");
+
+    py::class_<CudaPagedKVCache, KVCacheBase>(m, "CudaPagedKVCache")
+        .def_property_readonly("num_blocks", &CudaPagedKVCache::num_blocks)
+        .def_property_readonly("block_table", &CudaPagedKVCache::block_table)
+        .def("share_prefix", &CudaPagedKVCache::share_prefix, py::arg("blocks"), py::arg("length"));
+#endif
 
     py::class_<Model>(m, "Model")
         .def(py::init([](const std::string& weights_dir, QuantMode mode, const std::string& device) {
@@ -200,14 +229,19 @@ PYBIND11_MODULE(nicpp, m) {
              "or the device-resident cache for a CUDA model. Returned via KVCacheBase.")
         .def(
             "make_block_pool",
-            [](const Model& self, int64_t block_size, int64_t num_blocks) {
+            [](const Model& self, int64_t block_size, int64_t num_blocks) -> py::object {
                 const Config& c = self.config();
-                return BlockPool(c.num_layers, c.num_kv_heads, c.head_dim, block_size,
-                                 num_blocks);
+#ifdef NI_CUDA
+                if (self.device() == Device::CUDA)
+                    return py::cast(CudaBlockPool(c.num_layers, c.num_kv_heads, c.head_dim,
+                                                  block_size, num_blocks));
+#endif
+                return py::cast(BlockPool(c.num_layers, c.num_kv_heads, c.head_dim, block_size,
+                                          num_blocks));
             },
             py::arg("block_size"), py::arg("num_blocks"),
-            "Allocate a paged-attention block pool (F8b): num_blocks blocks of "
-            "block_size tokens each, shared across sequences via PagedKVCache.")
+            "Allocate a paged-attention block pool on the model's device (BlockPool on CPU, "
+            "CudaBlockPool on a CUDA model). Sequences draw caches via pool.make_cache().")
         .def(
             "generate",
             [](const Model& self, const std::vector<int64_t>& prompt, int max_tokens,

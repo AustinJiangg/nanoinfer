@@ -163,14 +163,15 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
       and `Model` routing every op through `backend_`. Pure refactor: CPU stays
       bit-identical (logits 4.24e-5 vs nanoinfer, every self-parity `max|diff|=0`,
       binding + scheduler MATCH). `-DNI_CUDA` CMake option (OFF) reserved.
-- [ ] **G1** — CudaBackend skeleton: device alloc/free, H2D/D2H, a naive `__global__`
+- [x] **G1** — CudaBackend skeleton: device alloc/free, H2D/D2H, a naive `__global__`
       GEMM; cuBLAS linked as a yardstick / cross-check. Single linear ≈ CpuBackend (~1e-3).
-- [ ] **G2** — full forward on GPU; every weight uploaded once and resident on device.
+- [x] **G2** — full forward on GPU; every weight uploaded once and resident on device.
       `run_cuda_parity.cpp`: logits ≈ CPU backend + golden greedy tokens.
-- [ ] **G3** — KV cache + single-stream decode on GPU (inject the Backend into the
+- [x] **G3** — KV cache + single-stream decode on GPU (inject the Backend into the
       cache, deferred from G0). cached == uncached within tolerance.
-- [ ] **G4** — batched decode + a paged-attention CUDA kernel; drive the existing
-      Python scheduler with the CUDA-backed Model. Throughput tok/s × batch on the 4070S.
+- [x] **G4** — batched decode + a paged-attention CUDA kernel; drive the existing
+      Python scheduler with the CUDA-backed Model (G4a batched, G4b paged kernel, G4c
+      contiguous scheduler, G4d paged + prefix-sharing). Throughput tok/s × batch.
 - [ ] **G5** — optimize one kernel (shared-memory tiling / warp reductions / occupancy),
       closing the gap to cuBLAS. Optional stretch: fp16/bf16 + tensor cores (wmma).
 

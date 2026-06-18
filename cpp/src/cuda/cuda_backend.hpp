@@ -90,6 +90,7 @@ public:
     int64_t used_blocks() const { return num_blocks_ - free_blocks(); }
     int64_t n_kv_heads() const { return n_kv_heads_; }
     int64_t head_dim() const { return head_dim_; }
+    int64_t refcount(int64_t block) const { return refcount_[static_cast<size_t>(block)]; }
 
     // Device buffers + strides for the kernels (a layer's slice is base + layer*layer_stride).
     float* k_base() const { return static_cast<float*>(dK_.get()); }
@@ -120,6 +121,9 @@ public:
     int64_t length() const override { return length_; }
     int64_t num_blocks() const { return static_cast<int64_t>(block_table_.size()); }
     const std::vector<int64_t>& block_table() const { return block_table_; }
+    // Prefix sharing (RadixAttention): seed a fresh cache with shared prefix blocks
+    // (increfing each); the sequence then prefills only its suffix past `length`.
+    void share_prefix(const std::vector<int64_t>& blocks, int64_t length);
 
 private:
     void ensure_capacity(int64_t positions);  // grow the block table to cover positions
