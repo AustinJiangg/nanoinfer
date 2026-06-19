@@ -189,7 +189,12 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
         `__shfl` reduction; m>16 (prefill) stays on the naive kernel. Decode's big ops jump
         to 59-86% of bandwidth — lm_head 217 GFLOP/s = 86% BW / 97% of cuBLAS — and batched
         decode (m=16) ~2.2×. Bit-identical row-wise (run_cuda_batch max|diff|=0), golden
-        tokens unchanged. float4 loads unneeded (already near the BW wall).
+        tokens unchanged. float4 loads unneeded (already near the BW wall). End-to-end
+        (`run_cuda_decode_bench`, A/B vs forced-naive) the decode win is only ~1.2×:
+        Amdahl-capped, because the matmul is now a minority of the decode step — per-op
+        CUDA overhead (cudaMalloc + cudaDeviceSynchronize × ~360 ops/token) and the
+        contiguous cache's growing per-step copy dominate. That plumbing (parked in G5a) is
+        now the decode bottleneck — re-measure once it's pooled.
   - [ ] **G5c** — prefill GEMM (compute-bound, m=seq): shared-memory tiling → register
         blocking (TM×TN micro-tiles) → double-buffered float4 — lifts intensity over the
         roofline ridge. The "close the gap to cuBLAS" arc.

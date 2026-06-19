@@ -344,14 +344,18 @@ static void sync_check(const char* what) {
     cuda_check(cudaDeviceSynchronize(), what);
 }
 
+// Bench-only switch (see cuda_backend.hpp) to force the naive GEMM path for A/B timing.
+bool g_cuda_force_naive_gemm = false;
+
 Tensor CudaBackend::linear(const Tensor& x, const Tensor& weight, const Tensor* bias) {
     const int64_t m = x.size(0), k = x.size(1), n = weight.size(0);
     Tensor y = device_alloc({m, n});
     // Pick the kernel by row count. Small m (decode, batched decode) is memory-bound, so the
     // coalesced warp-GEMV wins (G5b); large m (prefill) is compute-bound and wants the tiled
-    // GEMM landing in G5c — until then the naive one-thread-per-output kernel runs it.
+    // GEMM landing in G5c — until then the naive one-thread-per-output kernel runs it. The
+    // bench knob forces naive even at small m so run_cuda_decode_bench can A/B the win.
     constexpr int64_t kGemvMaxM = 16;
-    if (m <= kGemvMaxM) {
+    if (!g_cuda_force_naive_gemm && m <= kGemvMaxM) {
         const int threads = 128;  // 4 warps/block, one output channel per warp
         const int warps_per_block = threads / 32;
         const int blocks = static_cast<int>((n + warps_per_block - 1) / warps_per_block);

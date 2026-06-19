@@ -20,6 +20,11 @@
 
 namespace ni {
 
+// Bench/diagnostic knob (G5b): force the naive one-thread-per-output GEMM even for small
+// m, so run_cuda_decode_bench can A/B the warp-GEMV's decode win in one process with
+// everything else held constant. Left false in all normal use; not thread-safe to flip.
+extern bool g_cuda_force_naive_gemm;
+
 class CudaBackend : public Backend {
 public:
     Device device() const override;

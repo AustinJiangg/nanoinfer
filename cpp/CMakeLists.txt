@@ -182,6 +182,11 @@ if(NI_CUDA)
   add_executable(run_cuda_bench tests/run_cuda_bench.cpp)
   target_link_libraries(run_cuda_bench PRIVATE nicore CUDA::cublas)
   target_include_directories(run_cuda_bench PRIVATE tests)
+
+  # G5b: end-to-end decode tok/s, A/B'ing the GEMV vs the forced-naive GEMM in one process.
+  add_executable(run_cuda_decode_bench tests/run_cuda_decode_bench.cpp)
+  target_link_libraries(run_cuda_decode_bench PRIVATE nicore)
+  target_include_directories(run_cuda_decode_bench PRIVATE tests)
 endif()
 
 # F6: pybind11 module exposing the C++ core to Python — the vLLM-shape pivot
