@@ -195,6 +195,12 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
         CUDA overhead (cudaMalloc + cudaDeviceSynchronize × ~360 ops/token) and the
         contiguous cache's growing per-step copy dominate. That plumbing (parked in G5a) is
         now the decode bottleneck — re-measure once it's pooled.
+  - [x] **G5-pool** — the decode-overhead pull-in (run_cuda_decode_bench pointed here, not
+        G5c): a caching device-memory pool (reuse freed buffers — no per-op cudaMalloc) plus
+        dropping the per-launch cudaDeviceSynchronize (the one default stream already orders
+        kernels). Decode 21→46 tok/s at 128 ctx (2.15×, bigger than the kernel's own 1.2×);
+        prefill ~1.5× too; every golden / bit-identical gate unchanged. The remaining decode
+        drag at long context is the contiguous cache's O(ctx) cat_seq copy — paged territory.
   - [ ] **G5c** — prefill GEMM (compute-bound, m=seq): shared-memory tiling → register
         blocking (TM×TN micro-tiles) → double-buffered float4 — lifts intensity over the
         roofline ridge. The "close the gap to cuBLAS" arc.

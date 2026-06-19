@@ -20,6 +20,8 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 #include "tensor.hpp"
 
@@ -37,13 +39,56 @@ void cuda_check(cudaError_t e, const char* what) {
 // only place that knows it is really a float*.
 float* dptr(const Tensor& t) { return static_cast<float*>(t.device_ptr()); }
 
-// Allocate a device tensor of `shape`: cudaMalloc the bytes and hand ownership to the
-// Tensor as a shared_ptr whose deleter is cudaFree (RAII over the C allocator).
+// Device memory pool (G5): kill the per-op cudaMalloc. A forward allocates ~360 short-lived
+// output buffers; a raw cudaMalloc each SYNCHRONIZES the device, so that alloc traffic — not
+// the matmul — dominates GPU decode (run_cuda_decode_bench showed the GEMV win Amdahl-capped
+// by it). This is a caching allocator: acquire() reuses a freed buffer of the same byte size
+// or cudaMallocs once; release() (a Tensor's deleter) returns it to the free list, never
+// cudaFree. Buffers live to process exit — a leaked singleton, so a Tensor outliving any
+// wrapper still finds the pool (the CUDA context reclaims the memory at teardown). Reuse is
+// safe with NO per-op sync because every kernel runs on the one default stream in submission
+// order: a buffer handed to a later op is overwritten only after the earlier op's kernel
+// (ordered before it) has read it. Single-threaded, like the rest of the host path. (The
+// contiguous KV cache's cat_seq grows a new size each token, so those buffers don't reuse —
+// the paged cache avoids that; the win here is the fixed-size activation buffers.)
+struct DevicePool {
+    std::unordered_map<size_t, std::vector<void*>> free_;  // byte size -> reusable buffers
+    std::unordered_map<void*, size_t> size_of_;            // size of every buffer we own
+
+    void* acquire(size_t nbytes) {
+        auto it = free_.find(nbytes);
+        if (it != free_.end() && !it->second.empty()) {
+            void* p = it->second.back();
+            it->second.pop_back();
+            return p;
+        }
+        void* p = nullptr;
+        cuda_check(cudaMalloc(&p, nbytes), "DevicePool::acquire");
+        size_of_[p] = nbytes;
+        return p;
+    }
+    void release(void* p) {
+        auto it = size_of_.find(p);
+        if (it == size_of_.end()) {  // foreign ptr — shouldn't happen
+            cudaFree(p);
+            return;
+        }
+        free_[it->second].push_back(p);
+    }
+};
+DevicePool& pool() {
+    static DevicePool* p = new DevicePool();  // leaked on purpose (see above)
+    return *p;
+}
+
+// Allocate a device tensor of `shape` from the pool and hand the Tensor a deleter that
+// returns the buffer to the pool (not cudaFree) — so steady-state forwards do no cudaMalloc.
 Tensor device_alloc(const std::vector<int64_t>& shape) {
     Tensor d(shape, Device::CUDA);
-    void* p = nullptr;
-    cuda_check(cudaMalloc(&p, static_cast<size_t>(d.numel()) * sizeof(float)), "cudaMalloc");
-    d.set_device_ptr(std::shared_ptr<void>(p, [](void* q) { cudaFree(q); }));
+    const size_t nbytes = static_cast<size_t>(d.numel()) * sizeof(float);
+    if (nbytes == 0) return d;  // empty tensor (e.g. an unfilled KV history): no buffer
+    void* p = pool().acquire(nbytes);
+    d.set_device_ptr(std::shared_ptr<void>(p, [](void* q) { pool().release(q); }));
     return d;
 }
 
@@ -338,10 +383,12 @@ Tensor to_host(const Tensor& dev) {
 
 Device CudaBackend::device() const { return Device::CUDA; }
 
-// Launch a kernel, then check both the launch (bad config) and the run (in-kernel fault).
-static void sync_check(const char* what) {
+// After a launch, check the launch config (cheap, immediate). The device sync that used to
+// follow was dropped in G5: kernels run ordered on the one default stream, so correctness
+// needs no per-op sync — results are read only through to_host's (synchronizing) D2H copy.
+// The trade is attribution: an in-kernel fault now surfaces at the next sync, not its call.
+static void launch_check(const char* what) {
     cuda_check(cudaGetLastError(), what);
-    cuda_check(cudaDeviceSynchronize(), what);
 }
 
 // Bench-only switch (see cuda_backend.hpp) to force the naive GEMM path for A/B timing.
@@ -371,7 +418,7 @@ Tensor CudaBackend::linear(const Tensor& x, const Tensor& weight, const Tensor* 
                                        dptr(y), static_cast<int>(m), static_cast<int>(n),
                                        static_cast<int>(k));
     }
-    sync_check("linear_kernel");
+    launch_check("linear_kernel");
     return y;
 }
 
@@ -383,7 +430,7 @@ Tensor CudaBackend::embedding(const Tensor& table, const std::vector<int64_t>& i
     cuda_check(cudaMemcpy(d_ids, ids.data(), n * sizeof(int64_t), cudaMemcpyHostToDevice),
                "embedding ids H2D");
     embedding_kernel<<<grid1d(n * hidden, kBlock), kBlock>>>(dptr(table), d_ids, dptr(out), n, hidden);
-    sync_check("embedding_kernel");
+    launch_check("embedding_kernel");
     cudaFree(d_ids);
     return out;
 }
@@ -392,28 +439,28 @@ Tensor CudaBackend::rmsnorm(const Tensor& x, const Tensor& weight, float eps) {
     const int64_t d = x.size(x.ndim() - 1), rows = x.numel() / d;
     Tensor out = device_alloc(x.shape());
     rmsnorm_kernel<<<grid1d(rows, kBlock), kBlock>>>(dptr(x), dptr(weight), dptr(out), rows, d, eps);
-    sync_check("rmsnorm_kernel");
+    launch_check("rmsnorm_kernel");
     return out;
 }
 
 Tensor CudaBackend::silu(const Tensor& x) {
     Tensor out = device_alloc(x.shape());
     silu_kernel<<<grid1d(x.numel(), kBlock), kBlock>>>(dptr(x), dptr(out), x.numel());
-    sync_check("silu_kernel");
+    launch_check("silu_kernel");
     return out;
 }
 
 Tensor CudaBackend::mul(const Tensor& a, const Tensor& b) {
     Tensor out = device_alloc(a.shape());
     mul_kernel<<<grid1d(a.numel(), kBlock), kBlock>>>(dptr(a), dptr(b), dptr(out), a.numel());
-    sync_check("mul_kernel");
+    launch_check("mul_kernel");
     return out;
 }
 
 Tensor CudaBackend::add(const Tensor& a, const Tensor& b) {
     Tensor out = device_alloc(a.shape());
     add_kernel<<<grid1d(a.numel(), kBlock), kBlock>>>(dptr(a), dptr(b), dptr(out), a.numel());
-    sync_check("add_kernel");
+    launch_check("add_kernel");
     return out;
 }
 
@@ -422,7 +469,7 @@ Tensor CudaBackend::split_heads(const Tensor& x, int64_t n_heads, int64_t head_d
     Tensor out = device_alloc({n_heads, seq, head_dim});
     split_heads_kernel<<<grid1d(n_heads * seq * head_dim, kBlock), kBlock>>>(
         dptr(x), dptr(out), seq, n_heads, head_dim);
-    sync_check("split_heads_kernel");
+    launch_check("split_heads_kernel");
     return out;
 }
 
@@ -430,7 +477,7 @@ Tensor CudaBackend::merge_heads(const Tensor& x) {
     const int64_t H = x.size(0), seq = x.size(1), D = x.size(2);
     Tensor out = device_alloc({seq, H * D});
     merge_heads_kernel<<<grid1d(H * seq * D, kBlock), kBlock>>>(dptr(x), dptr(out), H, seq, D);
-    sync_check("merge_heads_kernel");
+    launch_check("merge_heads_kernel");
     return out;
 }
 
@@ -439,7 +486,7 @@ Tensor CudaBackend::repeat_kv(const Tensor& x, int64_t n_rep) {
     Tensor out = device_alloc({out_heads, seq, D});
     repeat_kv_kernel<<<grid1d(out_heads * seq * D, kBlock), kBlock>>>(
         dptr(x), dptr(out), n_rep, seq, D, out_heads);
-    sync_check("repeat_kv_kernel");
+    launch_check("repeat_kv_kernel");
     return out;
 }
 
@@ -449,7 +496,7 @@ Tensor CudaBackend::apply_rope(const Tensor& x, const Tensor& cos, const Tensor&
     Tensor out = device_alloc({H, seq, D});
     rope_kernel<<<grid1d(H * seq * D, kBlock), kBlock>>>(dptr(x), dptr(cos), dptr(sin), dptr(out),
                                                          H, seq, D, pos_offset);
-    sync_check("rope_kernel");
+    launch_check("rope_kernel");
     return out;
 }
 
@@ -462,7 +509,7 @@ Tensor CudaBackend::attention(const Tensor& q, const Tensor& k, const Tensor& v,
     const float scale = 1.0f / sqrtf(static_cast<float>(D));
     attention_kernel<<<grid1d(H * sq, kBlock), kBlock>>>(dptr(q), dptr(k), dptr(v), dptr(out), H, sq,
                                                          sk, D, causal ? 1 : 0, query_offset, scale);
-    sync_check("attention_kernel");
+    launch_check("attention_kernel");
     return out;
 }
 
@@ -601,7 +648,7 @@ Tensor CudaPagedKVCache::attend(int64_t layer, const Tensor& q, const Tensor& k,
 
     paged_write_kernel<<<grid1d(n_kv * t * hd, kBlock), kBlock>>>(dptr(k), dptr(v), Kbase, Vbase,
                                                                  d_bt, t, n_kv, hd, bs, start);
-    sync_check("paged_write_kernel");
+    launch_check("paged_write_kernel");
 
     const int64_t n_heads = q.size(0), sq = q.size(1), D = q.size(2);
     if (D > kMaxHeadDim)
@@ -611,7 +658,7 @@ Tensor CudaPagedKVCache::attend(int64_t layer, const Tensor& q, const Tensor& k,
     paged_attention_kernel<<<grid1d(n_heads * sq, kBlock), kBlock>>>(
         dptr(q), Kbase, Vbase, d_bt, dptr(out), n_heads, sq, D, n_kv, n_rep, bs, causal ? 1 : 0,
         query_offset, end, scale);
-    sync_check("paged_attention_kernel");
+    launch_check("paged_attention_kernel");
 
     cudaFree(d_bt);
     return out;
