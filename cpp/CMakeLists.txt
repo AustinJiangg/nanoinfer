@@ -175,6 +175,13 @@ if(NI_CUDA)
   add_executable(run_cuda_paged tests/run_cuda_paged.cpp)
   target_link_libraries(run_cuda_paged PRIVATE nicore)
   target_include_directories(run_cuda_paged PRIVATE tests)
+
+  # G5a: micro-benchmark the naive linear() kernel vs cuBLAS sgemm (the yardstick) on
+  # the real projection shapes. cuBLAS is only linked here, never in nicore — the engine
+  # runs our own kernels (the golden rule); this tool just measures the gap to close.
+  add_executable(run_cuda_bench tests/run_cuda_bench.cpp)
+  target_link_libraries(run_cuda_bench PRIVATE nicore CUDA::cublas)
+  target_include_directories(run_cuda_bench PRIVATE tests)
 endif()
 
 # F6: pybind11 module exposing the C++ core to Python — the vLLM-shape pivot
