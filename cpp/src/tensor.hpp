@@ -20,6 +20,11 @@ namespace ni {
 // cross-platform backend. A Backend operates on tensors resident on its own device.
 enum class Device { CPU, CUDA, METAL };
 
+// Element type of a tensor's data. F32 is the default and the only host type; F16 exists
+// only on device (a half buffer) — fp16 weights for the tensor-core path (G5d). The host
+// vector is always float; dtype() tells a backend how to read the device buffer.
+enum class DType { F32, F16 };
+
 class Tensor {
 public:
     Tensor() = default;
@@ -36,6 +41,8 @@ public:
     int64_t numel() const { return numel_; }
     int64_t size(int64_t dim) const { return shape_[dim]; }
     Device device() const { return device_; }
+    DType dtype() const { return dtype_; }
+    void set_dtype(DType d) { dtype_ = d; }
 
     // Host storage. Valid for CPU tensors only (a device tensor's vector is empty).
     float* data() { return data_.data(); }
@@ -65,6 +72,7 @@ private:
     std::vector<float> data_;       // host storage (CPU tensors)
     int64_t numel_ = 0;
     Device device_ = Device::CPU;
+    DType dtype_ = DType::F32;       // element type; F16 only for device weight buffers (G5d)
     std::shared_ptr<void> ddata_;   // device storage (CUDA/Metal); RAII-freed, type-erased
 };
 

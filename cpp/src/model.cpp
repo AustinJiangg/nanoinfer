@@ -71,7 +71,12 @@ Model::Model(const std::string& weights_dir, QuantMode mode, Device device) {
     // C5's "stream each weight once". After this W() returns device tensors and every op
     // in forward() runs on the GPU. (Quant stays on CPU, so this path uses fp32 weights.)
     if (device == Device::CUDA) {
-        for (auto& kv : w_) kv.second = to_device(kv.second);
+        // Layer-projection weights go up as fp16 when opted in (G5d) — half the DRAM bytes,
+        // and the linear dispatch then routes them through the tensor-core / fp16-GEMV path.
+        // embed/lm_head/norms/biases stay fp32 (lm_head is tied to embed; deferred).
+        for (auto& kv : w_)
+            kv.second = (g_cuda_fp16_weights && is_layer_proj(kv.first)) ? to_device_f16(kv.second)
+                                                                         : to_device(kv.second);
         rope_.cos = to_device(rope_.cos);
         rope_.sin = to_device(rope_.sin);
     }

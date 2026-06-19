@@ -86,8 +86,11 @@ int main() {
     // NI_WMMA=1 routes the prefill (m>16) rows through the tensor-core kernel (G5d) instead of
     // the fp32 tiled GEMM, so the GFLOP/s and max|diff| columns then report wmma vs cuBLAS.
     if (const char* e = std::getenv("NI_WMMA")) g_cuda_use_wmma = (e[0] == '1');
-    std::printf("prefill (m>16) kernel: %s\n", g_cuda_use_wmma ? "wmma tensor cores (fp16)"
-                                                              : "tiled (fp32)");
+    if (const char* e = std::getenv("NI_FP16W")) g_cuda_fp16_weights = (e[0] == '1');
+    std::printf("prefill (m>16) kernel: %s\n",
+                g_cuda_fp16_weights ? "wmma-h (fp16 weights)"
+                                    : (g_cuda_use_wmma ? "wmma (fp32 weights, fp16 staged)"
+                                                       : "tiled (fp32)"));
 
     // Qwen2.5-0.5B linears (hidden=896, intermediate=4864, kv=128, vocab=151936).
     const std::vector<Shape> shapes = {
@@ -114,9 +117,12 @@ int main() {
             Tensor x({m, k}), w({n, k});
             for (int64_t i = 0; i < x.numel(); ++i) x[i] = dist(rng);
             for (int64_t i = 0; i < w.numel(); ++i) w[i] = dist(rng);
-            Tensor xd = to_device(x), wd = to_device(w), yd = to_device(Tensor({m, n}));
+            Tensor xd = to_device(x), wf32 = to_device(w), yd = to_device(Tensor({m, n}));
+            // ours uses fp16 weights when opted in; cuBLAS always reads the fp32 copy, so the
+            // max|diff| column then reports the fp16-weight cost vs the fp32 baseline.
+            Tensor wd = g_cuda_fp16_weights ? to_device_f16(w) : wf32;
             float* xp = static_cast<float*>(xd.device_ptr());
-            float* wp = static_cast<float*>(wd.device_ptr());
+            float* wp = static_cast<float*>(wf32.device_ptr());
             float* yp = static_cast<float*>(yd.device_ptr());
 
             // y[m,n] row-major = x[m,k] @ w[n,k]ᵀ. cuBLAS is column-major, where our

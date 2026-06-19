@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "cuda/cuda.hpp"
+#include "cuda/cuda_backend.hpp"
 #include "model.hpp"
 #include "parity_util.hpp"
 #include "serialize.hpp"
@@ -91,6 +92,32 @@ int main(int argc, char** argv) {
         const bool greedy_ok = got.size() == ref_gen.size() && genmism == 0;
         std::printf("greedy match: %s (%d/%zu mismatches)\n", greedy_ok ? "MATCH" : "MISMATCH",
                     genmism, ref_gen.size());
+
+        // --- 3. fp16 weights (G5d), informational: the same uncached greedy with the layer
+        // projections uploaded as fp16. Does the whole model at fp16 weights still match the
+        // golden tokens? Not gated — fp16 may flip a close argmax; that's the measured cost. ---
+        g_cuda_fp16_weights = true;
+        Model model16(dir, QuantMode::None, Device::CUDA);
+        g_cuda_fp16_weights = false;
+        double maxd16 = 0.0;
+        {
+            Tensor lg = model16.forward(ids);
+            for (int64_t i = 0; i < lg.numel() && i < ref.numel(); ++i)
+                maxd16 = std::fmax(maxd16, std::fabs(double(lg[i]) - double(ref[i])));
+        }
+        std::vector<int64_t> ctx16 = ids, got16;
+        for (size_t t = 0; t < ref_gen.size(); ++t) {
+            Tensor lg = model16.forward(ctx16);
+            const int64_t tok = argmax_row(lg, lg.size(0) - 1, lg.size(1));
+            got16.push_back(tok);
+            ctx16.push_back(tok);
+        }
+        int gen16 = 0;
+        for (size_t i = 0; i < ref_gen.size() && i < got16.size(); ++i)
+            if (ref_gen[i] != got16[i]) ++gen16;
+        print_ids("fp16w :", got16);
+        std::printf("fp16 weights: greedy %s (%d/%zu mism), logits max|diff|=%g vs fp32 ref\n",
+                    gen16 == 0 ? "MATCH" : "DIFFERS", gen16, ref_gen.size(), maxd16);
 
         if (has_nan) std::printf("WARNING: GPU logits contain NaN\n");
         // Correctness = the tokens (argmax + greedy); maxd is a loose drift guard, looser

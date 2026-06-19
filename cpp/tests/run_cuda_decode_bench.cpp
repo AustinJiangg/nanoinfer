@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -72,8 +73,12 @@ int main(int argc, char** argv) {
             std::printf("run_cuda_decode_bench: no CUDA device visible — skipping\n");
             return 0;
         }
+        // NI_FP16W=1 uploads the layer weights as fp16 (G5d) — must be set before the Model
+        // is built, since the conversion happens at the once-per-load upload.
+        if (const char* e = std::getenv("NI_FP16W")) g_cuda_fp16_weights = (e[0] == '1');
         Model model(dir, QuantMode::None, Device::CUDA);
         const int64_t vocab = model.config().vocab_size;
+        std::printf("layer weights: %s\n", g_cuda_fp16_weights ? "fp16 (G5d)" : "fp32");
 
         // Synthesize a prompt by cycling the reference ids (any valid ids time the same).
         std::vector<int64_t> seed;

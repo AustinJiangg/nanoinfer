@@ -83,11 +83,14 @@ DevicePool& pool() {
     return *p;
 }
 
-// Allocate a device tensor of `shape` from the pool and hand the Tensor a deleter that
-// returns the buffer to the pool (not cudaFree) — so steady-state forwards do no cudaMalloc.
-Tensor device_alloc(const std::vector<int64_t>& shape) {
+// Allocate a device tensor of `shape` (+ dtype) from the pool and hand the Tensor a deleter
+// that returns the buffer to the pool (not cudaFree) — so steady-state forwards do no
+// cudaMalloc. F16 buffers (fp16 weights, G5d) are half the bytes; the pool keys on bytes.
+Tensor device_alloc(const std::vector<int64_t>& shape, DType dt = DType::F32) {
     Tensor d(shape, Device::CUDA);
-    const size_t nbytes = static_cast<size_t>(d.numel()) * sizeof(float);
+    d.set_dtype(dt);
+    const size_t elem = (dt == DType::F16) ? sizeof(half) : sizeof(float);
+    const size_t nbytes = static_cast<size_t>(d.numel()) * elem;
     if (nbytes == 0) return d;  // empty tensor (e.g. an unfilled KV history): no buffer
     void* p = pool().acquire(nbytes);
     d.set_device_ptr(std::shared_ptr<void>(p, [](void* q) { pool().release(q); }));
@@ -128,6 +131,15 @@ Tensor cat_seq(const Tensor& a, const Tensor& b) {
 int grid1d(int64_t total, int block) { return static_cast<int>((total + block - 1) / block); }
 constexpr int kBlock = 256;
 
+// Weight loaders that fold the dtype into the read, so one templated kernel serves both fp32
+// and fp16 weights (G5d). ldf returns float (for the fp32-accumulate GEMV/tiled paths); ldh
+// returns half (for the wmma staging). On a float* both are the identity / the same round the
+// fp32 kernels already did, so the fp32 instantiations stay bit-identical to before.
+__device__ inline float ldf(const float* w, size_t i) { return w[i]; }
+__device__ inline float ldf(const half* w, size_t i) { return __half2float(w[i]); }
+__device__ inline half ldh(const float* w, size_t i) { return __float2half(w[i]); }
+__device__ inline half ldh(const half* w, size_t i) { return w[i]; }
+
 // y[i,o] = sum_j x[i,j]*w[o,j] + (bias?bias[o]:0). One thread per output (i,o).
 // w has one row per output feature (nn.Linear: y = x @ wᵀ + bias), so no transpose.
 __global__ void linear_kernel(const float* __restrict__ x, const float* __restrict__ w,
@@ -153,17 +165,18 @@ __global__ void linear_kernel(const float* __restrict__ x, const float* __restri
 // them from L2 — the batched weight reuse. Same float math as linear_kernel (a different
 // reduction ORDER, so ~1e-6 off it, well within GPU tolerance); row s is independent of m,
 // so forward_batch row s stays bit-identical to a standalone m=1 forward (run_cuda_batch).
-__global__ void linear_gemv_kernel(const float* __restrict__ x, const float* __restrict__ w,
+template <typename WT>
+__global__ void linear_gemv_kernel(const float* __restrict__ x, const WT* __restrict__ w,
                                    const float* __restrict__ bias, float* __restrict__ y,
                                    int m, int n, int k) {
     const int o = (blockIdx.x * blockDim.x + threadIdx.x) / 32;  // one warp per output
     const int lane = static_cast<int>(threadIdx.x) & 31;
     if (o >= n) return;
-    const float* wr = w + static_cast<size_t>(o) * k;
+    const size_t wbase = static_cast<size_t>(o) * k;
     for (int i = 0; i < m; ++i) {
         const float* xr = x + static_cast<size_t>(i) * k;
         float partial = 0.0f;
-        for (int j = lane; j < k; j += 32) partial += xr[j] * wr[j];  // coalesced w read
+        for (int j = lane; j < k; j += 32) partial += xr[j] * ldf(w, wbase + j);  // coalesced
         for (int off = 16; off > 0; off >>= 1)  // warp-reduce the 32 partials
             partial += __shfl_down_sync(0xffffffff, partial, off);
         if (lane == 0) y[static_cast<size_t>(i) * n + o] = partial + (bias ? bias[o] : 0.0f);
@@ -245,7 +258,8 @@ __global__ void linear_tiled_kernel(const float* __restrict__ x, const float* __
 // decimal digits). Opt-in via g_cuda_use_wmma; the accuracy cost is measured (test_cuda /
 // run_cuda_bench). Block = 2×2 warps over a 64×64 tile (each warp a 2×2 grid of 16×16 frags);
 // n is a multiple of 64 for every Qwen linear, m is bounds-checked at the store.
-__global__ void linear_wmma_kernel(const float* __restrict__ x, const float* __restrict__ w,
+template <typename WT>
+__global__ void linear_wmma_kernel(const float* __restrict__ x, const WT* __restrict__ w,
                                    const float* __restrict__ bias, float* __restrict__ y, int m,
                                    int n, int k) {
     using namespace nvcuda;
@@ -273,7 +287,8 @@ __global__ void linear_wmma_kernel(const float* __restrict__ x, const float* __r
         }
         for (int idx = tid; idx < BK * BN; idx += numThreads) {  // stage w (k fastest: coalesced)
             const int o = idx / BK, c = idx % BK, go = colBase + o, gc = kk + c;
-            Bs[c * BN + o] = (go < n && gc < k) ? __float2half(w[go * k + gc]) : __float2half(0.0f);
+            Bs[c * BN + o] =
+                (go < n && gc < k) ? ldh(w, static_cast<size_t>(go) * k + gc) : __float2half(0.0f);
         }
         __syncthreads();
         wmma::fragment<wmma::matrix_a, WM, WN, WK, half, wmma::row_major> aFrag;
@@ -343,6 +358,13 @@ __global__ void add_kernel(const float* __restrict__ a, const float* __restrict_
                            float* __restrict__ out, int64_t n) {
     const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n) out[i] = a[i] + b[i];
+}
+
+// Convert an fp32 buffer to fp16 (G5d weight upload): one thread per element.
+__global__ void f32_to_f16_kernel(const float* __restrict__ src, half* __restrict__ dst,
+                                  int64_t n) {
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2half(src[i]);
 }
 
 // [seq, H*D] -> [H, seq, D]: out[h,s,d] = x[s, h*D+d]. One thread per output element.
@@ -516,6 +538,23 @@ Tensor to_host(const Tensor& dev) {
     return h;
 }
 
+// launch_check (the post-launch error check) is defined below with the CudaBackend ops;
+// forward-declare it for the fp16 upload helper, which launches the convert kernel here.
+static void launch_check(const char* what);
+
+// Upload an fp32 host tensor and convert it to fp16 on device (G5d): stage fp32 to a pooled
+// temp, then one convert kernel into an owned half buffer. Done once per weight at load.
+Tensor to_device_f16(const Tensor& host) {
+    Tensor src = to_device(host);                       // fp32 on device (a pooled temp)
+    Tensor d = device_alloc(host.shape(), DType::F16);  // fp16 destination
+    const int64_t n = host.numel();
+    if (n > 0)
+        f32_to_f16_kernel<<<grid1d(n, kBlock), kBlock>>>(dptr(src),
+                                                         static_cast<half*>(d.device_ptr()), n);
+    launch_check("f32_to_f16_kernel");
+    return d;  // `src` (fp32 temp) returns to the pool here
+}
+
 Device CudaBackend::device() const { return Device::CUDA; }
 
 // After a launch, check the launch config (cheap, immediate). The device sync that used to
@@ -530,6 +569,8 @@ static void launch_check(const char* what) {
 bool g_cuda_force_naive_gemm = false;
 // Opt-in switch (see cuda_backend.hpp) to run the prefill GEMM on the tensor cores (G5d).
 bool g_cuda_use_wmma = false;
+// Opt-in switch (see cuda_backend.hpp) to upload the layer weights as fp16 (G5d).
+bool g_cuda_fp16_weights = false;
 
 Tensor CudaBackend::linear(const Tensor& x, const Tensor& weight, const Tensor* bias) {
     const int64_t m = x.size(0), k = x.size(1), n = weight.size(0);
@@ -539,13 +580,25 @@ Tensor CudaBackend::linear(const Tensor& x, const Tensor& weight, const Tensor* 
     const float* bp = bias ? dptr(*bias) : nullptr;
     float* yp = dptr(y);
     const int mi = static_cast<int>(m), ni = static_cast<int>(n), ki = static_cast<int>(k);
-    // Pick the kernel by row count. The bench knob forces the naive GEMM (the A/B baseline for
-    // run_cuda_*_bench). Otherwise: small m (decode, batched decode) is memory-bound → the
-    // coalesced warp-GEMV (G5b); large m (prefill) is compute-bound → the register-tiled GEMM
-    // (G5c). Each output row is computed independently in all three, so batching never changes
-    // a row (run_cuda_batch stays bit-identical).
+    // Pick the kernel. fp16 weights (G5d) read half directly: GEMV for decode, tensor cores
+    // for prefill (wmma then streams ½ the weight bytes with no convert — the path that wins).
+    // Otherwise the bench knob forces the naive GEMM (the A/B baseline); else small m (decode)
+    // is memory-bound → warp-GEMV (G5b), large m (prefill) is compute-bound → tiled GEMM
+    // (G5c). Each output row is independent in all paths, so batching never changes a row.
     constexpr int64_t kGemvMaxM = 16;
-    if (g_cuda_force_naive_gemm) {
+    if (weight.dtype() == DType::F16) {
+        const half* wh = static_cast<const half*>(weight.device_ptr());
+        if (m <= kGemvMaxM) {
+            const int threads = 128;
+            const int blocks = static_cast<int>((n + threads / 32 - 1) / (threads / 32));
+            linear_gemv_kernel<half><<<blocks, threads>>>(xp, wh, bp, yp, mi, ni, ki);
+        } else {
+            constexpr int BM = 64, BN = 64;
+            const dim3 grid((static_cast<unsigned>(n) + BN - 1) / BN,
+                            (static_cast<unsigned>(m) + BM - 1) / BM);
+            linear_wmma_kernel<half><<<grid, 128>>>(xp, wh, bp, yp, mi, ni, ki);
+        }
+    } else if (g_cuda_force_naive_gemm) {
         const dim3 block(16, 16);
         const dim3 grid((static_cast<unsigned>(n) + block.x - 1) / block.x,
                         (static_cast<unsigned>(m) + block.y - 1) / block.y);
@@ -553,12 +606,12 @@ Tensor CudaBackend::linear(const Tensor& x, const Tensor& weight, const Tensor* 
     } else if (m <= kGemvMaxM) {
         const int threads = 128;  // 4 warps/block, one output channel per warp
         const int blocks = static_cast<int>((n + threads / 32 - 1) / (threads / 32));
-        linear_gemv_kernel<<<blocks, threads>>>(xp, wp, bp, yp, mi, ni, ki);
+        linear_gemv_kernel<float><<<blocks, threads>>>(xp, wp, bp, yp, mi, ni, ki);
     } else if (g_cuda_use_wmma) {
         constexpr int BM = 64, BN = 64;  // 2×2 warps = 128 threads compute a 64×64 tile
         const dim3 grid((static_cast<unsigned>(n) + BN - 1) / BN,
                         (static_cast<unsigned>(m) + BM - 1) / BM);
-        linear_wmma_kernel<<<grid, 128>>>(xp, wp, bp, yp, mi, ni, ki);
+        linear_wmma_kernel<float><<<grid, 128>>>(xp, wp, bp, yp, mi, ni, ki);
     } else {
         constexpr int BM = 64, BN = 64, BK = 8, TM = 4, TN = 4;
         constexpr int threads = (BM / TM) * (BN / TN);  // 256

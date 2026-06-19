@@ -214,8 +214,15 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
         (gate/up 7.9 vs 10.9 TFLOP/s). The lesson: tensor-core FLOPS are huge (~142 TFLOP/s on
         Ada), but a kernel that reads fp32 + converts per tile, with a small tile and no
         double-buffering, starves them (~5% utilization). To win: fp16 weight STORAGE (½ the
-        DRAM bytes + no convert), 128×128 tiles, cp.async double-buffering. Still ahead: an
-        int8×int8→int32 tensor-core GEMM (C4 weights) + quantize lm_head.
+        DRAM bytes + no convert), 128×128 tiles, cp.async double-buffering. **fp16 weight
+        storage then landed** (DType on Tensor + to_device_f16 + g_cuda_fp16_weights, layer
+        projections only): end-to-end greedy still MATCHES golden (logits 3.6e-5 vs fp32 — real
+        weights are small, so fp16 is ~free) and it halves the layer-weight device memory. But
+        it did NOT make wmma win (wmma-h ≈ wmma-fp32 ≈ 2.6 < tiled 4.1 TFLOP/s — the kernel is
+        FEEDING-bound, not byte-bound) and decode is only ~1.07× (overhead-bound). Real value:
+        ~free memory + the dtype path int8 builds on. Still ahead: optimize wmma (128² tiles +
+        cp.async double-buffer) so it actually wins, then int8×int8→int32 (C4 weights) +
+        quantize lm_head.
 
 ## Cross-platform (portability proof, after the GPU is learned)
 - [ ] **NEON** — fill `simd.hpp`'s `#elif` NEON path so `CpuBackend` runs on Apple ARM
