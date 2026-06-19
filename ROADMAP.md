@@ -179,13 +179,17 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
       The naive kernel is one-thread-per-output: ~0.25 FLOP/byte intensity vs a
       ~70 FLOP/byte roofline ridge (4070S), uncoalesced stride-k weight reads, and a
       `cudaDeviceSynchronize` after every launch. Staged:
-  - [ ] **G5a** — measurement scaffold: drop the per-launch sync (sync only at D2H),
-        preallocate the per-call `d_bt`/`d_ids` buffers, time with CUDA events, baseline
-        against the G1-linked cuBLAS sgemm on the real shapes. Done-when bar for the
-        rest: % of cuBLAS on prefill shapes + greedy still matches the golden dump.
-  - [ ] **G5b** — decode GEMV (memory-bound, m=1..16): one warp per output row, coalesced
-        weight reads, `__shfl` reduction, float4 loads. The throughput path and the
-        lm_head bottleneck (544 MB streamed per token at fp32).
+  - [x] **G5a** — measurement scaffold (`run_cuda_bench`): time linear() against a cuBLAS
+        sgemm baseline (newly linked — G1 never actually wired it in) with CUDA events on
+        the real shapes. Found the naive kernel at 3-12% of cuBLAS on prefill, 14-50% of
+        bandwidth on decode; per-op alloc is only 0-4% (and cudaMalloc already syncs the
+        device), so the sync/alloc plumbing is NOT the bottleneck — deferred until the
+        kernels are fast enough to expose it (re-measure with the scaffold then).
+  - [x] **G5b** — decode GEMV: one warp per output channel, coalesced strided weight reads,
+        `__shfl` reduction; m>16 (prefill) stays on the naive kernel. Decode's big ops jump
+        to 59-86% of bandwidth — lm_head 217 GFLOP/s = 86% BW / 97% of cuBLAS — and batched
+        decode (m=16) ~2.2×. Bit-identical row-wise (run_cuda_batch max|diff|=0), golden
+        tokens unchanged. float4 loads unneeded (already near the BW wall).
   - [ ] **G5c** — prefill GEMM (compute-bound, m=seq): shared-memory tiling → register
         blocking (TM×TN micro-tiles) → double-buffered float4 — lifts intensity over the
         roofline ridge. The "close the gap to cuBLAS" arc.

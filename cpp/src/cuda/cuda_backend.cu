@@ -97,6 +97,32 @@ __global__ void linear_kernel(const float* __restrict__ x, const float* __restri
     y[static_cast<size_t>(i) * n + o] = acc;
 }
 
+// Decode GEMV / skinny GEMM (G5b): one WARP per output channel o, vs linear_kernel's one
+// thread per (row,output). The 32 lanes stride the k dim, so consecutive lanes read
+// consecutive w[o,j] — a coalesced 128-byte transaction, where the naive kernel's threads
+// read w[o,j] for consecutive o (stride-k, one transaction PER thread). A warp-shuffle
+// then reduces the partial dots in log2(32) steps instead of one serial k-loop. For m>1
+// (batched decode) the warp loops the rows, so w[o] is streamed once and reused across
+// them from L2 — the batched weight reuse. Same float math as linear_kernel (a different
+// reduction ORDER, so ~1e-6 off it, well within GPU tolerance); row s is independent of m,
+// so forward_batch row s stays bit-identical to a standalone m=1 forward (run_cuda_batch).
+__global__ void linear_gemv_kernel(const float* __restrict__ x, const float* __restrict__ w,
+                                   const float* __restrict__ bias, float* __restrict__ y,
+                                   int m, int n, int k) {
+    const int o = (blockIdx.x * blockDim.x + threadIdx.x) / 32;  // one warp per output
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    if (o >= n) return;
+    const float* wr = w + static_cast<size_t>(o) * k;
+    for (int i = 0; i < m; ++i) {
+        const float* xr = x + static_cast<size_t>(i) * k;
+        float partial = 0.0f;
+        for (int j = lane; j < k; j += 32) partial += xr[j] * wr[j];  // coalesced w read
+        for (int off = 16; off > 0; off >>= 1)  // warp-reduce the 32 partials
+            partial += __shfl_down_sync(0xffffffff, partial, off);
+        if (lane == 0) y[static_cast<size_t>(i) * n + o] = partial + (bias ? bias[o] : 0.0f);
+    }
+}
+
 // out[r,c] = table[ids[r], c]. One thread per output element; ids already on device.
 __global__ void embedding_kernel(const float* __restrict__ table, const int64_t* __restrict__ ids,
                                  float* __restrict__ out, int64_t n, int64_t hidden) {
@@ -321,11 +347,26 @@ static void sync_check(const char* what) {
 Tensor CudaBackend::linear(const Tensor& x, const Tensor& weight, const Tensor* bias) {
     const int64_t m = x.size(0), k = x.size(1), n = weight.size(0);
     Tensor y = device_alloc({m, n});
-    const dim3 block(16, 16);
-    const dim3 grid((static_cast<unsigned>(n) + block.x - 1) / block.x,
-                    (static_cast<unsigned>(m) + block.y - 1) / block.y);
-    linear_kernel<<<grid, block>>>(dptr(x), dptr(weight), bias ? dptr(*bias) : nullptr, dptr(y),
-                                   static_cast<int>(m), static_cast<int>(n), static_cast<int>(k));
+    // Pick the kernel by row count. Small m (decode, batched decode) is memory-bound, so the
+    // coalesced warp-GEMV wins (G5b); large m (prefill) is compute-bound and wants the tiled
+    // GEMM landing in G5c — until then the naive one-thread-per-output kernel runs it.
+    constexpr int64_t kGemvMaxM = 16;
+    if (m <= kGemvMaxM) {
+        const int threads = 128;  // 4 warps/block, one output channel per warp
+        const int warps_per_block = threads / 32;
+        const int blocks = static_cast<int>((n + warps_per_block - 1) / warps_per_block);
+        linear_gemv_kernel<<<blocks, threads>>>(dptr(x), dptr(weight),
+                                                bias ? dptr(*bias) : nullptr, dptr(y),
+                                                static_cast<int>(m), static_cast<int>(n),
+                                                static_cast<int>(k));
+    } else {
+        const dim3 block(16, 16);
+        const dim3 grid((static_cast<unsigned>(n) + block.x - 1) / block.x,
+                        (static_cast<unsigned>(m) + block.y - 1) / block.y);
+        linear_kernel<<<grid, block>>>(dptr(x), dptr(weight), bias ? dptr(*bias) : nullptr,
+                                       dptr(y), static_cast<int>(m), static_cast<int>(n),
+                                       static_cast<int>(k));
+    }
     sync_check("linear_kernel");
     return y;
 }
