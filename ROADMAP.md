@@ -208,9 +208,14 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
         run_cuda_decode_bench). Verified vs the CPU oracle incl. ragged m (test_cuda),
         golden tokens unchanged. Further gains (warp tiling / double-buffer / float4 /
         bank-conflict-free smem) left as G5c+ — would push 68% → ~85%.
-  - [ ] **G5d** — low precision (stretch): fp16 tensor cores (wmma) → an int8×int8→int32
-        tensor-core GEMM wired to the C4 quantized weights → quantize lm_head. The lever
-        past the fp32 decode bandwidth wall (fewer bytes streamed).
+  - [ ] **G5d** — low precision (stretch). **fp16 wmma landed** (linear_wmma_kernel, opt-in
+        g_cuda_use_wmma): a 64×64 / 2×2-warp tensor-core kernel, correct (fp16 cost ~1-2% vs
+        the oracle — test_cuda) but the naive version is SLOWER than the tuned fp32 tiled GEMM
+        (gate/up 7.9 vs 10.9 TFLOP/s). The lesson: tensor-core FLOPS are huge (~142 TFLOP/s on
+        Ada), but a kernel that reads fp32 + converts per tile, with a small tile and no
+        double-buffering, starves them (~5% utilization). To win: fp16 weight STORAGE (½ the
+        DRAM bytes + no convert), 128×128 tiles, cp.async double-buffering. Still ahead: an
+        int8×int8→int32 tensor-core GEMM (C4 weights) + quantize lm_head.
 
 ## Cross-platform (portability proof, after the GPU is learned)
 - [ ] **NEON** — fill `simd.hpp`'s `#elif` NEON path so `CpuBackend` runs on Apple ARM

@@ -25,6 +25,11 @@ namespace ni {
 // everything else held constant. Left false in all normal use; not thread-safe to flip.
 extern bool g_cuda_force_naive_gemm;
 
+// Opt-in (G5d): run the prefill GEMM on the tensor cores (fp16 inputs, fp32 accumulate).
+// Default off — fp16 is lossy, so it stays opt-in until the accuracy/speed tradeoff is
+// accepted; flip it to measure (test_cuda, run_cuda_bench NI_WMMA=1). Not thread-safe.
+extern bool g_cuda_use_wmma;
+
 class CudaBackend : public Backend {
 public:
     Device device() const override;

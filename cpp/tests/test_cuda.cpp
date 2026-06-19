@@ -1,13 +1,14 @@
 // G1/G5 parity: the CUDA backend's linear() reproduces the CPU backend's linear() within
-// float tolerance, on synthetic data (no model weights). Covers both kernels the dispatch
-// picks: the warp-GEMV (m<=16, decode) and the register-tiled GEMM (m>16, prefill) — the
-// golden e2e tests (run_cuda_parity/cache) only ever use short sequences (m<=16), so this is
-// where the tiled prefill kernel gets its correctness check against the oracle.
+// tolerance, on synthetic data (no model weights). Covers every kernel the dispatch picks:
+// the warp-GEMV (m<=16, decode), the register-tiled GEMM (m>16, prefill), and the tensor-core
+// wmma GEMM (m>16, opt-in). The golden e2e tests (run_cuda_parity/cache) only use short
+// sequences (m<=16), so this is where the prefill kernels meet the oracle.
 //
-// NOT bit-identical: the GPU accumulates each dot product in float and in a different order
-// than the CPU's double-accumulated SIMD dot, so ~1e-4 of drift is expected and correct —
-// the concrete demonstration of CLAUDE.md's "GPU parity is not bit-identical" rule. The CPU
-// backend is the oracle (it is itself HF-parity-locked).
+// NOT bit-identical: the GPU accumulates in float and in a different order than the CPU's
+// double-accumulated SIMD dot (~1e-4 drift, expected — CLAUDE.md's "GPU parity is not
+// bit-identical"). The wmma path is looser still: fp16 rounds the inputs to ~3 decimal
+// digits, so its printed max|diff| IS the measured result — the fp16 accuracy cost vs the
+// fp32 oracle. The CPU backend is the oracle (itself HF-parity-locked).
 //
 // Self-contained, so it joins ctest; skips at runtime if no GPU is visible. Only built when
 // -DNI_CUDA=ON.
@@ -23,8 +24,8 @@
 
 using namespace ni;
 
-// One shape: GPU linear() (with bias) vs the CPU oracle. Returns true if within tolerance.
-static bool check_linear(int64_t m, int64_t n, int64_t k, std::mt19937& rng) {
+// One shape: GPU linear() (with bias) vs the CPU oracle. ok if max|diff| < tol.
+static bool check_linear(int64_t m, int64_t n, int64_t k, double tol, std::mt19937& rng) {
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     Tensor x({m, k}), w({n, k}), bias({n});
     for (int64_t i = 0; i < x.numel(); ++i) x[i] = dist(rng);
@@ -38,17 +39,14 @@ static bool check_linear(int64_t m, int64_t n, int64_t k, std::mt19937& rng) {
     Tensor xd = to_device(x), wd = to_device(w), bd = to_device(bias);
     Tensor y_gpu = to_host(gpu.linear(xd, wd, &bd));
 
-    double maxdiff = 0.0, sumdiff = 0.0;
-    for (int64_t i = 0; i < y_cpu.numel(); ++i) {
-        const double d = std::fabs(static_cast<double>(y_cpu[i]) - y_gpu[i]);
-        maxdiff = std::max(maxdiff, d);
-        sumdiff += d;
-    }
-    const double tol = 5e-3;  // float-vs-double accumulation over k; well above noise
+    double maxdiff = 0.0;
+    for (int64_t i = 0; i < y_cpu.numel(); ++i)
+        maxdiff = std::max(maxdiff, std::fabs(static_cast<double>(y_cpu[i]) - y_gpu[i]));
     const bool ok = maxdiff < tol;
-    std::printf("test_cuda: [%4lld x %4lld] @ [%6lld x %4lld]^T (%-5s)  max|diff|=%.3e  %s\n",
-                (long long)m, (long long)k, (long long)n, (long long)k, m <= 16 ? "gemv" : "tiled",
-                maxdiff, ok ? "ok" : "FAIL");
+    const char* kern = g_cuda_use_wmma ? "wmma" : (m <= 16 ? "gemv" : "tiled");
+    std::printf("test_cuda: [%4lld x %4lld] @ [%6lld x %4lld]^T (%-5s)  max|diff|=%.3e (tol %.0e) %s\n",
+                (long long)m, (long long)k, (long long)n, (long long)k, kern, maxdiff, tol,
+                ok ? "ok" : "FAIL");
     return ok;
 }
 
@@ -59,10 +57,19 @@ int main() {
     }
     std::mt19937 rng(1234);  // fixed seed: deterministic, per CLAUDE.md
     bool ok = true;
-    ok &= check_linear(4, 896, 896, rng);     // warp-GEMV (decode)
-    ok &= check_linear(128, 896, 896, rng);   // tiled, square (prefill q/o shape)
-    ok &= check_linear(128, 4864, 896, rng);  // tiled, wide n (gate/up shape)
-    ok &= check_linear(100, 896, 4864, rng);  // tiled, ragged m + wide k (down shape)
+    ok &= check_linear(4, 896, 896, 5e-3, rng);     // warp-GEMV (decode)
+    ok &= check_linear(128, 896, 896, 5e-3, rng);   // tiled, square (prefill q/o shape)
+    ok &= check_linear(128, 4864, 896, 5e-3, rng);  // tiled, wide n (gate/up shape)
+    ok &= check_linear(100, 896, 4864, 5e-3, rng);  // tiled, ragged m + wide k (down shape)
+
+    // Tensor-core path (G5d): fp16 inputs -> a much looser tolerance. The max|diff| printed
+    // here is the result: the fp16 accuracy cost (vs the fp32 oracle), not a tight bound.
+    g_cuda_use_wmma = true;
+    ok &= check_linear(128, 896, 896, 3e-1, rng);   // wmma, square
+    ok &= check_linear(128, 4864, 896, 3e-1, rng);  // wmma, wide n
+    ok &= check_linear(100, 896, 4864, 1e0, rng);   // wmma, ragged m + wide k (more accumulation)
+    g_cuda_use_wmma = false;
+
     std::printf("test_cuda: %s\n", ok ? "ok" : "FAIL");
     return ok ? 0 : 1;
 }

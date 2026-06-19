@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -81,6 +82,12 @@ int main() {
 
     cublasHandle_t handle;
     cublas_check(cublasCreate(&handle), "cublasCreate");
+
+    // NI_WMMA=1 routes the prefill (m>16) rows through the tensor-core kernel (G5d) instead of
+    // the fp32 tiled GEMM, so the GFLOP/s and max|diff| columns then report wmma vs cuBLAS.
+    if (const char* e = std::getenv("NI_WMMA")) g_cuda_use_wmma = (e[0] == '1');
+    std::printf("prefill (m>16) kernel: %s\n", g_cuda_use_wmma ? "wmma tensor cores (fp16)"
+                                                              : "tiled (fp32)");
 
     // Qwen2.5-0.5B linears (hidden=896, intermediate=4864, kv=128, vocab=151936).
     const std::vector<Shape> shapes = {
