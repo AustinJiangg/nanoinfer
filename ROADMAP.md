@@ -201,9 +201,13 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
         kernels). Decode 21→46 tok/s at 128 ctx (2.15×, bigger than the kernel's own 1.2×);
         prefill ~1.5× too; every golden / bit-identical gate unchanged. The remaining decode
         drag at long context is the contiguous cache's O(ctx) cat_seq copy — paged territory.
-  - [ ] **G5c** — prefill GEMM (compute-bound, m=seq): shared-memory tiling → register
-        blocking (TM×TN micro-tiles) → double-buffered float4 — lifts intensity over the
-        roofline ridge. The "close the gap to cuBLAS" arc.
+  - [x] **G5c** — prefill tiled GEMM: a thread block stages BM×BK / BK×BN tiles of x/w into
+        shared memory, each thread computes a TM×TN (4×4) register micro-tile (config
+        64×64×8), ragged m/n bounds-checked. Prefill matmul 3% → 20-68% of cuBLAS (gate/up
+        10.9 TFLOP/s = 68%); end-to-end prefill 493 → 2192 tok/s (4.4×, A/B vs naive in
+        run_cuda_decode_bench). Verified vs the CPU oracle incl. ragged m (test_cuda),
+        golden tokens unchanged. Further gains (warp tiling / double-buffer / float4 /
+        bank-conflict-free smem) left as G5c+ — would push 68% → ~85%.
   - [ ] **G5d** — low precision (stretch): fp16 tensor cores (wmma) → an int8×int8→int32
         tensor-core GEMM wired to the C4 quantized weights → quantize lm_head. The lever
         past the fp32 decode bandwidth wall (fewer bytes streamed).

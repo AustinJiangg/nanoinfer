@@ -168,6 +168,73 @@ __global__ void linear_gemv_kernel(const float* __restrict__ x, const float* __r
     }
 }
 
+// Prefill tiled GEMM (G5c): m>16 rows. Replaces the naive one-thread-per-output kernel
+// (which re-read x and w from DRAM for every output — ~0.25 FLOP/byte, ~3% of cuBLAS). A
+// thread BLOCK cooperatively stages a BM×BK tile of x and a BK×BN tile of w into shared
+// memory; each THREAD then computes a TM×TN micro-tile of outputs by outer products held in
+// registers, so every shared value is reused TM (or TN) times and every global load is
+// amortized across the block. That lifts arithmetic intensity over the roofline ridge —
+// prefill becomes compute-bound, as it should be. Same float math as the naive/GEMV kernels
+// (a tiled reduction order), within GPU tolerance; golden tokens unchanged.
+//
+// Layout: y[m,n] = x[m,k] @ w[n,k]ᵀ. x is row-major [m,k]; w is row-major [n,k], so a w ROW
+// (one output's weights) is contiguous — both staging loops stride the k dim fastest, which
+// keeps the global reads coalesced. OOB rows/cols (ragged m,n) load 0 and skip the store; a
+// thread reads only its own As rows / Bs cols, so the zero padding never contaminates a
+// valid output.
+template <int BM, int BN, int BK, int TM, int TN>
+__global__ void linear_tiled_kernel(const float* __restrict__ x, const float* __restrict__ w,
+                                    const float* __restrict__ bias, float* __restrict__ y, int m,
+                                    int n, int k) {
+    constexpr int numThreads = (BM / TM) * (BN / TN);
+    __shared__ float As[BM * BK];  // a tile of x: [BM rows][BK cols]
+    __shared__ float Bs[BK * BN];  // a tile of w viewed [BK k-rows][BN output-cols]
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const int threadRow = tid / (BN / TN), threadCol = tid % (BN / TN);  // this thread's tile
+    const int rowBase = static_cast<int>(blockIdx.y) * BM;  // global y-row base of the block
+    const int colBase = static_cast<int>(blockIdx.x) * BN;  // global y-col (output) base
+
+    // Cooperative-load indices: k fastest in both (innerCol = tid % BK), so consecutive
+    // threads read consecutive memory (x within a row; w within a row).
+    const int innerColA = tid % BK, innerRowA = tid / BK;
+    const int innerColB = tid % BK, innerRowB = tid / BK;
+    constexpr int strideA = numThreads / BK;  // rows of x staged per pass
+    constexpr int strideB = numThreads / BK;  // output cols of w staged per pass
+
+    float acc[TM * TN] = {0.0f};
+    float regM[TM], regN[TN];
+
+    for (int kIdx = 0; kIdx < k; kIdx += BK) {
+        for (int off = 0; off < BM; off += strideA) {
+            const int r = innerRowA + off, gr = rowBase + r, gc = kIdx + innerColA;
+            As[r * BK + innerColA] = (gr < m && gc < k) ? x[gr * k + gc] : 0.0f;
+        }
+        for (int off = 0; off < BN; off += strideB) {
+            const int o = innerRowB + off, go = colBase + o, gk = kIdx + innerColB;
+            Bs[innerColB * BN + o] = (go < n && gk < k) ? w[go * k + gk] : 0.0f;
+        }
+        __syncthreads();
+        for (int dot = 0; dot < BK; ++dot) {
+            for (int i = 0; i < TM; ++i) regM[i] = As[(threadRow * TM + i) * BK + dot];
+            for (int j = 0; j < TN; ++j) regN[j] = Bs[dot * BN + (threadCol * TN + j)];
+            for (int i = 0; i < TM; ++i)
+                for (int j = 0; j < TN; ++j) acc[i * TN + j] += regM[i] * regN[j];
+        }
+        __syncthreads();
+    }
+
+    for (int i = 0; i < TM; ++i) {
+        const int gr = rowBase + threadRow * TM + i;
+        if (gr >= m) continue;
+        for (int j = 0; j < TN; ++j) {
+            const int gc = colBase + threadCol * TN + j;
+            if (gc >= n) continue;
+            y[static_cast<size_t>(gr) * n + gc] = acc[i * TN + j] + (bias ? bias[gc] : 0.0f);
+        }
+    }
+}
+
 // out[r,c] = table[ids[r], c]. One thread per output element; ids already on device.
 __global__ void embedding_kernel(const float* __restrict__ table, const int64_t* __restrict__ ids,
                                  float* __restrict__ out, int64_t n, int64_t hidden) {
@@ -397,26 +464,32 @@ bool g_cuda_force_naive_gemm = false;
 Tensor CudaBackend::linear(const Tensor& x, const Tensor& weight, const Tensor* bias) {
     const int64_t m = x.size(0), k = x.size(1), n = weight.size(0);
     Tensor y = device_alloc({m, n});
-    // Pick the kernel by row count. Small m (decode, batched decode) is memory-bound, so the
-    // coalesced warp-GEMV wins (G5b); large m (prefill) is compute-bound and wants the tiled
-    // GEMM landing in G5c — until then the naive one-thread-per-output kernel runs it. The
-    // bench knob forces naive even at small m so run_cuda_decode_bench can A/B the win.
+    const float* xp = dptr(x);
+    const float* wp = dptr(weight);
+    const float* bp = bias ? dptr(*bias) : nullptr;
+    float* yp = dptr(y);
+    const int mi = static_cast<int>(m), ni = static_cast<int>(n), ki = static_cast<int>(k);
+    // Pick the kernel by row count. The bench knob forces the naive GEMM (the A/B baseline for
+    // run_cuda_*_bench). Otherwise: small m (decode, batched decode) is memory-bound → the
+    // coalesced warp-GEMV (G5b); large m (prefill) is compute-bound → the register-tiled GEMM
+    // (G5c). Each output row is computed independently in all three, so batching never changes
+    // a row (run_cuda_batch stays bit-identical).
     constexpr int64_t kGemvMaxM = 16;
-    if (!g_cuda_force_naive_gemm && m <= kGemvMaxM) {
-        const int threads = 128;  // 4 warps/block, one output channel per warp
-        const int warps_per_block = threads / 32;
-        const int blocks = static_cast<int>((n + warps_per_block - 1) / warps_per_block);
-        linear_gemv_kernel<<<blocks, threads>>>(dptr(x), dptr(weight),
-                                                bias ? dptr(*bias) : nullptr, dptr(y),
-                                                static_cast<int>(m), static_cast<int>(n),
-                                                static_cast<int>(k));
-    } else {
+    if (g_cuda_force_naive_gemm) {
         const dim3 block(16, 16);
         const dim3 grid((static_cast<unsigned>(n) + block.x - 1) / block.x,
                         (static_cast<unsigned>(m) + block.y - 1) / block.y);
-        linear_kernel<<<grid, block>>>(dptr(x), dptr(weight), bias ? dptr(*bias) : nullptr,
-                                       dptr(y), static_cast<int>(m), static_cast<int>(n),
-                                       static_cast<int>(k));
+        linear_kernel<<<grid, block>>>(xp, wp, bp, yp, mi, ni, ki);
+    } else if (m <= kGemvMaxM) {
+        const int threads = 128;  // 4 warps/block, one output channel per warp
+        const int blocks = static_cast<int>((n + threads / 32 - 1) / (threads / 32));
+        linear_gemv_kernel<<<blocks, threads>>>(xp, wp, bp, yp, mi, ni, ki);
+    } else {
+        constexpr int BM = 64, BN = 64, BK = 8, TM = 4, TN = 4;
+        constexpr int threads = (BM / TM) * (BN / TN);  // 256
+        const dim3 grid((static_cast<unsigned>(n) + BN - 1) / BN,
+                        (static_cast<unsigned>(m) + BM - 1) / BM);
+        linear_tiled_kernel<BM, BN, BK, TM, TN><<<grid, threads>>>(xp, wp, bp, yp, mi, ni, ki);
     }
     launch_check("linear_kernel");
     return y;
