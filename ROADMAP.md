@@ -172,14 +172,44 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
 - [x] **G4** — batched decode + a paged-attention CUDA kernel; drive the existing
       Python scheduler with the CUDA-backed Model (G4a batched, G4b paged kernel, G4c
       contiguous scheduler, G4d paged + prefix-sharing). Throughput tok/s × batch.
-- [ ] **G5** — optimize one kernel (shared-memory tiling / warp reductions / occupancy),
-      closing the gap to cuBLAS. Optional stretch: fp16/bf16 + tensor cores (wmma).
+- [ ] **G5** — optimize the GEMM, closing the gap to cuBLAS. `linear` dominates the
+      forward (168 projection matmuls + the 896×151936 lm_head), so it's the kernel to
+      sharpen first; `attention` (FlashAttention-style: online softmax, shared-mem K/V
+      tiles, warp-per-query) is second, once long context / large batch make it matter.
+      The naive kernel is one-thread-per-output: ~0.25 FLOP/byte intensity vs a
+      ~70 FLOP/byte roofline ridge (4070S), uncoalesced stride-k weight reads, and a
+      `cudaDeviceSynchronize` after every launch. Staged:
+  - [ ] **G5a** — measurement scaffold: drop the per-launch sync (sync only at D2H),
+        preallocate the per-call `d_bt`/`d_ids` buffers, time with CUDA events, baseline
+        against the G1-linked cuBLAS sgemm on the real shapes. Done-when bar for the
+        rest: % of cuBLAS on prefill shapes + greedy still matches the golden dump.
+  - [ ] **G5b** — decode GEMV (memory-bound, m=1..16): one warp per output row, coalesced
+        weight reads, `__shfl` reduction, float4 loads. The throughput path and the
+        lm_head bottleneck (544 MB streamed per token at fp32).
+  - [ ] **G5c** — prefill GEMM (compute-bound, m=seq): shared-memory tiling → register
+        blocking (TM×TN micro-tiles) → double-buffered float4 — lifts intensity over the
+        roofline ridge. The "close the gap to cuBLAS" arc.
+  - [ ] **G5d** — low precision (stretch): fp16 tensor cores (wmma) → an int8×int8→int32
+        tensor-core GEMM wired to the C4 quantized weights → quantize lm_head. The lever
+        past the fp32 decode bandwidth wall (fewer bytes streamed).
 
 ## Cross-platform (portability proof, after the GPU is learned)
 - [ ] **NEON** — fill `simd.hpp`'s `#elif` NEON path so `CpuBackend` runs on Apple ARM
       (M4 on CPU — the cheapest path to running on the Mac).
 - [ ] **Metal** — a `MetalBackend` on the M4 GPU; unified memory removes most H2D. The
       same Python serving layer on a third backend = the Backend boundary proven real.
+
+## Backlog (pull in when the moment fits)
+Open candidates, not a closed/deferred-forever list — fold one into a stage when it's
+the right moment:
+- int8×int8→int32 GEMM — C4 quant is weight-only today (saves memory, not compute); fits G5d.
+- quantize embedding / lm_head — the biggest single weight; fits G5d.
+- batched sampling — the token draw is still per-sequence in Python; fits the G4/G5 decode path.
+- SIMD nibble-unpack for q4/q4g — helps compute-bound q4 prefill.
+- NEON `simd.hpp` `#elif` path — the cross-platform leg above.
+- float32-accumulation in the SIMD dot — **has a real cost**: it trades away the
+  bit-for-bit CPU parity oracle (the project's correctness spine). Only as a conscious
+  tolerance change, never silent.
 
 ## Reference reading
 - PagedAttention / vLLM paper — KV memory management

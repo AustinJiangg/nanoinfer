@@ -253,9 +253,10 @@ python tools/serve.py --block-size 4 --num-blocks 128 --prefix-sharing --max-tok
 
 With F8c the Fusion track is a mini-vLLM: Python orchestration (continuous batching +
 paged block scheduler + prefix sharing) over our own C++ kernels (batched decode +
-paged attention), parity-locked end to end. Deliberately left for later: batched
-sampling (the draw is still per-sequence in Python) and a true int8×int8→int32 GEMM
-(C4 quant is still weight-only, so it saves memory, not compute).
+paged attention), parity-locked end to end. On the backlog (open, not deferred-forever
+— see the parent ROADMAP's Backlog): batched sampling (the draw is still per-sequence in
+Python) and a true int8×int8→int32 GEMM (C4 quant is still weight-only, so it saves
+memory, not compute) — both natural to fold into the GPU GEMM work (G5).
 
 ## Performance (C5: SIMD + threads)
 
@@ -289,10 +290,11 @@ what weight quantization (C4) attacks: q8 streams a quarter of the bytes, so q8 
 int8→float widening adds compute the now-compute-bound prefill can't hide (weight-only
 quant saves memory, not compute).
 
-Deliberately left out: a NEON path (slots into `simd.hpp` at the marked `#elif`),
-float32-accumulation (the further, lossy step llama.cpp takes — it would break the
-parity floor), and a SIMD nibble-unpack for q4/q4g (would only help compute-bound q4
-prefill, an uncommon path).
+On the backlog (open, not deferred-forever): a NEON path (slots into `simd.hpp` at the
+marked `#elif`), a SIMD nibble-unpack for q4/q4g (would help compute-bound q4 prefill,
+an uncommon path), and float32-accumulation — the further, lossy step llama.cpp takes.
+The last has a real cost: it would break the bit-for-bit CPU parity floor, so it's a
+conscious tolerance-trade, not a silent change.
 
 ## Status
 
