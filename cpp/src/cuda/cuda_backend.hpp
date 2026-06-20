@@ -13,12 +13,20 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "backend.hpp"
 #include "cache.hpp"
+#include "quant.hpp"
 
 namespace ni {
+
+// G5d: build a device-resident W8A8 weight — quantize `w` to int8 (per-channel, like Q8) and upload
+// the codes + per-row scales to the GPU once. Its linear() runs cuda_linear_w8a8 (int8×int8 DP4A on
+// device). The model holds these in qweights_ for the CUDA + W8A8 path, so Model::project drives the
+// int8 compute through the same QuantizedWeight interface as the CPU quant modes (no forward change).
+std::unique_ptr<QuantizedWeight> make_cuda_w8a8(const Tensor& w);
 
 // Bench/diagnostic knob (G5b): force the naive one-thread-per-output GEMM even for small
 // m, so run_cuda_decode_bench can A/B the warp-GEMV's decode win in one process with

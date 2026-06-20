@@ -25,6 +25,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "quant.hpp"
 #include "tensor.hpp"
 
 namespace ni {
@@ -1075,6 +1076,34 @@ Tensor cuda_linear_w8a8(const Tensor& x, const Tensor& wq, const Tensor& w_scale
         static_cast<int>(n), static_cast<int>(k));
     launch_check("linear_w8a8_kernel");
     return y;
+}
+
+// Device-resident W8A8 weight (G5d): int8 codes + per-row scales on the GPU; linear() runs the DP4A
+// kernel via cuda_linear_w8a8. Lives in the model's qweights_ for the CUDA + W8A8 path, so
+// Model::project drives int8 compute through the QuantizedWeight interface (no forward change).
+namespace {
+class CudaW8A8Weight : public QuantizedWeight {
+    Tensor wq_;       // device int8 [out, in]
+    Tensor w_scale_;  // device fp32 [out]
+    int64_t out_, in_;
+
+public:
+    CudaW8A8Weight(Tensor wq, Tensor w_scale, int64_t out, int64_t in)
+        : wq_(std::move(wq)), w_scale_(std::move(w_scale)), out_(out), in_(in) {}
+    Tensor linear(const Tensor& x, const Tensor* bias) const override {
+        return cuda_linear_w8a8(x, wq_, w_scale_, bias);
+    }
+    int64_t bytes() const override { return out_ * in_ + out_ * 4; }  // int8 codes + fp32 scales
+    int64_t fp32_bytes() const override { return out_ * in_ * 4; }
+};
+}  // namespace
+
+std::unique_ptr<QuantizedWeight> make_cuda_w8a8(const Tensor& w) {
+    QTensor q = quantize_q8(w);  // per-channel int8 (same as Q8), then upload codes + scales once
+    Tensor wq = to_device_i8(q.q.data(), {q.out, q.in});
+    Tensor ws({q.out});
+    for (int64_t o = 0; o < q.out; ++o) ws[o] = q.scale[static_cast<size_t>(o)];
+    return std::make_unique<CudaW8A8Weight>(std::move(wq), to_device(ws), q.out, q.in);
 }
 
 Device CudaBackend::device() const { return Device::CUDA; }

@@ -230,7 +230,7 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
         only home. Still ahead: cp.async double-buffering (another lm_head-local micro-gain); the
         real end-to-end prefill lever is now attention (FlashAttention — G5's named "second" kernel)
         and per-op launch overhead.
-  - [ ] **G5d** — low precision (stretch). **fp16 wmma landed** (linear_wmma_kernel, opt-in
+  - [x] **G5d** — low precision (fp16 + int8 W8A8; lm_head int8 deferred to backlog). **fp16 wmma landed** (linear_wmma_kernel, opt-in
         g_cuda_use_wmma): a 64×64 / 2×2-warp tensor-core kernel, correct (fp16 cost ~1-2% vs
         the oracle — test_cuda) but the naive version is SLOWER than the tuned fp32 tiled GEMM
         (gate/up 7.9 vs 10.9 TFLOP/s). The lesson: tensor-core FLOPS are huge (~142 TFLOP/s on
@@ -279,9 +279,16 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
         compute win fp16 lacked — int8 beats the float4 fp32 tiled on the compute-bound matmuls:
         gate/up 1.11×, down 1.14×, lm_head 1.36× (run_cuda_bench m=128); the tiny q/o,k/v lose 0.88×
         (basic tile + the activation-quant pass dominate at small n). Even a basic DP4A tile beating
-        the tuned fp32 shows the 4:1-MAC lever. Still ahead: wire W8A8 into the GPU model forward for
-        end-to-end golden tokens (a device CudaW8A8Weight in qweights_), and int8-quantize the
-        embedding/lm_head (the biggest weight — but it feeds argmax, so guard the tokens).
+        the tuned fp32 shows the 4:1-MAC lever. **W8A8 then wired into the GPU model forward**
+        (model.cpp routes CUDA+W8A8 layer projections to a device CudaW8A8Weight in qweights_, so
+        Model::project drives int8 DP4A through the same QuantizedWeight interface — no forward
+        change; embedding/lm_head/norms stay fp32): run_cuda_parity runs W8A8 end-to-end on the GPU —
+        greedy differs from fp32 at 1/12, next-token preserved, weights 907 MB — IDENTICAL to the CPU
+        W8A8 oracle (argmax is robust to the float dequant). **G5d done**: fp16 (memory 2× + decode
+        1.21× + prefill 1.05×) and int8 W8A8 (the compute win on the compute-bound projections fp16
+        could only tie) both land, CPU-oracle-locked at every step. The one open low-precision item —
+        int8-quantizing the embedding/lm_head (the biggest weight) — is in the backlog: it feeds
+        argmax directly, so it needs a token guard, and fp16 already halves it ~losslessly.
   - [x] **G5e** — attention, the GEMM's successor on the critical path. Once G5c+ made the
         matmuls fast, a prefill=128 step was only ~15ms of matmul out of ~55ms — the naive G2
         attention dominated. It ran one THREAD per (head,query): just H·sq = 1792 threads (~3% of
@@ -309,9 +316,11 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
 ## Backlog (pull in when the moment fits)
 Open candidates, not a closed/deferred-forever list — fold one into a stage when it's
 the right moment:
-- int8×int8→int32 GEMM — C4 quant is weight-only today (saves memory, not compute); fits G5d.
+- int8×int8→int32 GEMM — DONE (G5d W8A8: CPU oracle linear_w8a8 + simd::dot_qq, GPU cuda_linear_w8a8
+  DP4A, model-integrated; the compute win — gate/up 1.11×, down 1.14×, lm_head 1.36×).
 - int8-quantize embedding / lm_head — the biggest single weight. fp16 storage landed (G5d:
-  ~free, 2× smaller, golden MATCH); int8 still open (pairs with the int8 GEMM above).
+  ~free, 2× smaller, golden MATCH); int8 still open — it feeds argmax directly, so guard the tokens
+  (the W8A8 dynamic-activation path + a static or careful scale would extend to it).
 - batched sampling — the token draw is still per-sequence in Python; fits the G4/G5 decode path.
 - SIMD nibble-unpack for q4/q4g — helps compute-bound q4 prefill.
 - NEON `simd.hpp` `#elif` path — the cross-platform leg above.

@@ -127,6 +127,26 @@ int main(int argc, char** argv) {
                     double(wb32.first) / 1e6, double(wb16.first) / 1e6,
                     double(wb32.first) / double(wb16.first));
 
+        // --- 4. W8A8 (G5d), informational: the layer projections run as int8×int8 DP4A on the GPU
+        // (a device CudaW8A8Weight in qweights_); embedding/lm_head/norms stay fp32. Activation quant
+        // is lossy, so — like run_quant w8a8 on CPU — it may flip a close argmax. Not gated; the
+        // point is the int8 COMPUTE running end-to-end on the GPU, and how close the tokens stay. ---
+        Model modelq(dir, QuantMode::W8A8, Device::CUDA);
+        std::vector<int64_t> ctxq = ids, gotq;
+        for (size_t t = 0; t < ref_gen.size(); ++t) {
+            Tensor lg = modelq.forward(ctxq);
+            gotq.push_back(argmax_row(lg, lg.size(0) - 1, lg.size(1)));
+            ctxq.push_back(gotq.back());
+        }
+        int genq = 0;
+        for (size_t i = 0; i < ref_gen.size() && i < gotq.size(); ++i)
+            if (ref_gen[i] != gotq[i]) ++genq;
+        const auto wbq = modelq.weight_bytes();
+        const bool nextq = !ref_gen.empty() && !gotq.empty() && ref_gen[0] == gotq[0];
+        print_ids("w8a8  :", gotq);
+        std::printf("W8A8 (GPU int8 DP4A): greedy vs fp32 %d/%zu differ, next-token %s; weights %.0f MB\n",
+                    genq, ref_gen.size(), nextq ? "preserved" : "CHANGED", double(wbq.first) / 1e6);
+
         if (has_nan) std::printf("WARNING: GPU logits contain NaN\n");
         // Correctness = the tokens (argmax + greedy); maxd is a loose drift guard, looser
         // than the CPU's 0.1 because float error compounds across the 24 layers.

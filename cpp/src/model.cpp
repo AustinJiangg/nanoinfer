@@ -69,7 +69,15 @@ Model::Model(const std::string& weights_dir, QuantMode mode, Device device) {
         for (const auto& kv : w_)
             if (is_layer_proj(kv.first)) names.push_back(kv.first);
         for (const std::string& n : names) {
-            qweights_.emplace(n, make_quantized(w_.at(n), mode));
+#ifdef NI_CUDA
+            // CUDA + W8A8: a device-resident int8 weight, so the projection runs int8×int8 DP4A on
+            // the GPU (the compute win). W8A8 is the GPU quant path; the other modes on CUDA aren't
+            // GPU-wired (their CPU linear can't take a device tensor). CPU uses make_quantized.
+            if (device == Device::CUDA && mode == QuantMode::W8A8)
+                qweights_.emplace(n, make_cuda_w8a8(w_.at(n)));
+            else
+#endif
+                qweights_.emplace(n, make_quantized(w_.at(n), mode));
             w_.erase(n);  // free the fp32 copy — the quantized weight is live now
         }
     }
