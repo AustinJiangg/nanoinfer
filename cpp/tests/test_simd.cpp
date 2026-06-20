@@ -43,17 +43,23 @@ int main() {
     for (int64_t n = 0; n <= 40; ++n) {
         std::vector<float> a(static_cast<size_t>(n)), b(static_cast<size_t>(n)),
             x(static_cast<size_t>(n));
-        std::vector<int8_t> q(static_cast<size_t>(n));
+        std::vector<int8_t> q(static_cast<size_t>(n)), q2(static_cast<size_t>(n));
         for (int64_t i = 0; i < n; ++i) {
             a[static_cast<size_t>(i)] = uf(rng);
             b[static_cast<size_t>(i)] = uf(rng);
             x[static_cast<size_t>(i)] = uf(rng);
             q[static_cast<size_t>(i)] = static_cast<int8_t>(ui(rng));
+            q2[static_cast<size_t>(i)] = static_cast<int8_t>(ui(rng));
         }
         const double rf = ref_dot(a.data(), b.data(), n);
         CHECK_CLOSE(ni::simd::dot_f32(a.data(), b.data(), n), rf, 1e-6 + 1e-9 * std::fabs(rf));
         const double rq = ref_dot_q(x.data(), q.data(), n);
         CHECK_CLOSE(ni::simd::dot_qf32(x.data(), q.data(), n), rq, 1e-6 + 1e-9 * std::fabs(rq));
+        // dot_qq is EXACT integer arithmetic: whatever it compiled to (AVX2 madd or scalar) must
+        // equal the scalar int32 reference bit-for-bit — the W8A8 integer core a GPU DP4A reproduces.
+        int32_t rqq = 0;
+        for (int64_t i = 0; i < n; ++i) rqq += int32_t(q[static_cast<size_t>(i)]) * int32_t(q2[static_cast<size_t>(i)]);
+        CHECK(ni::simd::dot_qq(q.data(), q2.data(), n) == rqq);
     }
     CHECK_CLOSE(ni::simd::dot_f32(nullptr, nullptr, 0), 0.0, 0.0);  // empty -> 0
 

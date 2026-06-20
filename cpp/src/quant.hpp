@@ -24,9 +24,12 @@
 
 namespace ni {
 
-// Weight quantization mode for the model. None = fp32; Q8/Q4 are per-channel;
-// Q4G is group-wise int4 (one scale per K-element block — accurate enough to use).
-enum class QuantMode { None, Q8, Q4, Q4G };
+// Weight quantization mode for the model. None = fp32; Q8/Q4 are per-channel weight-only
+// (int8/int4 weight × fp32 activation — saves memory, not compute); Q4G is group-wise int4
+// (one scale per K-element block — accurate enough to use). W8A8 quantizes the ACTIVATIONS to
+// int8 too (per row, dynamically), so the inner product is an int8×int8→int32 integer dot — the
+// form a GPU DP4A / CPU VNNI runs at int8 throughput: the compute win, not just memory.
+enum class QuantMode { None, Q8, Q4, Q4G, W8A8 };
 
 // An int8-quantized [out, in] weight: codes row-major, one scale per output row.
 struct QTensor {
@@ -45,6 +48,14 @@ Tensor dequantize_q8(const QTensor& w);
 // y = x @ dequant(w)^T + bias. x is [m, in]; returns [m, out]. The inner product
 // runs over the int8 codes; the per-row scale is applied once at the end.
 Tensor linear_q8(const Tensor& x, const QTensor& w, const Tensor* bias = nullptr);
+
+// W8A8: the SAME int8 weight (a QTensor from quantize_q8), but the activations are also quantized
+// to int8 — dynamically, per row: a_scale[i] = max_j|x[i,j]|/127. The inner product is then an
+// int8×int8→int32 integer dot (simd::dot_qq), dequantized by both scales at the end:
+//   y[i,o] = (sum_j xq[i,j]·wq[o,j]) · a_scale[i] · w_scale[o] + bias[o].
+// Both operands int8 ⇒ the dot runs at int8 throughput (the compute win Q8 can't get); the int32
+// sum is exact, so a GPU DP4A kernel reproduces this integer core identically (G5d, the oracle).
+Tensor linear_w8a8(const Tensor& x, const QTensor& w, const Tensor* bias = nullptr);
 
 // An int4-quantized [out, in] weight (Q4): codes in [-7, 7] packed two per byte
 // (each stored as code+8, a nibble in [1, 15]), per row, plus one fp32 scale per

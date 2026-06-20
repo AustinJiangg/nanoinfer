@@ -54,7 +54,8 @@ QuantMode quant_mode_from_string(const std::string& s) {
     if (s == "q8") return QuantMode::Q8;
     if (s == "q4") return QuantMode::Q4;
     if (s == "q4g") return QuantMode::Q4G;
-    throw std::invalid_argument("unknown quant mode '" + s + "' (fp32|q8|q4|q4g)");
+    if (s == "w8a8") return QuantMode::W8A8;
+    throw std::invalid_argument("unknown quant mode '" + s + "' (fp32|q8|q4|q4g|w8a8)");
 }
 
 }  // namespace
@@ -68,7 +69,8 @@ PYBIND11_MODULE(nicpp, m) {
         .value("NONE", QuantMode::None, "fp32 (no quantization)")
         .value("Q8", QuantMode::Q8, "per-channel int8")
         .value("Q4", QuantMode::Q4, "per-channel int4")
-        .value("Q4G", QuantMode::Q4G, "group-wise int4 (Q4_0-style, 32-blocks)");
+        .value("Q4G", QuantMode::Q4G, "group-wise int4 (Q4_0-style, 32-blocks)")
+        .value("W8A8", QuantMode::W8A8, "int8 weight × int8 activation (int8×int8→int32 — compute, not just memory)");
 
     m.def("quant_mode", &quant_mode_from_string, py::arg("name"),
           "Parse 'fp32'|'q8'|'q4'|'q4g' into a QuantMode.");

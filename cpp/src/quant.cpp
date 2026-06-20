@@ -130,6 +130,53 @@ Tensor linear_q8(const Tensor& x, const QTensor& w, const Tensor* bias) {
     return y;
 }
 
+Tensor linear_w8a8(const Tensor& x, const QTensor& w, const Tensor* bias) {
+    check_qtensor(w);
+    require(x.ndim() == 2, "linear_w8a8 expects 2-D x");
+    require(x.size(1) == w.in, "linear_w8a8: x cols must match weight in-features");
+    if (bias) require(bias->numel() == w.out, "linear_w8a8: bias must match out-features");
+
+    const int64_t m = x.size(0), in = w.in, out = w.out;
+    Tensor y({m, out});
+    const float* xp = x.data();
+    const int8_t* qp = w.q.data();
+    const float* sp = w.scale.data();
+    const float* bp = bias ? bias->data() : nullptr;
+    float* yp = y.data();
+
+    // Dynamic per-row activation quantization (symmetric int8), recomputed every call since the
+    // activations change. Same scheme as the weight (quantize_q8's per-output-row), applied to each
+    // input row: a_scale[i] = max_j|x[i,j]|/127, xq = round_clamp(x / a_scale).
+    std::vector<int8_t> xq(static_cast<size_t>(m) * static_cast<size_t>(in));
+    std::vector<float> a_scale(static_cast<size_t>(m));
+    for (int64_t i = 0; i < m; ++i) {
+        const float* xr = xp + i * in;
+        float absmax = 0.0f;
+        for (int64_t j = 0; j < in; ++j) absmax = std::max(absmax, std::fabs(xr[j]));
+        const float scale = absmax / kQ8Max;  // 0 for an all-zero row
+        a_scale[static_cast<size_t>(i)] = scale;
+        int8_t* xqr = xq.data() + i * in;
+        for (int64_t j = 0; j < in; ++j)
+            xqr[j] = static_cast<int8_t>(round_clamp(xr[j], scale, kQ8Max));
+    }
+
+    // int8×int8 → int32 GEMM. Output-channel parallel, row loop inner so each weight row streams
+    // once per call (like linear()). dot_qq is the exact integer core; the two scales fold in once.
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if (out >= kParallelMinRows)
+#endif
+    for (int64_t o = 0; o < out; ++o) {
+        const int8_t* qr = qp + o * in;
+        const double ws = double(sp[o]);
+        const double b = bp ? double(bp[o]) : 0.0;
+        for (int64_t i = 0; i < m; ++i)
+            yp[i * out + o] = float(double(simd::dot_qq(xq.data() + i * in, qr, in)) *
+                                        double(a_scale[static_cast<size_t>(i)]) * ws +
+                                    b);
+    }
+    return y;
+}
+
 Q4Tensor quantize_q4(const Tensor& w) {
     require(w.ndim() == 2, "quantize_q4 expects a 2-D [out, in] weight");
     const int64_t out = w.size(0), in = w.size(1), row_bytes = q4_row_bytes(in);
@@ -312,6 +359,18 @@ public:
     }
     int64_t fp32_bytes() const override { return t_.out * t_.in * 4; }
 };
+// W8A8 stores the same int8 weight as Q8 (a QTensor) — the difference is the LINEAR (int8×int8,
+// activations quantized at call time), so storage bytes match Q8; the win is compute, not memory.
+class W8A8Weight : public QuantizedWeight {
+    QTensor t_;
+public:
+    explicit W8A8Weight(QTensor t) : t_(std::move(t)) {}
+    Tensor linear(const Tensor& x, const Tensor* bias) const override { return linear_w8a8(x, t_, bias); }
+    int64_t bytes() const override {
+        return int64_t(t_.q.size()) + int64_t(t_.scale.size()) * 4;
+    }
+    int64_t fp32_bytes() const override { return t_.out * t_.in * 4; }
+};
 }  // namespace
 
 std::unique_ptr<QuantizedWeight> make_quantized(const Tensor& w, QuantMode mode) {
@@ -319,6 +378,7 @@ std::unique_ptr<QuantizedWeight> make_quantized(const Tensor& w, QuantMode mode)
         case QuantMode::Q8: return std::make_unique<Q8Weight>(quantize_q8(w));
         case QuantMode::Q4: return std::make_unique<Q4Weight>(quantize_q4(w));
         case QuantMode::Q4G: return std::make_unique<Q4GWeight>(quantize_q4g(w));  // group 32
+        case QuantMode::W8A8: return std::make_unique<W8A8Weight>(quantize_q8(w));  // int8 weight, int8 act
         case QuantMode::None: return nullptr;
     }
     return nullptr;

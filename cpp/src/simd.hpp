@@ -107,5 +107,34 @@ inline double dot_qf32(const float* x, const int8_t* q, int64_t n) {
 #endif
 }
 
+// dot(a, b) for two int8 code arrays, accumulated EXACTLY in int32 (the W8A8 inner product, G5d).
+// Both operands are int8, so this runs at int8 throughput — _mm256_madd_epi16 here, __dp4a on the
+// GPU — the compute win weight-only Q8 (dot_qf32, an fp inner product) can't get. Integer add is
+// associative, so the SIMD re-association is bit-identical to the scalar loop AND to a GPU int32
+// accumulate (DP4A): the integer core is the same number everywhere; only the later float dequant
+// drifts. Exact while k·127² < INT32_MAX (~133k contraction); our largest matmul is k=4864.
+inline int32_t dot_qq(const int8_t* a, const int8_t* b, int64_t n) {
+#if defined(__AVX2__) && defined(__FMA__)
+    __m256i acc = _mm256_setzero_si256();  // 8 int32 lanes
+    int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        // Sign-extend 16 int8 -> 16 int16, multiply-add adjacent pairs -> 8 int32, accumulate.
+        const __m256i av = _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(a + i)));
+        const __m256i bv = _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i)));
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(av, bv));
+    }
+    __m128i s = _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(1, 0, 3, 2)));  // fold 4 -> 2 lanes
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(2, 3, 0, 1)));  // fold 2 -> 1 lane
+    int32_t total = _mm_cvtsi128_si32(s);
+    for (; i < n; ++i) total += int32_t(a[i]) * int32_t(b[i]);  // scalar tail
+    return total;
+#else
+    int32_t total = 0;
+    for (int64_t i = 0; i < n; ++i) total += int32_t(a[i]) * int32_t(b[i]);
+    return total;
+#endif
+}
+
 }  // namespace simd
 }  // namespace ni

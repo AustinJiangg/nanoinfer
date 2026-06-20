@@ -94,6 +94,67 @@ int main() {
         CHECK_CLOSE(dq.at(0, 1), 0.0, 1e-12);
     }
 
+    // --- W8A8 (int8 activation × int8 weight) ---
+
+    // The W8A8 product equals dequant(x)·dequant(w): factoring the two scales out of the integer
+    // dot is the same value as multiplying the dequantized operands (up to float ordering). Running
+    // quantize_q8 on x reproduces W8A8's own per-row activation quant, so this pins the dual-scale
+    // dequant and the integer core together.
+    {
+        std::mt19937_64 rng(10);
+        std::normal_distribution<float> nd;
+        Tensor x({3, 16}), w({5, 16}), bias({5});
+        for (int64_t i = 0; i < x.numel(); ++i) x[i] = nd(rng);
+        for (int64_t i = 0; i < w.numel(); ++i) w[i] = nd(rng);
+        for (int64_t i = 0; i < bias.numel(); ++i) bias[i] = nd(rng);
+        ni::QTensor qw = ni::quantize_q8(w);
+        Tensor x_deq = ni::dequantize_q8(ni::quantize_q8(x));  // per-row int8 activations, dequantized
+        Tensor ref = ni::linear(x_deq, ni::dequantize_q8(qw), &bias);
+        Tensor got = ni::linear_w8a8(x, qw, &bias);
+        for (int64_t i = 0; i < ref.numel(); ++i) CHECK_CLOSE(got[i], ref[i], 1e-3);
+    }
+
+    // W8A8 quantizes the activations too, so it genuinely differs from weight-only Q8 (the
+    // activation quant is real, not a no-op), while staying a small approximation of fp32. (It is
+    // worse than Q8 in aggregate/expectation, but not necessarily on the max element — the two
+    // independent roundings can partially cancel — so that is not asserted.)
+    {
+        std::mt19937_64 rng(11);
+        std::normal_distribution<float> nd;
+        Tensor x({4, 64}), w({6, 64});
+        for (int64_t i = 0; i < x.numel(); ++i) x[i] = nd(rng);
+        for (int64_t i = 0; i < w.numel(); ++i) w[i] = nd(rng);
+        ni::QTensor qw = ni::quantize_q8(w);
+        Tensor fp32 = ni::linear(x, w);
+        Tensor q8 = ni::linear_q8(x, qw);      // weight-only int8
+        Tensor w8a8 = ni::linear_w8a8(x, qw);  // + dynamic int8 activations
+        double e_w8a8 = 0, peak = 0, vs_q8 = 0;
+        for (int64_t i = 0; i < fp32.numel(); ++i) {
+            const double f = std::fabs(double(fp32[i]));
+            if (f > peak) peak = f;
+            const double dw = std::fabs(double(w8a8[i]) - double(fp32[i]));
+            if (dw > e_w8a8) e_w8a8 = dw;
+            const double dvs = std::fabs(double(w8a8[i]) - double(q8[i]));
+            if (dvs > vs_q8) vs_q8 = dvs;
+        }
+        CHECK(vs_q8 > 0.0);          // activation quant actually changes the result (not a no-op)
+        CHECK(e_w8a8 < 0.2 * peak);  // but W8A8 stays a small approximation (quantization is ~0.4%/operand)
+    }
+
+    // Factory routes W8A8 to linear_w8a8; storage matches Q8 (same int8 weight — the win is compute).
+    {
+        std::mt19937_64 rng(12);
+        std::normal_distribution<float> nd;
+        Tensor x({2, 16}), w({4, 16});
+        for (int64_t i = 0; i < x.numel(); ++i) x[i] = nd(rng);
+        for (int64_t i = 0; i < w.numel(); ++i) w[i] = nd(rng);
+        auto qw8 = ni::make_quantized(w, ni::QuantMode::W8A8);
+        Tensor ref = ni::linear_w8a8(x, ni::quantize_q8(w), nullptr);
+        Tensor got = qw8->linear(x, nullptr);
+        for (int64_t i = 0; i < ref.numel(); ++i) CHECK_CLOSE(got[i], ref[i], 1e-9);
+        CHECK(qw8->bytes() == ni::make_quantized(w, ni::QuantMode::Q8)->bytes());
+    }
+
     // --- Q4 (int4) ---
 
     // Q4 error is bounded by half a step (scale_o/2 = absmax_o/14) per weight,

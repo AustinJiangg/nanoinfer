@@ -27,8 +27,9 @@ int main(int argc, char** argv) {
     ni::QuantMode mode = ni::QuantMode::Q8;
     if (mode_str == "q4") mode = ni::QuantMode::Q4;
     else if (mode_str == "q4g") mode = ni::QuantMode::Q4G;
+    else if (mode_str == "w8a8") mode = ni::QuantMode::W8A8;
     else if (mode_str != "q8") {
-        std::printf("unknown mode '%s' (use q8, q4, or q4g)\n", mode_str.c_str());
+        std::printf("unknown mode '%s' (use q8, q4, q4g, or w8a8)\n", mode_str.c_str());
         return 2;
     }
     try {

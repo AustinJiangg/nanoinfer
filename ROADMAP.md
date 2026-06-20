@@ -266,8 +266,15 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
         fp16 prefill now BEATS fp32: 3253→3424 tok/s (1.05×, run_cuda_decode_bench). fp16 weights now
         win on every axis — memory 2×, decode 1.21× (gemv-h), prefill 1.05× — golden tokens MATCH,
         tiled-h error 8e-3 (fp16-weight-only + fp32 compute, tighter than wmma's fp16-accumulate). The
-        fp16 sub-track is done. Still ahead: int8×int8→int32 (C4 weights) + int8-quantize the
-        embedding/lm_head — the FLOP-reduction (compute) lever, vs fp16's byte-reduction.
+        fp16 sub-track is done. **int8 W8A8 then began** — the FLOP-reduction (compute) lever, vs
+        fp16's byte-reduction. **CPU W8A8 oracle landed** (QuantMode::W8A8 + linear_w8a8 +
+        simd::dot_qq): the C4 int8 weight (a QTensor) plus dynamic per-row int8 activations, an
+        int8×int8→int32 integer dot (exact — AVX2 madd == scalar == a GPU DP4A int32 accumulate),
+        dual-scale dequant. run_quant w8a8 on Qwen2.5-0.5B: same 2.18× memory as Q8 (same weight),
+        logit err 11.2 vs Q8's 3.8 (the added activation quant), but next-token preserved and 11/12
+        greedy == Q8 — accuracy is fine; the point is the compute. Still ahead: the GPU DP4A int8
+        kernel (the actual compute win on the projections fp16 could only tie) + int8-quantize the
+        embedding/lm_head.
   - [x] **G5e** — attention, the GEMM's successor on the critical path. Once G5c+ made the
         matmuls fast, a prefill=128 step was only ~15ms of matmul out of ~55ms — the naive G2
         attention dominated. It ran one THREAD per (head,query): just H·sq = 1792 threads (~3% of
