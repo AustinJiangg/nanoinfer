@@ -93,9 +93,11 @@ int main(int argc, char** argv) {
         std::printf("greedy match: %s (%d/%zu mismatches)\n", greedy_ok ? "MATCH" : "MISMATCH",
                     genmism, ref_gen.size());
 
-        // --- 3. fp16 weights (G5d), informational: the same uncached greedy with the layer
-        // projections uploaded as fp16. Does the whole model at fp16 weights still match the
-        // golden tokens? Not gated — fp16 may flip a close argmax; that's the measured cost. ---
+        // --- 3. fp16 weights (G5d), informational: the same uncached greedy with the big weights
+        // uploaded as fp16 — the layer projections AND the token embedding / tied lm_head (the
+        // single largest weight). Does the whole model at fp16 still match the golden tokens? Not
+        // gated — fp16 may flip a close argmax (esp. now the lm_head logits are fp16); the measured
+        // cost is the logit max|diff| and whether the tokens hold. Also reports the storage win. ---
         g_cuda_fp16_weights = true;
         Model model16(dir, QuantMode::None, Device::CUDA);
         g_cuda_fp16_weights = false;
@@ -118,6 +120,12 @@ int main(int argc, char** argv) {
         print_ids("fp16w :", got16);
         std::printf("fp16 weights: greedy %s (%d/%zu mism), logits max|diff|=%g vs fp32 ref\n",
                     gen16 == 0 ? "MATCH" : "DIFFERS", gen16, ref_gen.size(), maxd16);
+        // The headline win: half the bytes for the layer projections + the ~544 MB tied embedding.
+        const auto wb32 = model.weight_bytes();    // fp32 model: actual == fp32
+        const auto wb16 = model16.weight_bytes();  // fp16 model: actual reflects the half buffers
+        std::printf("fp16 weights: device weight storage %.0f MB -> %.0f MB (%.2fx smaller)\n",
+                    double(wb32.first) / 1e6, double(wb16.first) / 1e6,
+                    double(wb32.first) / double(wb16.first));
 
         if (has_nan) std::printf("WARNING: GPU logits contain NaN\n");
         // Correctness = the tokens (argmax + greedy); maxd is a loose drift guard, looser

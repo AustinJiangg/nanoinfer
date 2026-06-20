@@ -30,10 +30,12 @@ extern bool g_cuda_force_naive_gemm;
 // accepted; flip it to measure (test_cuda, run_cuda_bench NI_WMMA=1). Not thread-safe.
 extern bool g_cuda_use_wmma;
 
-// Opt-in (G5d): upload the layer-projection weights as fp16 (half the DRAM bytes). Set it
-// BEFORE constructing a CUDA Model — the conversion happens at the once-per-load upload, and
-// the linear dispatch then routes fp16 weights through the GEMV/wmma fp16 paths (so fp16
-// weights force the tensor-core kernel for prefill). Default off; not thread-safe.
+// Opt-in (G5d): upload the big weights as fp16 (half the DRAM bytes) — the layer projections
+// plus the token embedding / tied lm_head (embed_tokens, the single largest weight). Set it
+// BEFORE constructing a CUDA Model — the conversion happens at the once-per-load upload; the
+// linear dispatch then routes fp16 weights through the GEMV/wmma fp16 paths (so fp16 weights
+// force the tensor-core kernel for prefill), and the embedding gather reads the fp16 table
+// directly. Default off; not thread-safe.
 extern bool g_cuda_fp16_weights;
 
 // Bench/diagnostic knob (G5e): force the naive one-thread-per-query attention kernel instead of

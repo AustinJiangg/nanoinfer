@@ -81,6 +81,35 @@ static bool check_attention(int64_t H, int64_t sq, int64_t sk, int64_t D, bool c
     return ok;
 }
 
+// Embedding gather vs the CPU oracle (G5d). Random [vocab, hidden] table, random ids; an fp32
+// table matches exactly (a pure copy — no arithmetic), an fp16 table within fp16 rounding (the
+// looked-up rows are half-rounded). Covers the fp16-table path now that embed_tokens goes fp16.
+static bool check_embedding(int64_t vocab, int64_t hidden, int64_t n, bool f16, double tol,
+                            std::mt19937& rng) {
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    Tensor table({vocab, hidden});
+    for (int64_t i = 0; i < table.numel(); ++i) table[i] = dist(rng);
+    std::uniform_int_distribution<int64_t> idd(0, vocab - 1);
+    std::vector<int64_t> ids(static_cast<size_t>(n));
+    for (auto& v : ids) v = idd(rng);
+
+    CpuBackend cpu;
+    Tensor o_cpu = cpu.embedding(table, ids);  // oracle (fp32 table)
+
+    CudaBackend gpu;
+    Tensor td = f16 ? to_device_f16(table) : to_device(table);
+    Tensor o_gpu = to_host(gpu.embedding(td, ids));
+
+    double maxdiff = 0.0;
+    for (int64_t i = 0; i < o_cpu.numel(); ++i)
+        maxdiff = std::max(maxdiff, std::fabs(static_cast<double>(o_cpu[i]) - o_gpu[i]));
+    const bool ok = maxdiff < tol;
+    std::printf("test_cuda: embed [%6lld x %4lld] gather n=%lld (%-3s) max|diff|=%.3e (tol %.0e) %s\n",
+                (long long)vocab, (long long)hidden, (long long)n, f16 ? "f16" : "f32", maxdiff, tol,
+                ok ? "ok" : "FAIL");
+    return ok;
+}
+
 int main() {
     if (!cuda_available()) {
         std::printf("test_cuda: no CUDA device visible — skipping\n");
@@ -107,6 +136,11 @@ int main() {
     ok &= check_linear(4, 896, 896, 1e-1, true, rng);      // gemv-h (decode, fp16 weight)
     ok &= check_linear(128, 896, 896, 3e-1, true, rng);    // wmma-h (prefill, fp16 weight)
     ok &= check_linear(100, 896, 4864, 1e0, true, rng);    // wmma-h, ragged + wide k
+
+    // Embedding gather (G5d): fp32 table is an exact copy; fp16 table (embed_tokens path) costs
+    // only the fp16 rounding of the looked-up rows.
+    ok &= check_embedding(2048, 896, 8, false, 1e-6, rng);  // fp32 table — exact
+    ok &= check_embedding(2048, 896, 8, true, 1e-3, rng);   // fp16 table — fp16 rounding
 
     // Warp-per-query attention (G5e): prefill (limit>32 → lane key-striding), decode (sq=1, large
     // sk), and full (non-causal). Tight tol — only the key sums reorder vs the CPU oracle.

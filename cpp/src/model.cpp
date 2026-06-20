@@ -24,6 +24,15 @@ bool is_layer_proj(const std::string& name) {
     return name.rfind("layers.", 0) == 0 && name.size() > suffix.size() &&
            name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
+
+// Weights uploaded as fp16 when g_cuda_fp16_weights is on (G5d): the layer projections PLUS the
+// big token embedding / output projection. embed_tokens (vocab×hidden) is the single largest
+// weight — ~136M params, ~544 MB in fp32, and tied as the lm_head — so storing it as half is the
+// biggest single memory win; fp32-accumulated, it keeps the golden tokens. "lm_head.weight"
+// covers an untied checkpoint. Norms/biases stay fp32: tiny, and precision-sensitive.
+bool is_fp16_weight(const std::string& name) {
+    return is_layer_proj(name) || name == "embed_tokens.weight" || name == "lm_head.weight";
+}
 }  // namespace
 
 Model::Model(const std::string& weights_dir, QuantMode mode, Device device) {
@@ -71,12 +80,13 @@ Model::Model(const std::string& weights_dir, QuantMode mode, Device device) {
     // C5's "stream each weight once". After this W() returns device tensors and every op
     // in forward() runs on the GPU. (Quant stays on CPU, so this path uses fp32 weights.)
     if (device == Device::CUDA) {
-        // Layer-projection weights go up as fp16 when opted in (G5d) — half the DRAM bytes,
-        // and the linear dispatch then routes them through the tensor-core / fp16-GEMV path.
-        // embed/lm_head/norms/biases stay fp32 (lm_head is tied to embed; deferred).
+        // The big weights go up as fp16 when opted in (G5d) — half the DRAM bytes. The linear
+        // dispatch routes fp16 weights through the tensor-core / fp16-GEMV path, and the embedding
+        // gather + tied lm_head read the fp16 table directly (embedding/linear both handle F16).
+        // Norms/biases stay fp32 (tiny, precision-sensitive). See is_fp16_weight.
         for (auto& kv : w_)
-            kv.second = (g_cuda_fp16_weights && is_layer_proj(kv.first)) ? to_device_f16(kv.second)
-                                                                         : to_device(kv.second);
+            kv.second = (g_cuda_fp16_weights && is_fp16_weight(kv.first)) ? to_device_f16(kv.second)
+                                                                          : to_device(kv.second);
         rope_.cos = to_device(rope_.cos);
         rope_.sin = to_device(rope_.sin);
     }
@@ -108,7 +118,9 @@ std::pair<int64_t, int64_t> Model::weight_bytes() const {
     int64_t actual = 0, fp32 = 0;
     for (const auto& kv : w_) {
         const int64_t n = kv.second.numel();
-        actual += n * 4;
+        // fp16 device weights (G5d) take 2 bytes/elem, not 4 — so the report reflects the fp16
+        // storage win, not just quantization's. CPU weights are always F32, so this is a no-op there.
+        actual += n * (kv.second.dtype() == DType::F16 ? 2 : 4);
         fp32 += n * 4;
     }
     for (const auto& kv : qweights_) {

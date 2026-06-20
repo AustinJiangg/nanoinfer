@@ -507,13 +507,17 @@ __global__ void linear_wmma_kernel(const float* __restrict__ x, const WT* __rest
     }
 }
 
-// out[r,c] = table[ids[r], c]. One thread per output element; ids already on device.
-__global__ void embedding_kernel(const float* __restrict__ table, const int64_t* __restrict__ ids,
+// out[r,c] = table[ids[r], c]. One thread per output element; ids already on device. Templated
+// on the table type so an fp16 embedding (G5d: embed_tokens, the largest weight, uploaded as
+// half) reads through ldf and converts to fp32 on store — activations stay fp32, only the
+// looked-up table is half. On a float* table ldf is the identity, so fp32 is unchanged.
+template <typename WT>
+__global__ void embedding_kernel(const WT* __restrict__ table, const int64_t* __restrict__ ids,
                                  float* __restrict__ out, int64_t n, int64_t hidden) {
     const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= n * hidden) return;
     const int64_t r = idx / hidden, c = idx % hidden;
-    out[idx] = table[ids[r] * hidden + c];
+    out[idx] = ldf(table, static_cast<size_t>(ids[r] * hidden + c));
 }
 
 // RMSNorm over the last dim: out = x / sqrt(mean(x²)+eps) * weight. One thread per row;
@@ -953,12 +957,17 @@ Tensor CudaBackend::linear(const Tensor& x, const Tensor& weight, const Tensor* 
 
 Tensor CudaBackend::embedding(const Tensor& table, const std::vector<int64_t>& ids) {
     const int64_t n = static_cast<int64_t>(ids.size()), hidden = table.size(1);
-    Tensor out = device_alloc({n, hidden});
+    Tensor out = device_alloc({n, hidden});  // fp32 activations, even from an fp16 table
     int64_t* d_ids = nullptr;
     cuda_check(cudaMalloc(&d_ids, n * sizeof(int64_t)), "embedding ids malloc");
     cuda_check(cudaMemcpy(d_ids, ids.data(), n * sizeof(int64_t), cudaMemcpyHostToDevice),
                "embedding ids H2D");
-    embedding_kernel<<<grid1d(n * hidden, kBlock), kBlock>>>(dptr(table), d_ids, dptr(out), n, hidden);
+    const int blocks = grid1d(n * hidden, kBlock);
+    if (table.dtype() == DType::F16)  // G5d: embed_tokens uploaded as half (the largest weight)
+        embedding_kernel<half><<<blocks, kBlock>>>(static_cast<const half*>(table.device_ptr()),
+                                                   d_ids, dptr(out), n, hidden);
+    else
+        embedding_kernel<float><<<blocks, kBlock>>>(dptr(table), d_ids, dptr(out), n, hidden);
     launch_check("embedding_kernel");
     cudaFree(d_ids);
     return out;

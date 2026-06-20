@@ -242,9 +242,14 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
         weights are small, so fp16 is ~free) and it halves the layer-weight device memory. But
         it did NOT make wmma win (wmma-h ≈ wmma-fp32 ≈ 2.6 < tiled 4.1 TFLOP/s — the kernel is
         FEEDING-bound, not byte-bound) and decode is only ~1.07× (overhead-bound). Real value:
-        ~free memory + the dtype path int8 builds on. Still ahead: optimize wmma (128² tiles +
-        cp.async double-buffer) so it actually wins, then int8×int8→int32 (C4 weights) +
-        quantize lm_head.
+        ~free memory + the dtype path int8 builds on. **fp16 embed/lm_head then landed**
+        (is_fp16_weight extends the opt-in to embed_tokens — the single largest weight, ~544 MB,
+        tied as the lm_head; a templated embedding gather reads the fp16 table, and the tied
+        lm_head linear already took F16): greedy still MATCHES golden with the logits themselves
+        produced in fp16 (max|diff| 3.6e-5, ~unchanged from the fp32-GPU 3.5e-5 — fp16 lm_head is
+        ~free even feeding argmax), and total device weight storage halves 1979→991 MB (2.00×,
+        run_cuda_parity). Still ahead: optimize wmma (128² tiles + cp.async double-buffer) so it
+        actually wins, then int8×int8→int32 (C4 weights) + int8-quantize the embedding/lm_head.
   - [x] **G5e** — attention, the GEMM's successor on the critical path. Once G5c+ made the
         matmuls fast, a prefill=128 step was only ~15ms of matmul out of ~55ms — the naive G2
         attention dominated. It ran one THREAD per (head,query): just H·sq = 1792 threads (~3% of
@@ -273,7 +278,8 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
 Open candidates, not a closed/deferred-forever list — fold one into a stage when it's
 the right moment:
 - int8×int8→int32 GEMM — C4 quant is weight-only today (saves memory, not compute); fits G5d.
-- quantize embedding / lm_head — the biggest single weight; fits G5d.
+- int8-quantize embedding / lm_head — the biggest single weight. fp16 storage landed (G5d:
+  ~free, 2× smaller, golden MATCH); int8 still open (pairs with the int8 GEMM above).
 - batched sampling — the token draw is still per-sequence in Python; fits the G4/G5 decode path.
 - SIMD nibble-unpack for q4/q4g — helps compute-bound q4 prefill.
 - NEON `simd.hpp` `#elif` path — the cross-platform leg above.

@@ -59,7 +59,8 @@ public:
     // The device this model computes on (CPU, or CUDA after a -DNI_CUDA build).
     Device device() const { return backend_->device(); }
 
-    // {actual weight bytes, bytes if everything were fp32} — for the Q8 report.
+    // {actual weight bytes, bytes if everything were fp32} — the storage-savings report
+    // (quantization, and fp16 device weights under g_cuda_fp16_weights).
     std::pair<int64_t, int64_t> weight_bytes() const;
 
 private:
