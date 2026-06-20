@@ -46,7 +46,7 @@ static bool check_linear(int64_t m, int64_t n, int64_t k, double tol, bool f16w,
     for (int64_t i = 0; i < y_cpu.numel(); ++i)
         maxdiff = std::max(maxdiff, std::fabs(static_cast<double>(y_cpu[i]) - y_gpu[i]));
     const bool ok = maxdiff < tol;
-    const char* kern = f16w ? (m <= 16 ? "gemv-h" : "wmma-h")
+    const char* kern = f16w ? (m <= 16 ? "gemv-h" : (n >= 8192 ? "wmma-h" : "tiled-h"))
                             : (g_cuda_use_wmma ? "wmma" : (m <= 16 ? "gemv" : "tiled"));
     std::printf("test_cuda: [%4lld x %4lld] @ [%6lld x %4lld]^T (%-6s) max|diff|=%.3e (tol %.0e) %s\n",
                 (long long)m, (long long)k, (long long)n, (long long)k, kern, maxdiff, tol,
@@ -135,12 +135,13 @@ int main() {
     ok &= check_linear(100, 8192, 896, 5e-1, false, rng);  // wmma 128², large n + ragged m
     g_cuda_use_wmma = false;
 
-    // fp16 WEIGHTS (G5d): weight uploaded as half -> gemv-h (decode) / wmma-h (prefill, 64² or
-    // 128² warp-tiled for large n).
+    // fp16 WEIGHTS (G5d): gemv-h (decode); prefill projections (n<8192) -> CUDA-core float4 tiled
+    // (tiled-h: fp16-weight-only error, fp32 compute, so tighter than wmma's fp16-accumulate);
+    // lm_head (n>=8192) -> 128² warp-tiled tensor cores (wmma-h).
     ok &= check_linear(4, 896, 896, 1e-1, true, rng);      // gemv-h (decode, fp16 weight)
-    ok &= check_linear(128, 896, 896, 3e-1, true, rng);    // wmma-h 64² (prefill, fp16 weight)
-    ok &= check_linear(100, 896, 4864, 1e0, true, rng);    // wmma-h 64², ragged + wide k
-    ok &= check_linear(128, 8192, 896, 5e-1, true, rng);   // wmma-h 128² warp-tiled, large n
+    ok &= check_linear(128, 896, 896, 1e-1, true, rng);    // tiled-h (prefill projection, fp16 weight)
+    ok &= check_linear(100, 896, 4864, 3e-1, true, rng);   // tiled-h, ragged m + wide k
+    ok &= check_linear(128, 8192, 896, 5e-1, true, rng);   // wmma-h 128² warp-tiled, large n (lm_head)
 
     // Embedding gather (G5d): fp32 table is an exact copy; fp16 table (embed_tokens path) costs
     // only the fp16 rounding of the looked-up rows.

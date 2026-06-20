@@ -257,9 +257,17 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
         run_cuda_decode_bench): the layer projections run the 64² wmma-h kernel, which loses to the
         fp32 tiled GEMM (q/o 2610<5425, down 3062<5271 — small n + wmma overhead), and they are 168
         of the 169 prefill matmuls. Decode wins (gemv-h, ½ bytes: 83→101 tok/s, 1.22×) and memory is
-        2×. Still ahead: make the fp16 PROJECTIONS win — cp.async double-buffering to feed the wmma,
-        or an fp16-input CUDA-core tiled GEMM (½ DRAM bytes without the wmma overhead) — so full
-        prefill beats fp32; then int8×int8→int32 (C4 weights) + int8-quantize the embedding/lm_head.
+        2×. **fp16 projection tiled-h then landed**
+        (linear_tiled_vec_kernel templated on weight dtype + a load4 helper): the projections route to
+        the CUDA-core float4 tiled GEMM reading ½ the weight bytes (convert to fp32 in-register, fp32
+        compute), NOT wmma — wmma's fragment overhead loses at small n. tiled-h lifts the projections
+        from ~0.5× (wmma-h) to ~0.95× of fp32 tiled (they're compute-bound, so ½ bytes doesn't speed
+        them and the convert costs ~5%), but that stops swamping the lm_head wmma win, so end-to-end
+        fp16 prefill now BEATS fp32: 3253→3424 tok/s (1.05×, run_cuda_decode_bench). fp16 weights now
+        win on every axis — memory 2×, decode 1.21× (gemv-h), prefill 1.05× — golden tokens MATCH,
+        tiled-h error 8e-3 (fp16-weight-only + fp32 compute, tighter than wmma's fp16-accumulate). The
+        fp16 sub-track is done. Still ahead: int8×int8→int32 (C4 weights) + int8-quantize the
+        embedding/lm_head — the FLOP-reduction (compute) lever, vs fp16's byte-reduction.
   - [x] **G5e** — attention, the GEMM's successor on the critical path. Once G5c+ made the
         matmuls fast, a prefill=128 step was only ~15ms of matmul out of ~55ms — the naive G2
         attention dominated. It ran one THREAD per (head,query): just H·sq = 1792 threads (~3% of

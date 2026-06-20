@@ -140,6 +140,20 @@ __device__ inline float ldf(const half* w, size_t i) { return __half2float(w[i])
 __device__ inline half ldh(const float* w, size_t i) { return __float2half(w[i]); }
 __device__ inline half ldh(const half* w, size_t i) { return w[i]; }
 
+// Vectorized load of 4 consecutive weights as a float4, dtype-aware (G5d): fp32 reads one 16-byte
+// float4; fp16 reads 8 bytes (4 halfs) and converts. Lets one templated tiled GEMM stage either
+// weight dtype through the same float4 register path — fp16 just halves the weight DRAM bytes
+// (CUDA-core compute, no tensor-core / per-element-convert overhead). i is a multiple of 4 (the
+// tiled kernel's loadCol stride), so the fp16 half2 reads are 4-byte aligned.
+__device__ inline float4 load4(const float* w, size_t i) {
+    return *reinterpret_cast<const float4*>(w + i);
+}
+__device__ inline float4 load4(const half* w, size_t i) {
+    const half2* h = reinterpret_cast<const half2*>(w + i);
+    const float2 a = __half22float2(h[0]), b = __half22float2(h[1]);
+    return make_float4(a.x, a.y, b.x, b.y);
+}
+
 // y[i,o] = sum_j x[i,j]*w[o,j] + (bias?bias[o]:0). One thread per output (i,o).
 // w has one row per output feature (nn.Linear: y = x @ wᵀ + bias), so no transpose.
 __global__ void linear_kernel(const float* __restrict__ x, const float* __restrict__ w,
@@ -269,10 +283,12 @@ __global__ void linear_tiled_kernel(const float* __restrict__ x, const float* __
 // so BOTH stage by float4-reading along k and scattering transposed into a [BK][*] tile (As[kl][ml],
 // Bs[kl][nl]); symmetric. Alignment holds because k,n are multiples of 4 and every tile base lands
 // on a 4-float boundary, so each reinterpret_cast<float4*> address is 16-byte aligned.
-template <int BM, int BN, int BK, int TM, int TN>
-__global__ void linear_tiled_vec_kernel(const float* __restrict__ x, const float* __restrict__ w,
+template <typename WT, int BM, int BN, int BK, int TM, int TN>
+__global__ void linear_tiled_vec_kernel(const float* __restrict__ x, const WT* __restrict__ w,
                                         const float* __restrict__ bias, float* __restrict__ y, int m,
                                         int n, int k) {
+    // WT = float (fp32 weights) or half (fp16 weights, G5d). x (activations) is always fp32; only
+    // the weight global read differs (load4), and the staged Bs / register math stay fp32.
     constexpr int numThreads = (BM / TM) * (BN / TN);
     __shared__ float As[BK * BM];  // x tile, TRANSPOSED: As[kl * BM + ml]
     __shared__ float Bs[BK * BN];  // w tile, TRANSPOSED: Bs[kl * BN + nl]
@@ -306,7 +322,7 @@ __global__ void linear_tiled_vec_kernel(const float* __restrict__ x, const float
         for (int off = 0; off < BN; off += rowStrideB) {  // stage w, transposed into Bs
             const int nl = loadRow + off, go = colBase + nl, gk = kIdx + loadCol;
             // n % BN == 0 (precondition) → go is always valid; only k is strided, never ragged.
-            float4 t = *reinterpret_cast<const float4*>(&w[static_cast<size_t>(go) * k + gk]);
+            float4 t = load4(w, static_cast<size_t>(go) * k + gk);  // fp32 float4 or fp16 4-half load
             Bs[(loadCol + 0) * BN + nl] = t.x;
             Bs[(loadCol + 1) * BN + nl] = t.y;
             Bs[(loadCol + 2) * BN + nl] = t.z;
@@ -960,11 +976,12 @@ Tensor CudaBackend::linear(const Tensor& x, const Tensor& weight, const Tensor* 
     const float* bp = bias ? dptr(*bias) : nullptr;
     float* yp = dptr(y);
     const int mi = static_cast<int>(m), ni = static_cast<int>(n), ki = static_cast<int>(k);
-    // Pick the kernel. fp16 weights (G5d) read half directly: GEMV for decode, tensor cores
-    // for prefill (wmma then streams ½ the weight bytes with no convert — the path that wins).
-    // Otherwise the bench knob forces the naive GEMM (the A/B baseline); else small m (decode)
-    // is memory-bound → warp-GEMV (G5b), large m (prefill) is compute-bound → tiled GEMM
-    // (G5c). Each output row is independent in all paths, so batching never changes a row.
+    // Pick the kernel. fp16 weights (G5d) read half directly: GEMV-h for decode; for prefill, the
+    // 128² tensor-core kernel for the huge lm_head (where TC win) and the CUDA-core float4 tiled GEMM
+    // for the projections (where wmma's small-n fragment overhead loses) — both stream ½ the weight
+    // bytes. Otherwise the bench knob forces the naive GEMM (the A/B baseline); else small m (decode)
+    // is memory-bound → warp-GEMV (G5b), large m (prefill) is compute-bound → tiled GEMM (G5c).
+    // Each output row is independent in all paths, so batching never changes a row.
     constexpr int64_t kGemvMaxM = 16;
     if (weight.dtype() == DType::F16) {
         const half* wh = static_cast<const half*>(weight.device_ptr());
@@ -979,8 +996,19 @@ Tensor CudaBackend::linear(const Tensor& x, const Tensor& weight, const Tensor* 
             const dim3 grid((static_cast<unsigned>(n) + BN - 1) / BN,
                             (static_cast<unsigned>(m) + BM - 1) / BM);
             linear_wmma_tiled_kernel<half><<<grid, 256>>>(xp, wh, bp, yp, mi, ni, ki);
+        } else if (n % 128 == 0 && k % 16 == 0) {
+            // Projections (narrow n): fp16 weights through the CUDA-core float4 tiled GEMM — read ½
+            // the bytes (load4), convert to fp32 in-register, fp32 compute. Beats the 64² wmma-h
+            // here (small n + wmma fragment overhead make tensor cores lose); the same tuned tiled
+            // kernel as fp32, just halving the weight DRAM traffic. lm_head stays on wmma above.
+            constexpr int BM = 64, BN = 64, BK = 16, TM = 4, TN = 4;
+            constexpr int threads = (BM / TM) * (BN / TN);  // 256
+            const dim3 grid((static_cast<unsigned>(n) + BN - 1) / BN,
+                            (static_cast<unsigned>(m) + BM - 1) / BM);
+            linear_tiled_vec_kernel<half, BM, BN, BK, TM, TN><<<grid, threads>>>(xp, wh, bp, yp, mi,
+                                                                                 ni, ki);
         } else {
-            constexpr int BM = 64, BN = 64;  // narrower n: a 128-wide tile would starve the GPU
+            constexpr int BM = 64, BN = 64;  // ragged fallback: wmma bounds-checks every edge
             const dim3 grid((static_cast<unsigned>(n) + BN - 1) / BN,
                             (static_cast<unsigned>(m) + BM - 1) / BM);
             linear_wmma_kernel<half><<<grid, 128>>>(xp, wh, bp, yp, mi, ni, ki);
@@ -1027,7 +1055,8 @@ Tensor CudaBackend::linear(const Tensor& x, const Tensor& weight, const Tensor* 
             constexpr int threads = (BM / TM) * (BN / TN);  // 256
             const dim3 grid((static_cast<unsigned>(n) + BN - 1) / BN,
                             (static_cast<unsigned>(m) + BM - 1) / BM);
-            linear_tiled_vec_kernel<BM, BN, BK, TM, TN><<<grid, threads>>>(xp, wp, bp, yp, mi, ni, ki);
+            linear_tiled_vec_kernel<float, BM, BN, BK, TM, TN><<<grid, threads>>>(xp, wp, bp, yp, mi,
+                                                                                  ni, ki);
         }
     } else {
         // Fallback for shapes the vectorized kernel's divisibility preconditions don't cover
