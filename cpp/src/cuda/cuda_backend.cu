@@ -507,6 +507,79 @@ __global__ void linear_wmma_kernel(const float* __restrict__ x, const WT* __rest
     }
 }
 
+// Prefill on tensor cores, 128×128 WARP-TILED (G5d). The 64×64 linear_wmma_kernel above starves the
+// Ada tensor cores: a 64×64 / BK=16 tile is only ~32 FLOP/byte, far under the fp16 roofline ridge
+// (~282 FLOP/byte at 142 TFLOP/s), so it loses even to the fp32 tiled GEMM. This stages a 128×128
+// block tile and gives each of 8 warps a 64×32 region = a 4×2 grid of 16×16×16 wmma fragments, so
+// each staged smem word feeds 8 tensor-core MMAs (the compute-to-smem ratio a TC GEMM lives on) and
+// each warp reloads only 4 A- + 2 B-fragments per K-step. Aimed at the huge lm_head (n=151936):
+// >1000 blocks, so cross-block occupancy hides the per-K-tile load-sync stall even without cp.async
+// (that's the next lever, for the lower-occupancy projection shapes). x (activations) is always fp32,
+// staged to half; w is fp32 or fp16 (WT) read via ldh. fp16 inputs, fp32 accumulate — same mixed
+// precision as the 64² kernel, so the same ~fp16 accuracy cost. n%128==0 and k%16==0 (the dispatch
+// guarantees it); only m is ragged, bounds-checked at the store.
+template <typename WT>
+__global__ void linear_wmma_tiled_kernel(const float* __restrict__ x, const WT* __restrict__ w,
+                                         const float* __restrict__ bias, float* __restrict__ y,
+                                         int m, int n, int k) {
+    using namespace nvcuda;
+    constexpr int BM = 128, BN = 128, BK = 16;
+    constexpr int WARPS_M = 2, WARPS_N = 4, NUM_WARPS = WARPS_M * WARPS_N;  // 8 warps = 256 threads
+    constexpr int WMROWS = BM / WARPS_M, WNCOLS = BN / WARPS_N;             // 64×32 per warp
+    constexpr int MFRAG = WMROWS / 16, NFRAG = WNCOLS / 16;                 // 4×2 frags per warp
+    __shared__ half As[BM * BK];              // x tile [BM][BK], row-major (M-major)
+    __shared__ half Bs[BK * BN];              // w tile [BK][BN], row-major (K-major)
+    __shared__ float Cs[NUM_WARPS][16 * 16];  // per-warp 16×16 epilogue staging (bias + bounds)
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const int warpId = tid / 32, lane = tid % 32;
+    const int warpRow = warpId / WARPS_N, warpCol = warpId % WARPS_N;  // 2×4 warp grid
+    const int rowBase = static_cast<int>(blockIdx.y) * BM;
+    const int colBase = static_cast<int>(blockIdx.x) * BN;
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[MFRAG][NFRAG];
+    for (int i = 0; i < MFRAG; ++i)
+        for (int j = 0; j < NFRAG; ++j) wmma::fill_fragment(acc[i][j], 0.0f);
+
+    for (int kk = 0; kk < k; kk += BK) {
+        for (int idx = tid; idx < BM * BK; idx += NUM_WARPS * 32) {  // stage x (k fastest: coalesced)
+            const int r = idx / BK, c = idx % BK, gr = rowBase + r;
+            As[r * BK + c] = (gr < m) ? __float2half(x[static_cast<size_t>(gr) * k + kk + c])
+                                      : __float2half(0.0f);
+        }
+        for (int idx = tid; idx < BK * BN; idx += NUM_WARPS * 32) {  // stage w (k fastest: coalesced)
+            const int o = idx / BK, c = idx % BK, go = colBase + o;
+            Bs[c * BN + o] =
+                (go < n) ? ldh(w, static_cast<size_t>(go) * k + kk + c) : __float2half(0.0f);
+        }
+        __syncthreads();
+        // Reload this warp's A/B fragments once, then 8 MMAs reuse them (the warp-tile leverage).
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> aFrag[MFRAG];
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> bFrag[NFRAG];
+        for (int i = 0; i < MFRAG; ++i)
+            wmma::load_matrix_sync(aFrag[i], As + (warpRow * WMROWS + i * 16) * BK, BK);
+        for (int j = 0; j < NFRAG; ++j)
+            wmma::load_matrix_sync(bFrag[j], Bs + (warpCol * WNCOLS + j * 16), BN);
+        for (int i = 0; i < MFRAG; ++i)
+            for (int j = 0; j < NFRAG; ++j) wmma::mma_sync(acc[i][j], aFrag[i], bFrag[j], acc[i][j]);
+        __syncthreads();
+    }
+
+    for (int i = 0; i < MFRAG; ++i)
+        for (int j = 0; j < NFRAG; ++j) {
+            wmma::store_matrix_sync(Cs[warpId], acc[i][j], 16, wmma::mem_row_major);
+            __syncwarp();
+            const int r0 = rowBase + warpRow * WMROWS + i * 16;
+            const int c0 = colBase + warpCol * WNCOLS + j * 16;
+            for (int e = lane; e < 16 * 16; e += 32) {
+                const int gr = r0 + e / 16, gc = c0 + e % 16;
+                if (gr < m && gc < n)
+                    y[static_cast<size_t>(gr) * n + gc] = Cs[warpId][e] + (bias ? bias[gc] : 0.0f);
+            }
+            __syncwarp();
+        }
+}
+
 // out[r,c] = table[ids[r], c]. One thread per output element; ids already on device. Templated
 // on the table type so an fp16 embedding (G5d: embed_tokens, the largest weight, uploaded as
 // half) reads through ldf and converts to fp32 on store — activations stay fp32, only the
@@ -899,8 +972,15 @@ Tensor CudaBackend::linear(const Tensor& x, const Tensor& weight, const Tensor* 
             const int threads = 128;
             const int blocks = static_cast<int>((n + threads / 32 - 1) / (threads / 32));
             linear_gemv_kernel<half><<<blocks, threads>>>(xp, wh, bp, yp, mi, ni, ki);
+        } else if (n >= 8192 && n % 128 == 0 && k % 16 == 0) {
+            // lm_head: huge n, compute-bound — 128² warp-tiled tensor cores (8 frags/warp). >1000
+            // blocks, so cross-block occupancy hides the load-sync stall (cp.async is the next lever).
+            constexpr int BM = 128, BN = 128;
+            const dim3 grid((static_cast<unsigned>(n) + BN - 1) / BN,
+                            (static_cast<unsigned>(m) + BM - 1) / BM);
+            linear_wmma_tiled_kernel<half><<<grid, 256>>>(xp, wh, bp, yp, mi, ni, ki);
         } else {
-            constexpr int BM = 64, BN = 64;
+            constexpr int BM = 64, BN = 64;  // narrower n: a 128-wide tile would starve the GPU
             const dim3 grid((static_cast<unsigned>(n) + BN - 1) / BN,
                             (static_cast<unsigned>(m) + BM - 1) / BM);
             linear_wmma_kernel<half><<<grid, 128>>>(xp, wh, bp, yp, mi, ni, ki);
@@ -915,10 +995,17 @@ Tensor CudaBackend::linear(const Tensor& x, const Tensor& weight, const Tensor* 
         const int blocks = static_cast<int>((n + threads / 32 - 1) / (threads / 32));
         linear_gemv_kernel<float><<<blocks, threads>>>(xp, wp, bp, yp, mi, ni, ki);
     } else if (g_cuda_use_wmma) {
-        constexpr int BM = 64, BN = 64;  // 2×2 warps = 128 threads compute a 64×64 tile
-        const dim3 grid((static_cast<unsigned>(n) + BN - 1) / BN,
-                        (static_cast<unsigned>(m) + BM - 1) / BM);
-        linear_wmma_kernel<float><<<grid, 128>>>(xp, wp, bp, yp, mi, ni, ki);
+        if (n >= 8192 && n % 128 == 0 && k % 16 == 0) {  // large n: 128² warp-tiled tensor cores
+            constexpr int BM = 128, BN = 128;
+            const dim3 grid((static_cast<unsigned>(n) + BN - 1) / BN,
+                            (static_cast<unsigned>(m) + BM - 1) / BM);
+            linear_wmma_tiled_kernel<float><<<grid, 256>>>(xp, wp, bp, yp, mi, ni, ki);
+        } else {
+            constexpr int BM = 64, BN = 64;  // 2×2 warps = 128 threads compute a 64×64 tile
+            const dim3 grid((static_cast<unsigned>(n) + BN - 1) / BN,
+                            (static_cast<unsigned>(m) + BM - 1) / BM);
+            linear_wmma_kernel<float><<<grid, 128>>>(xp, wp, bp, yp, mi, ni, ki);
+        }
     } else if (n % 128 == 0 && k % 16 == 0) {
         // G5c+: float4-vectorized tiled GEMM (transposed-As smem, 128-bit loads/stores). Two tile
         // sizes, picked by output width n — every real Qwen linear meets the n%128, k%16 gate, and

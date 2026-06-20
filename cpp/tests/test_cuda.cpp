@@ -126,16 +126,21 @@ int main() {
     ok &= check_linear(128, 8192, 896, 5e-3, false, rng);  // tiled-vec 128×128, large n (lm_head path)
     ok &= check_linear(100, 8192, 896, 5e-3, false, rng);  // tiled-vec 128×128, large n + ragged m
 
-    // Tensor-core (fp32 weight, fp16 staged) — the max|diff| is the fp16 cost.
+    // Tensor-core (fp32 weight, fp16 staged) — the max|diff| is the fp16 cost. n<8192 hits the 64²
+    // kernel; n>=8192 the 128² warp-tiled kernel (the lm_head path).
     g_cuda_use_wmma = true;
-    ok &= check_linear(128, 896, 896, 3e-1, false, rng);   // wmma, square
-    ok &= check_linear(100, 896, 4864, 1e0, false, rng);   // wmma, ragged + wide k
+    ok &= check_linear(128, 896, 896, 3e-1, false, rng);   // wmma 64², square
+    ok &= check_linear(100, 896, 4864, 1e0, false, rng);   // wmma 64², ragged + wide k
+    ok &= check_linear(128, 8192, 896, 5e-1, false, rng);  // wmma 128² warp-tiled, large n
+    ok &= check_linear(100, 8192, 896, 5e-1, false, rng);  // wmma 128², large n + ragged m
     g_cuda_use_wmma = false;
 
-    // fp16 WEIGHTS (G5d): weight uploaded as half -> gemv-h (decode) / wmma-h (prefill).
+    // fp16 WEIGHTS (G5d): weight uploaded as half -> gemv-h (decode) / wmma-h (prefill, 64² or
+    // 128² warp-tiled for large n).
     ok &= check_linear(4, 896, 896, 1e-1, true, rng);      // gemv-h (decode, fp16 weight)
-    ok &= check_linear(128, 896, 896, 3e-1, true, rng);    // wmma-h (prefill, fp16 weight)
-    ok &= check_linear(100, 896, 4864, 1e0, true, rng);    // wmma-h, ragged + wide k
+    ok &= check_linear(128, 896, 896, 3e-1, true, rng);    // wmma-h 64² (prefill, fp16 weight)
+    ok &= check_linear(100, 896, 4864, 1e0, true, rng);    // wmma-h 64², ragged + wide k
+    ok &= check_linear(128, 8192, 896, 5e-1, true, rng);   // wmma-h 128² warp-tiled, large n
 
     // Embedding gather (G5d): fp32 table is an exact copy; fp16 table (embed_tokens path) costs
     // only the fp16 rounding of the looked-up rows.

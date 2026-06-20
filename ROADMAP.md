@@ -248,8 +248,18 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
         lm_head linear already took F16): greedy still MATCHES golden with the logits themselves
         produced in fp16 (max|diff| 3.6e-5, ~unchanged from the fp32-GPU 3.5e-5 — fp16 lm_head is
         ~free even feeding argmax), and total device weight storage halves 1979→991 MB (2.00×,
-        run_cuda_parity). Still ahead: optimize wmma (128² tiles + cp.async double-buffer) so it
-        actually wins, then int8×int8→int32 (C4 weights) + int8-quantize the embedding/lm_head.
+        run_cuda_parity). **128² warp-tiled wmma then landed** for lm_head
+        (linear_wmma_tiled_kernel, n≥8192): 8 wmma frags/warp over a 128×128 tile, >1000 blocks so
+        cross-block occupancy hides the load-sync stall. The decisive finding is that wmma only wins
+        with fp16 STORAGE — lm_head fp16 128² hits 17.6k GFLOP/s (1.32× the fp32 warp-tiled 13.3k,
+        105% of cuBLAS sgemm), while the fp32-weight wmma path (4-byte read + per-tile convert) is a
+        LOSER at 11.2k < fp32-tiled. BUT end-to-end fp16 prefill still REGRESSES (3460→2529 tok/s,
+        run_cuda_decode_bench): the layer projections run the 64² wmma-h kernel, which loses to the
+        fp32 tiled GEMM (q/o 2610<5425, down 3062<5271 — small n + wmma overhead), and they are 168
+        of the 169 prefill matmuls. Decode wins (gemv-h, ½ bytes: 83→101 tok/s, 1.22×) and memory is
+        2×. Still ahead: make the fp16 PROJECTIONS win — cp.async double-buffering to feed the wmma,
+        or an fp16-input CUDA-core tiled GEMM (½ DRAM bytes without the wmma overhead) — so full
+        prefill beats fp32; then int8×int8→int32 (C4 weights) + int8-quantize the embedding/lm_head.
   - [x] **G5e** — attention, the GEMM's successor on the critical path. Once G5c+ made the
         matmuls fast, a prefill=128 step was only ~15ms of matmul out of ~55ms — the naive G2
         attention dominated. It ran one THREAD per (head,query): just H·sq = 1792 threads (~3% of
