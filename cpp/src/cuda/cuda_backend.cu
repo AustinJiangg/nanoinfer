@@ -89,7 +89,8 @@ DevicePool& pool() {
 Tensor device_alloc(const std::vector<int64_t>& shape, DType dt = DType::F32) {
     Tensor d(shape, Device::CUDA);
     d.set_dtype(dt);
-    const size_t elem = (dt == DType::F16) ? sizeof(half) : sizeof(float);
+    const size_t elem =
+        (dt == DType::F16) ? sizeof(half) : (dt == DType::I8) ? sizeof(int8_t) : sizeof(float);
     const size_t nbytes = static_cast<size_t>(d.numel()) * elem;
     if (nbytes == 0) return d;  // empty tensor (e.g. an unfilled KV history): no buffer
     void* p = pool().acquire(nbytes);
@@ -596,6 +597,100 @@ __global__ void linear_wmma_tiled_kernel(const float* __restrict__ x, const WT* 
         }
 }
 
+// Round-half-to-even + clamp to [-127,127], NaN->0 — mirrors quant.cpp round_clamp EXACTLY (rintf
+// == std::nearbyint under the default rounding mode), so device activation quant produces the same
+// int8 codes as the CPU oracle and the integer GEMM core is identical end-to-end.
+__device__ inline int8_t quant_round(float v, float scale) {
+    if (!(scale > 0.0f)) return 0;                  // all-zero row (scale 0) or NaN scale -> 0
+    float r = rintf(v / scale);
+    r = fmaxf(-127.0f, fminf(127.0f, r));           // clamp BEFORE the cast
+    if (isnan(r)) return 0;                          // NaN input slips the clamps -> 0
+    return static_cast<int8_t>(r);
+}
+
+// Dynamic per-row int8 activation quantization (W8A8, G5d): a_scale[i] = max_j|x[i,j]|/127, then
+// xq = round(x/a_scale). One block per row; threads stride the row for a shared-memory max-reduction
+// (max is exact/order-free, so a_scale matches the CPU's sequential max bit-for-bit), then quantize.
+// blockDim must be a power of two for the reduction. xq is bit-identical to quant.cpp's per-row quant.
+__global__ void activation_quant_kernel(const float* __restrict__ x, int8_t* __restrict__ xq,
+                                        float* __restrict__ a_scale, int m, int k) {
+    const int row = blockIdx.x;
+    if (row >= m) return;
+    const float* xr = x + static_cast<size_t>(row) * k;
+    int8_t* qr = xq + static_cast<size_t>(row) * k;
+    const int tid = static_cast<int>(threadIdx.x), nt = static_cast<int>(blockDim.x);
+
+    __shared__ float red[256];
+    float local = 0.0f;
+    for (int j = tid; j < k; j += nt) local = fmaxf(local, fabsf(xr[j]));
+    red[tid] = local;
+    __syncthreads();
+    for (int s = nt / 2; s > 0; s >>= 1) {
+        if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+        __syncthreads();
+    }
+    const float scale = red[0] / 127.0f;
+    if (tid == 0) a_scale[row] = scale;
+    for (int j = tid; j < k; j += nt) qr[j] = quant_round(xr[j], scale);
+}
+
+// W8A8 GEMM: int8×int8 → int32 via __dp4a, dual-scale dequant (G5d) — the int8-COMPUTE win that
+// weight-only Q8/fp16 can't get (fp16 only ties on the compute-bound projections). xq [m,k] and
+// wq [n,k] are int8 row-major (K contiguous). Both tiles stage K-contiguous (As [BM][BK], Bs N-major
+// [BN][BK]) so each thread packs 4 int8 into an int and __dp4a does 4 MACs at once into an int32
+// accumulator — exact, identical to the CPU dot_qq. Dequant folds in at the store:
+// y = acc · a_scale[row] · w_scale[col] + bias. BK%4==0 and k%BK==0 (dispatch); m,n ragged (checked).
+template <int BM, int BN, int BK, int TM, int TN>
+__global__ void linear_w8a8_kernel(const int8_t* __restrict__ xq, const int8_t* __restrict__ wq,
+                                   const float* __restrict__ a_scale,
+                                   const float* __restrict__ w_scale, const float* __restrict__ bias,
+                                   float* __restrict__ y, int m, int n, int k) {
+    constexpr int numThreads = (BM / TM) * (BN / TN);
+    __shared__ int8_t As[BM * BK];  // xq tile [BM][BK], K-contiguous
+    __shared__ int8_t Bs[BN * BK];  // wq tile [BN][BK], N-major + K-contiguous (for DP4A packing)
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const int threadRow = tid / (BN / TN), threadCol = tid % (BN / TN);
+    const int rowBase = static_cast<int>(blockIdx.y) * BM, colBase = static_cast<int>(blockIdx.x) * BN;
+
+    int32_t acc[TM * TN] = {0};
+
+    for (int kk = 0; kk < k; kk += BK) {
+        for (int idx = tid; idx < BM * BK; idx += numThreads) {  // stage xq (K-contiguous: coalesced)
+            const int r = idx / BK, c = idx % BK, gr = rowBase + r;
+            As[idx] = (gr < m) ? xq[static_cast<size_t>(gr) * k + kk + c] : int8_t(0);
+        }
+        for (int idx = tid; idx < BN * BK; idx += numThreads) {  // stage wq (K-contiguous: coalesced)
+            const int o = idx / BK, c = idx % BK, go = colBase + o;
+            Bs[idx] = (go < n) ? wq[static_cast<size_t>(go) * k + kk + c] : int8_t(0);
+        }
+        __syncthreads();
+        for (int g = 0; g < BK; g += 4) {  // DP4A over 4-int8 groups
+            int aPack[TM], bPack[TN];
+            for (int i = 0; i < TM; ++i)
+                aPack[i] = *reinterpret_cast<const int*>(&As[(threadRow * TM + i) * BK + g]);
+            for (int j = 0; j < TN; ++j)
+                bPack[j] = *reinterpret_cast<const int*>(&Bs[(threadCol * TN + j) * BK + g]);
+            for (int i = 0; i < TM; ++i)
+                for (int j = 0; j < TN; ++j)
+                    acc[i * TN + j] = __dp4a(aPack[i], bPack[j], acc[i * TN + j]);
+        }
+        __syncthreads();
+    }
+
+    for (int i = 0; i < TM; ++i) {
+        const int gr = rowBase + threadRow * TM + i;
+        if (gr >= m) continue;
+        const float as = a_scale[gr];
+        for (int j = 0; j < TN; ++j) {
+            const int gc = colBase + threadCol * TN + j;
+            if (gc >= n) continue;
+            y[static_cast<size_t>(gr) * n + gc] =
+                float(acc[i * TN + j]) * as * w_scale[gc] + (bias ? bias[gc] : 0.0f);
+        }
+    }
+}
+
 // out[r,c] = table[ids[r], c]. One thread per output element; ids already on device. Templated
 // on the table type so an fp16 embedding (G5d: embed_tokens, the largest weight, uploaded as
 // half) reads through ldf and converts to fp32 on store — activations stay fp32, only the
@@ -947,6 +1042,39 @@ Tensor to_device_f16(const Tensor& host) {
                                                          static_cast<half*>(d.device_ptr()), n);
     launch_check("f32_to_f16_kernel");
     return d;  // `src` (fp32 temp) returns to the pool here
+}
+
+Tensor to_device_i8(const int8_t* host, const std::vector<int64_t>& shape) {
+    Tensor d = device_alloc(shape, DType::I8);
+    const int64_t n = d.numel();
+    if (n > 0)
+        cuda_check(cudaMemcpy(d.device_ptr(), host, static_cast<size_t>(n) * sizeof(int8_t),
+                              cudaMemcpyHostToDevice),
+                   "to_device_i8");
+    return d;
+}
+
+Tensor cuda_linear_w8a8(const Tensor& x, const Tensor& wq, const Tensor& w_scale,
+                        const Tensor* bias) {
+    const int64_t m = x.size(0), k = x.size(1), n = wq.size(0);
+    Tensor xq = device_alloc({m, k}, DType::I8);
+    Tensor a_scale = device_alloc({m}, DType::F32);
+    activation_quant_kernel<<<static_cast<unsigned>(m), 256>>>(
+        dptr(x), static_cast<int8_t*>(xq.device_ptr()), dptr(a_scale), static_cast<int>(m),
+        static_cast<int>(k));
+    launch_check("activation_quant_kernel");
+
+    Tensor y = device_alloc({m, n});
+    constexpr int BM = 64, BN = 64, BK = 16, TM = 4, TN = 4;
+    constexpr int threads = (BM / TM) * (BN / TN);  // 256
+    const dim3 grid((static_cast<unsigned>(n) + BN - 1) / BN,
+                    (static_cast<unsigned>(m) + BM - 1) / BM);
+    linear_w8a8_kernel<BM, BN, BK, TM, TN><<<grid, threads>>>(
+        static_cast<const int8_t*>(xq.device_ptr()), static_cast<const int8_t*>(wq.device_ptr()),
+        dptr(a_scale), dptr(w_scale), bias ? dptr(*bias) : nullptr, dptr(y), static_cast<int>(m),
+        static_cast<int>(n), static_cast<int>(k));
+    launch_check("linear_w8a8_kernel");
+    return y;
 }
 
 Device CudaBackend::device() const { return Device::CUDA; }

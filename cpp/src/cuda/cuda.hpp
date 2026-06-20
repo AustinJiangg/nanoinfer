@@ -25,4 +25,14 @@ Tensor to_device_f16(const Tensor& host);
 // Copy a device tensor back down to the CPU (D2H). Returns a host tensor.
 Tensor to_host(const Tensor& dev);
 
+// Upload int8 codes (a QTensor's q) to a device I8 tensor of `shape` (G5d W8A8 weights). One H2D.
+Tensor to_device_i8(const int8_t* host, const std::vector<int64_t>& shape);
+
+// W8A8 GEMM on the GPU (G5d): x fp32 [m,k] on device; wq int8 [n,k] + w_scale fp32 [n] on device;
+// bias fp32 [n] or null. Quantizes x per-row to int8 on device, runs the int8×int8→int32 DP4A GEMM,
+// dequantizes with both scales -> fp32 y [m,n] on device. The integer core matches the CPU
+// linear_w8a8 oracle exactly; only the float dequant drifts (the usual accelerator tolerance).
+// Requires k % 16 == 0 (the DP4A tile's K step); m and n may be ragged.
+Tensor cuda_linear_w8a8(const Tensor& x, const Tensor& wq, const Tensor& w_scale, const Tensor* bias);
+
 }  // namespace ni

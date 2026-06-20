@@ -272,9 +272,16 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
         int8×int8→int32 integer dot (exact — AVX2 madd == scalar == a GPU DP4A int32 accumulate),
         dual-scale dequant. run_quant w8a8 on Qwen2.5-0.5B: same 2.18× memory as Q8 (same weight),
         logit err 11.2 vs Q8's 3.8 (the added activation quant), but next-token preserved and 11/12
-        greedy == Q8 — accuracy is fine; the point is the compute. Still ahead: the GPU DP4A int8
-        kernel (the actual compute win on the projections fp16 could only tie) + int8-quantize the
-        embedding/lm_head.
+        greedy == Q8 — accuracy is fine; the point is the compute. **GPU DP4A int8 GEMM then landed**
+        (cuda_linear_w8a8: device per-row activation quant + a 64² __dp4a tile, int32 accumulate,
+        dual-scale dequant; DType::I8 device buffers): parity vs the CPU oracle is max|diff| 3.8e-6 —
+        the integer core is identical (DP4A int32 == dot_qq), only the float dequant drifts. The
+        compute win fp16 lacked — int8 beats the float4 fp32 tiled on the compute-bound matmuls:
+        gate/up 1.11×, down 1.14×, lm_head 1.36× (run_cuda_bench m=128); the tiny q/o,k/v lose 0.88×
+        (basic tile + the activation-quant pass dominate at small n). Even a basic DP4A tile beating
+        the tuned fp32 shows the 4:1-MAC lever. Still ahead: wire W8A8 into the GPU model forward for
+        end-to-end golden tokens (a device CudaW8A8Weight in qweights_), and int8-quantize the
+        embedding/lm_head (the biggest weight — but it feeds argmax, so guard the tokens).
   - [x] **G5e** — attention, the GEMM's successor on the critical path. Once G5c+ made the
         matmuls fast, a prefill=128 step was only ~15ms of matmul out of ~55ms — the naive G2
         attention dominated. It ran one THREAD per (head,query): just H·sq = 1792 threads (~3% of

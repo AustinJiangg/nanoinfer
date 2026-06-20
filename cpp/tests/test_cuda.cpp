@@ -20,6 +20,7 @@
 #include "backend.hpp"
 #include "cuda/cuda.hpp"
 #include "cuda/cuda_backend.hpp"
+#include "quant.hpp"
 #include "tensor.hpp"
 
 using namespace ni;
@@ -110,6 +111,37 @@ static bool check_embedding(int64_t vocab, int64_t hidden, int64_t n, bool f16, 
     return ok;
 }
 
+// W8A8 DP4A GEMM (G5d) vs the CPU linear_w8a8 oracle. quantize_q8(w) gives the int8 weight + per-row
+// scales (uploaded to device); the GPU quantizes the activations itself. The integer core (dot_qq /
+// __dp4a) is identical, so the only gap is the float-vs-double dequant — a tight tolerance, not the
+// fp16 cost. k must be a multiple of 16 (the DP4A tile's K step).
+static bool check_w8a8(int64_t m, int64_t n, int64_t k, bool with_bias, double tol,
+                       std::mt19937& rng) {
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    Tensor x({m, k}), w({n, k}), bias({n});
+    for (int64_t i = 0; i < x.numel(); ++i) x[i] = dist(rng);
+    for (int64_t i = 0; i < w.numel(); ++i) w[i] = dist(rng);
+    for (int64_t i = 0; i < bias.numel(); ++i) bias[i] = dist(rng);
+
+    QTensor qw = quantize_q8(w);
+    Tensor y_cpu = linear_w8a8(x, qw, with_bias ? &bias : nullptr);  // oracle
+
+    Tensor ws({n});  // per-row weight scales as a tensor, to upload
+    for (int64_t o = 0; o < n; ++o) ws[o] = qw.scale[static_cast<size_t>(o)];
+    Tensor xd = to_device(x), wqd = to_device_i8(qw.q.data(), {n, k}), wsd = to_device(ws);
+    Tensor bd = to_device(bias);
+    Tensor y_gpu = to_host(cuda_linear_w8a8(xd, wqd, wsd, with_bias ? &bd : nullptr));
+
+    double maxdiff = 0.0;
+    for (int64_t i = 0; i < y_cpu.numel(); ++i)
+        maxdiff = std::max(maxdiff, std::fabs(static_cast<double>(y_cpu[i]) - y_gpu[i]));
+    const bool ok = maxdiff < tol;
+    std::printf("test_cuda: w8a8 [%4lld x %4lld] @ [%5lld x %4lld]^T %-7s max|diff|=%.3e (tol %.0e) %s\n",
+                (long long)m, (long long)k, (long long)n, (long long)k, with_bias ? "+bias" : "no-bias",
+                maxdiff, tol, ok ? "ok" : "FAIL");
+    return ok;
+}
+
 int main() {
     if (!cuda_available()) {
         std::printf("test_cuda: no CUDA device visible — skipping\n");
@@ -154,6 +186,13 @@ int main() {
     ok &= check_attention(2, 1, 100, 64, true, 99, 1e-3, rng);   // decode, large sk
     ok &= check_attention(3, 16, 16, 64, false, 0, 1e-3, rng);   // full (non-causal)
     ok &= check_attention(1, 64, 64, 64, true, 0, 1e-3, rng);    // longer prefill, multiple lane passes
+
+    // W8A8 DP4A int8 GEMM (G5d): the projection shapes, prefill + small m, with and without bias.
+    // The integer core is identical to the CPU oracle, so the tolerance is just the float dequant.
+    ok &= check_w8a8(128, 896, 896, true, 2e-3, rng);    // q/o prefill, +bias
+    ok &= check_w8a8(128, 4864, 896, false, 2e-3, rng);  // gate/up prefill, no bias
+    ok &= check_w8a8(100, 896, 4864, false, 2e-3, rng);  // down: ragged m + wide k
+    ok &= check_w8a8(4, 896, 896, true, 2e-3, rng);      // small m (decode-ish), +bias
 
     std::printf("test_cuda: %s\n", ok ? "ok" : "FAIL");
     return ok ? 0 : 1;

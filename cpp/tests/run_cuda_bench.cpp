@@ -29,6 +29,7 @@
 #include "backend.hpp"
 #include "cuda/cuda.hpp"
 #include "cuda/cuda_backend.hpp"
+#include "quant.hpp"
 #include "tensor.hpp"
 
 using namespace ni;
@@ -164,6 +165,46 @@ int main() {
                         cublas_gflops, maxdiff);
         }
         std::printf("\n");
+    }
+
+    // --- int8 W8A8 (DP4A) vs fp32 tiled, prefill m=128 — the COMPUTE win (fp16 only TIED here,
+    // since the compute-bound projections aren't byte-bound; int8 cuts the MACs 4:1 via __dp4a).
+    // The int8 time INCLUDES the per-call activation quant (realistic — the model quantizes the
+    // activations every forward). "vs fp32" is the W8A8 quantization error, not a kernel check
+    // (parity is test_cuda vs the CPU oracle). ---
+    g_cuda_fp16_weights = false;
+    g_cuda_use_wmma = false;
+    std::printf("\nint8 W8A8 (DP4A) vs fp32 tiled, prefill m=128 (int8 time incl. activation quant):\n");
+    std::printf("%-9s %10s %10s %8s | %10s\n", "shape", "int8 GF/s", "fp32 GF/s", "speedup",
+                "quant err");
+    {
+        const int64_t m = 128;
+        for (const Shape& sh : shapes) {
+            const int64_t n = sh.n, k = sh.k;
+            if (k % 16 != 0) continue;  // DP4A tile needs k%16==0 (every Qwen linear qualifies)
+            Tensor x({m, k}), w({n, k});
+            for (int64_t i = 0; i < x.numel(); ++i) x[i] = dist(rng);
+            for (int64_t i = 0; i < w.numel(); ++i) w[i] = dist(rng);
+            QTensor qw = quantize_q8(w);
+            Tensor ws({n});
+            for (int64_t o = 0; o < n; ++o) ws[o] = qw.scale[static_cast<size_t>(o)];
+            Tensor xd = to_device(x), wf32 = to_device(w);
+            Tensor wqd = to_device_i8(qw.q.data(), {n, k}), wsd = to_device(ws);
+            auto run_fp32 = [&] { Tensor y = gpu.linear(xd, wf32, nullptr); };
+            auto run_i8 = [&] { Tensor y = cuda_linear_w8a8(xd, wqd, wsd, nullptr); };
+            Tensor y_f = to_host(gpu.linear(xd, wf32, nullptr));
+            Tensor y_i = to_host(cuda_linear_w8a8(xd, wqd, wsd, nullptr));
+            double qerr = 0.0;
+            for (int64_t i = 0; i < y_f.numel(); ++i)
+                qerr = std::max(qerr, std::fabs((double)y_f[i] - y_i[i]));
+            const double fp32_ms = time_ms(run_fp32, 30, 5);
+            const double i8_ms = time_ms(run_i8, 30, 5);
+            const double flop = 2.0 * m * n * k;
+            const double i8_gf = flop / (i8_ms * 1e-3) / 1e9;
+            const double fp32_gf = flop / (fp32_ms * 1e-3) / 1e9;
+            std::printf("%-9s %10.0f %10.0f %7.2fx | %10.1e\n", sh.label, i8_gf, fp32_gf,
+                        fp32_ms / i8_ms, qerr);
+        }
     }
 
     cublasDestroy(handle);
