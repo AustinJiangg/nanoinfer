@@ -28,6 +28,20 @@ and uses OpenMP if found. Both are optional and degrade to the same numbers:
 `-DNI_NATIVE=OFF` falls back to the scalar inner products, and a toolchain
 without OpenMP runs single-threaded. Cap threads with `OMP_NUM_THREADS=N`.
 
+To exercise the **NEON** inner products (aarch64 / Apple M-series) on an x86 box,
+cross-compile with the checked-in toolchain file and run the tests under qemu-user
+(`cmake/aarch64-linux-gnu.cmake`; needs `g++-aarch64-linux-gnu` + `qemu-user-static`):
+
+```bash
+cmake -S . -B build-aarch64 -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64-linux-gnu.cmake \
+    -DNI_NATIVE=OFF -DCMAKE_DISABLE_FIND_PACKAGE_OpenMP=ON -DCMAKE_DISABLE_FIND_PACKAGE_pybind11=ON
+cmake --build build-aarch64 --target test_simd test_ops test_quant ops_parity -j
+ctest --test-dir build-aarch64 -R 'test_simd|test_ops|test_quant|ops_parity' --output-on-failure
+```
+
+This proves the NEON dots reproduce the scalar oracle (`simd target: neon`). qemu
+emulates the ISA, not the M4's timing — it's a correctness gate, not a benchmark.
+
 If `pybind11` is importable (`pip install pybind11`), the build also produces the
 `nicpp` Python module (stage F6) in `build/`; it's skipped cleanly otherwise, the
 same graceful degrade. See "Use from Python" below.
@@ -40,7 +54,7 @@ cpp/
     tensor.{hpp,cpp}     row-major contiguous float32 Tensor (shape/stride/data)
     ops.{hpp,cpp}        matmul, rmsnorm, softmax, add — naive, readable
     serialize.{hpp,cpp}  read/write the "NIT0" tensor format (the parity bridge)
-    simd.hpp             C5: AVX2/FMA dot products (double-accum), scalar fallback
+    simd.hpp             C5: AVX2/FMA + NEON dot products (double-accum), scalar fallback
     parallel.hpp         C5: OpenMP thread-count knobs for the kernels
   tests/
     test_util.hpp        dependency-free CHECK / CHECK_CLOSE / compare_tensors
@@ -290,11 +304,14 @@ what weight quantization (C4) attacks: q8 streams a quarter of the bytes, so q8 
 int8→float widening adds compute the now-compute-bound prefill can't hide (weight-only
 quant saves memory, not compute).
 
-On the backlog (open, not deferred-forever): a NEON path (slots into `simd.hpp` at the
-marked `#elif`), a SIMD nibble-unpack for q4/q4g (would help compute-bound q4 prefill,
-an uncommon path), and float32-accumulation — the further, lossy step llama.cpp takes.
-The last has a real cost: it would break the bit-for-bit CPU parity floor, so it's a
-conscious tolerance-trade, not a silent change.
+The **NEON** path is now in (the `#elif` in `simd.hpp`: `vfmaq_f64` double-accum for the
+float dots, `vmull_s8`+`vpadalq_s16` int32 for `dot_qq`), cross-compiled and qemu-parity-
+tested against the scalar oracle — `CpuBackend` runs on Apple ARM (correctness verified;
+M4 tok/s pending real hardware). Still on the backlog (open, not deferred-forever): a SIMD
+nibble-unpack for q4/q4g (would help compute-bound q4 prefill, an uncommon path), and
+float32-accumulation — the further, lossy step llama.cpp takes. The last has a real cost:
+it would break the bit-for-bit CPU parity floor, so it's a conscious tolerance-trade, not
+a silent change.
 
 ## Status
 

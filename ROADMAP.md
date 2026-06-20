@@ -308,8 +308,23 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
         max|diff|=0, golden MATCH), so both KV paths are now warp-parallel.
 
 ## Cross-platform (portability proof, after the GPU is learned)
-- [ ] **NEON** — fill `simd.hpp`'s `#elif` NEON path so `CpuBackend` runs on Apple ARM
-      (M4 on CPU — the cheapest path to running on the Mac).
+- [x] **NEON** — `simd.hpp`'s `#elif` path now carries the three inner products on aarch64
+      (Apple M-series), so `CpuBackend` runs on Apple ARM. `dot_f32`/`dot_qf32` widen each
+      float to double and `vfmaq_f64` (the float64x2 NEON is aarch64-only) — the same
+      double-accum as AVX2, so the cast back to float lands on the scalar value; `dot_qq`
+      does `vmull_s8` + `vpadalq_s16` into an int32 accumulator — integer-exact, so it
+      equals the scalar loop AND the AVX2 madd AND the GPU DP4A (the W8A8 integer core is
+      one number on every backend). Cross-compiled with a checked-in toolchain file
+      (`cmake/aarch64-linux-gnu.cmake`) and run under qemu-user: test_simd (the dot helpers
+      vs a scalar double/int32 reference across lengths 0..40 — every SIMD tail), test_ops,
+      test_quant (Q8 + W8A8 through the NEON dots), and ops_parity (linear/rmsnorm/softmax/
+      attention == numpy) all pass with `simd target: neon`; the whole `nicore` core also
+      cross-builds for ARM64. The x86 AVX2/scalar paths are untouched (native test_simd/
+      test_ops/test_quant still green, `avx2+fma`). **Honest scope:** qemu proves
+      CORRECTNESS (NEON == the scalar oracle), not speed — it emulates the ISA, not M4
+      timing, so tok/s and the weight-level run_parity wait for the real M4. Op-level
+      parity is the right-sized gate for a change to the inner-product primitives (it's the
+      same gate that validated the C5 AVX2 SIMD).
 - [ ] **Metal** — a `MetalBackend` on the M4 GPU; unified memory removes most H2D. The
       same Python serving layer on a third backend = the Backend boundary proven real.
 
@@ -323,7 +338,8 @@ the right moment:
   (the W8A8 dynamic-activation path + a static or careful scale would extend to it).
 - batched sampling — the token draw is still per-sequence in Python; fits the G4/G5 decode path.
 - SIMD nibble-unpack for q4/q4g — helps compute-bound q4 prefill.
-- NEON `simd.hpp` `#elif` path — the cross-platform leg above.
+- NEON `simd.hpp` `#elif` path — DONE (the Cross-platform NEON stage above: NEON
+  dot_f32/dot_qf32/dot_qq, cross-compiled + qemu-parity-tested vs the scalar oracle).
 - float32-accumulation in the SIMD dot — **has a real cost**: it trades away the
   bit-for-bit CPU parity oracle (the project's correctness spine). Only as a conscious
   tolerance change, never silent.

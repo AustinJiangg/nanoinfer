@@ -13,14 +13,19 @@
 // llama.cpp takes; left as a documented extension, not the default).
 //
 // AVX2+FMA is used when the compiler targets it (-march=native / -mavx2 -mfma,
-// which define __AVX2__ and __FMA__); otherwise a plain scalar loop runs, so the
-// engine stays correct on any target — a NEON path slots in at the marked #elif.
+// which define __AVX2__ and __FMA__); aarch64 (Apple M-series — the cross-platform
+// leg) takes the NEON path below; any other target falls back to a plain scalar
+// loop, so the engine stays correct everywhere. All three keep the double-accum
+// discipline (dot_qq accumulates in int32, which is associative and therefore
+// exact), so every path agrees with the scalar oracle to re-association error.
 #pragma once
 
 #include <cstdint>
 
 #if defined(__AVX2__) && defined(__FMA__)
 #include <immintrin.h>
+#elif defined(__aarch64__)
+#include <arm_neon.h>
 #endif
 
 namespace ni {
@@ -30,6 +35,8 @@ namespace simd {
 inline const char* target() {
 #if defined(__AVX2__) && defined(__FMA__)
     return "avx2+fma";
+#elif defined(__aarch64__)
+    return "neon";
 #else
     return "scalar";
 #endif
@@ -70,6 +77,23 @@ inline double dot_f32(const float* a, const float* b, int64_t n) {
     double total = hsum_pd(_mm256_add_pd(acc0, acc1));
     for (; i < n; ++i) total += double(a[i]) * double(b[i]);  // scalar tail
     return total;
+#elif defined(__aarch64__)
+    // NEON mirror of the AVX2 path: widen each float to double (exact) and FMA, so
+    // the sum is re-associated only within double — the final cast back to float
+    // lands on the same value as the scalar loop, just like AVX2. float64x2 NEON is
+    // aarch64-only, which is exactly the target (Apple M-series).
+    float64x2_t acc0 = vdupq_n_f64(0.0);
+    float64x2_t acc1 = vdupq_n_f64(0.0);
+    int64_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        const float32x4_t av = vld1q_f32(a + i);
+        const float32x4_t bv = vld1q_f32(b + i);
+        acc0 = vfmaq_f64(acc0, vcvt_f64_f32(vget_low_f32(av)),  vcvt_f64_f32(vget_low_f32(bv)));
+        acc1 = vfmaq_f64(acc1, vcvt_f64_f32(vget_high_f32(av)), vcvt_f64_f32(vget_high_f32(bv)));
+    }
+    double total = vaddvq_f64(vaddq_f64(acc0, acc1));
+    for (; i < n; ++i) total += double(a[i]) * double(b[i]);  // scalar tail
+    return total;
 #else
     double total = 0.0;
     for (int64_t i = 0; i < n; ++i) total += double(a[i]) * double(b[i]);
@@ -100,6 +124,26 @@ inline double dot_qf32(const float* x, const int8_t* q, int64_t n) {
     double total = hsum_pd(_mm256_add_pd(acc0, acc1));
     for (; i < n; ++i) total += double(x[i]) * double(q[i]);
     return total;
+#elif defined(__aarch64__)
+    // 8 per iteration like AVX2: widen the int8 codes int8->int16->int32->float, then
+    // share dot_f32's double-FMA reduction. Same double-accum, same parity floor.
+    float64x2_t acc0 = vdupq_n_f64(0.0);
+    float64x2_t acc1 = vdupq_n_f64(0.0);
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const int16x8_t q16 = vmovl_s8(vld1_s8(q + i));                       // 8 int8 -> 8 int16
+        const float32x4_t qlo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16)));  // q[0..3] -> float
+        const float32x4_t qhi = vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16))); // q[4..7] -> float
+        const float32x4_t xlo = vld1q_f32(x + i);
+        const float32x4_t xhi = vld1q_f32(x + i + 4);
+        acc0 = vfmaq_f64(acc0, vcvt_f64_f32(vget_low_f32(xlo)),  vcvt_f64_f32(vget_low_f32(qlo)));
+        acc1 = vfmaq_f64(acc1, vcvt_f64_f32(vget_high_f32(xlo)), vcvt_f64_f32(vget_high_f32(qlo)));
+        acc0 = vfmaq_f64(acc0, vcvt_f64_f32(vget_low_f32(xhi)),  vcvt_f64_f32(vget_low_f32(qhi)));
+        acc1 = vfmaq_f64(acc1, vcvt_f64_f32(vget_high_f32(xhi)), vcvt_f64_f32(vget_high_f32(qhi)));
+    }
+    double total = vaddvq_f64(vaddq_f64(acc0, acc1));
+    for (; i < n; ++i) total += double(x[i]) * double(q[i]);
+    return total;
 #else
     double total = 0.0;
     for (int64_t i = 0; i < n; ++i) total += double(x[i]) * double(q[i]);
@@ -108,11 +152,11 @@ inline double dot_qf32(const float* x, const int8_t* q, int64_t n) {
 }
 
 // dot(a, b) for two int8 code arrays, accumulated EXACTLY in int32 (the W8A8 inner product, G5d).
-// Both operands are int8, so this runs at int8 throughput — _mm256_madd_epi16 here, __dp4a on the
-// GPU — the compute win weight-only Q8 (dot_qf32, an fp inner product) can't get. Integer add is
-// associative, so the SIMD re-association is bit-identical to the scalar loop AND to a GPU int32
-// accumulate (DP4A): the integer core is the same number everywhere; only the later float dequant
-// drifts. Exact while k·127² < INT32_MAX (~133k contraction); our largest matmul is k=4864.
+// Both operands are int8, so this runs at int8 throughput — _mm256_madd_epi16 here, vmull+vpadalq on
+// NEON, __dp4a on the GPU — the compute win weight-only Q8 (dot_qf32, an fp inner product) can't get.
+// Integer add is associative, so the SIMD re-association is bit-identical to the scalar loop AND to a
+// GPU int32 accumulate (DP4A): the integer core is the same number everywhere; only the later float
+// dequant drifts. Exact while k·127² < INT32_MAX (~133k contraction); our largest matmul is k=4864.
 inline int32_t dot_qq(const int8_t* a, const int8_t* b, int64_t n) {
 #if defined(__AVX2__) && defined(__FMA__)
     __m256i acc = _mm256_setzero_si256();  // 8 int32 lanes
@@ -127,6 +171,22 @@ inline int32_t dot_qq(const int8_t* a, const int8_t* b, int64_t n) {
     s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(1, 0, 3, 2)));  // fold 4 -> 2 lanes
     s = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(2, 3, 0, 1)));  // fold 2 -> 1 lane
     int32_t total = _mm_cvtsi128_si32(s);
+    for (; i < n; ++i) total += int32_t(a[i]) * int32_t(b[i]);  // scalar tail
+    return total;
+#elif defined(__aarch64__)
+    // 16 int8 per iteration. vmull_s8 gives the widening int8*int8 -> int16 products (max
+    // 127*127 = 16129, fits int16); vpadalq_s16 pairwise-adds them into the int32 accumulator.
+    // Integer add is associative, so this is bit-exact == the scalar loop == the AVX2 madd ==
+    // a GPU DP4A int32 accumulate — the W8A8 integer core is the same number on every backend.
+    int32x4_t acc = vdupq_n_s32(0);
+    int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const int8x16_t av = vld1q_s8(a + i);
+        const int8x16_t bv = vld1q_s8(b + i);
+        acc = vpadalq_s16(acc, vmull_s8(vget_low_s8(av),  vget_low_s8(bv)));
+        acc = vpadalq_s16(acc, vmull_s8(vget_high_s8(av), vget_high_s8(bv)));
+    }
+    int32_t total = vaddvq_s32(acc);
     for (; i < n; ++i) total += int32_t(a[i]) * int32_t(b[i]);  // scalar tail
     return total;
 #else
