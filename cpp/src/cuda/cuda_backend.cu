@@ -341,6 +341,104 @@ __global__ void linear_tiled_vec_kernel(const float* __restrict__ x, const float
     }
 }
 
+// Prefill tiled GEMM, WARP-TILED (G5c+ second lever, Boehm "kernel 10"): inserts a WARP tile
+// between the block tile and the per-thread micro-tile. The block's BM×BN output splits into
+// (BM/WM)×(BN/WN) warp tiles, one per warp; each warp sweeps its WM×WN tile as a WMITER×WNITER
+// grid of subtiles, each thread owning a TM×TN micro-tile in every subtile. Why it beats the flat
+// thread tiling (G5c+): a warp's 32 threads now reuse the SAME small As/Bs slice across WMITER·WNITER
+// subtiles held in registers, so each shared-memory word feeds far more FMAs — the compute-to-smem
+// ratio that decides a compute-bound GEMM. It's aimed at the big lm_head matmul (n=151936): the most
+// compute-bound projection with the most headroom (G5c+ left it at ~51% of cuBLAS) and enough work
+// to fill a 128×128 tile with >1000 blocks. Same ascending-k accumulation per output as every tiled
+// kernel here, so still bit-identical to the scalar one; golden tokens unchanged. Preconditions as
+// G5c+ (n%BN==0, k%BK==0; only m ragged, bounds-checked at the store).
+template <int BM, int BN, int BK, int WM, int WN, int WNITER, int TM, int TN, int NUM_THREADS>
+__global__ void linear_warptiled_kernel(const float* __restrict__ x, const float* __restrict__ w,
+                                        const float* __restrict__ bias, float* __restrict__ y, int m,
+                                        int n, int k) {
+    constexpr int WMITER = (WM * WN) / (32 * TM * TN * WNITER);  // M-subtiles per warp
+    constexpr int WSUBM = WM / WMITER;                           // a warp subtile is WSUBM×WSUBN
+    constexpr int WSUBN = WN / WNITER;
+    __shared__ float As[BK * BM];  // x tile, TRANSPOSED: As[kl * BM + ml]
+    __shared__ float Bs[BK * BN];  // w tile, TRANSPOSED: Bs[kl * BN + nl]
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const int rowBase = static_cast<int>(blockIdx.y) * BM;
+    const int colBase = static_cast<int>(blockIdx.x) * BN;
+
+    const int warpIdx = tid / 32;                         // which warp tile this thread is in
+    const int warpRow = warpIdx / (BN / WN), warpCol = warpIdx % (BN / WN);
+    const int laneIdx = tid % 32;                         // thread placement inside the warp subtile
+    const int threadRowInWarp = laneIdx / (WSUBN / TN);   // (WSUBM/TM)×(WSUBN/TN) == 32
+    const int threadColInWarp = laneIdx % (WSUBN / TN);
+
+    // Cooperative float4-load indices (same transposed staging as G5c+, but multi-pass: NUM_THREADS
+    // float4 cover BM×BK / BK×BN over (NUM_THREADS*4)/BK-row strides).
+    const int innerRowA = tid / (BK / 4), innerColA = tid % (BK / 4);
+    const int innerRowB = tid / (BK / 4), innerColB = tid % (BK / 4);
+    constexpr int rowStrideA = (NUM_THREADS * 4) / BK;
+    constexpr int rowStrideB = (NUM_THREADS * 4) / BK;
+
+    float acc[WMITER * TM * WNITER * TN] = {0.0f};
+    float regM[WMITER * TM];
+    float regN[WNITER * TN];
+
+    for (int kIdx = 0; kIdx < k; kIdx += BK) {
+        for (int off = 0; off < BM; off += rowStrideA) {  // stage x, transposed into As
+            const int ml = innerRowA + off, gr = rowBase + ml, gc = kIdx + innerColA * 4;
+            float4 t = {0.0f, 0.0f, 0.0f, 0.0f};  // ragged m tail loads 0 (whole row OOB)
+            if (gr < m) t = *reinterpret_cast<const float4*>(&x[static_cast<size_t>(gr) * k + gc]);
+            As[(innerColA * 4 + 0) * BM + ml] = t.x;
+            As[(innerColA * 4 + 1) * BM + ml] = t.y;
+            As[(innerColA * 4 + 2) * BM + ml] = t.z;
+            As[(innerColA * 4 + 3) * BM + ml] = t.w;
+        }
+        for (int off = 0; off < BN; off += rowStrideB) {  // stage w, transposed into Bs
+            const int nl = innerRowB + off, go = colBase + nl, gk = kIdx + innerColB * 4;
+            float4 t = *reinterpret_cast<const float4*>(&w[static_cast<size_t>(go) * k + gk]);
+            Bs[(innerColB * 4 + 0) * BN + nl] = t.x;
+            Bs[(innerColB * 4 + 1) * BN + nl] = t.y;
+            Bs[(innerColB * 4 + 2) * BN + nl] = t.z;
+            Bs[(innerColB * 4 + 3) * BN + nl] = t.w;
+        }
+        __syncthreads();
+        for (int dot = 0; dot < BK; ++dot) {
+            for (int wm = 0; wm < WMITER; ++wm)  // load this warp's M-fragments (float4 from smem)
+                for (int i = 0; i < TM; i += 4)
+                    *reinterpret_cast<float4*>(&regM[wm * TM + i]) = *reinterpret_cast<const float4*>(
+                        &As[dot * BM + warpRow * WM + wm * WSUBM + threadRowInWarp * TM + i]);
+            for (int wn = 0; wn < WNITER; ++wn)  // load this warp's N-fragments
+                for (int j = 0; j < TN; j += 4)
+                    *reinterpret_cast<float4*>(&regN[wn * TN + j]) = *reinterpret_cast<const float4*>(
+                        &Bs[dot * BN + warpCol * WN + wn * WSUBN + threadColInWarp * TN + j]);
+            for (int wm = 0; wm < WMITER; ++wm)  // outer product over all subtiles
+                for (int wn = 0; wn < WNITER; ++wn)
+                    for (int i = 0; i < TM; ++i)
+                        for (int j = 0; j < TN; ++j)
+                            acc[(wm * TM + i) * (WNITER * TN) + wn * TN + j] +=
+                                regM[wm * TM + i] * regN[wn * TN + j];
+        }
+        __syncthreads();
+    }
+
+    for (int wm = 0; wm < WMITER; ++wm)  // store each subtile's TM×TN micro-tile, float4 along n
+        for (int wn = 0; wn < WNITER; ++wn)
+            for (int i = 0; i < TM; ++i) {
+                const int gr = rowBase + warpRow * WM + wm * WSUBM + threadRowInWarp * TM + i;
+                if (gr >= m) continue;  // ragged m tail (n never ragged here)
+                for (int j = 0; j < TN; j += 4) {
+                    const int gc = colBase + warpCol * WN + wn * WSUBN + threadColInWarp * TN + j;
+                    const int a = (wm * TM + i) * (WNITER * TN) + wn * TN + j;
+                    float4 t;
+                    t.x = acc[a + 0] + (bias ? bias[gc + 0] : 0.0f);
+                    t.y = acc[a + 1] + (bias ? bias[gc + 1] : 0.0f);
+                    t.z = acc[a + 2] + (bias ? bias[gc + 2] : 0.0f);
+                    t.w = acc[a + 3] + (bias ? bias[gc + 3] : 0.0f);
+                    *reinterpret_cast<float4*>(&y[static_cast<size_t>(gr) * n + gc]) = t;
+                }
+            }
+}
+
 // Prefill on tensor cores (G5d): the same tiled GEMM, but each warp's 16×16×16 multiply runs
 // on the Ada tensor cores via the wmma API. x/w stay fp32 in DRAM (the engine is fp32); each
 // BM×BK / BK×BN tile is converted to half as it is staged into shared memory, and the matmul
@@ -707,17 +805,18 @@ Tensor CudaBackend::linear(const Tensor& x, const Tensor& weight, const Tensor* 
         // G5c+: float4-vectorized tiled GEMM (transposed-As smem, 128-bit loads/stores). Two tile
         // sizes, picked by output width n — every real Qwen linear meets the n%128, k%16 gate, and
         // only the m (row) dimension is ever ragged (bounds-checked inside the kernel):
-        //   • huge n (lm_head, n=151936): a 128×128 / 8×8 tile — maximum per-thread reuse, and it
-        //     still launches >1000 blocks, so occupancy is fine.
+        //   • huge n (lm_head, n=151936): a WARP-TILED 128×128 tile — the most compute-bound matmul,
+        //     enough work for >1000 blocks, so warp-tiling's extra register reuse pays off (G5c+).
         //   • narrow n (the projections): a 64×64 / 4×4 tile — at m=128 a 128-wide tile would launch
         //     only n/128 blocks (n=896 → 7) and starve a 56-SM GPU; the 64-wide tile keeps ~4× more
         //     blocks resident. BK=16 so 256 threads still load one float4 of x and w apiece per pass.
         if (n >= 8192) {
-            constexpr int BM = 128, BN = 128, BK = 8, TM = 8, TN = 8;
-            constexpr int threads = (BM / TM) * (BN / TN);  // 256
+            constexpr int BM = 128, BN = 128, BK = 16, WM = 64, WN = 64, WNITER = 4, TM = 8, TN = 4;
+            constexpr int NT = 128;  // 4 warps, each a 64×64 warp tile (2×2 grid over the block)
             const dim3 grid((static_cast<unsigned>(n) + BN - 1) / BN,
                             (static_cast<unsigned>(m) + BM - 1) / BM);
-            linear_tiled_vec_kernel<BM, BN, BK, TM, TN><<<grid, threads>>>(xp, wp, bp, yp, mi, ni, ki);
+            linear_warptiled_kernel<BM, BN, BK, WM, WN, WNITER, TM, TN, NT>
+                <<<grid, NT>>>(xp, wp, bp, yp, mi, ni, ki);
         } else {
             constexpr int BM = 64, BN = 64, BK = 16, TM = 4, TN = 4;
             constexpr int threads = (BM / TM) * (BN / TN);  // 256

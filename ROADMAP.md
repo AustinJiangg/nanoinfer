@@ -218,8 +218,18 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
         over the G5c scalar tile, 4.8× over naive — A/B in run_cuda_decode_bench). Bit-identical
         to the scalar tiled kernel (a given output still sums its products in ascending-k order,
         tile shape aside), so golden tokens are unchanged; both tiles parity-tested vs the CPU
-        oracle incl. ragged m (test_cuda, large-n cases added). Still ahead (Boehm kernels 9-10):
-        warp-tiling + cp.async double-buffering, and lm_head's store/occupancy-bound regime.
+        oracle incl. ragged m (test_cuda, large-n cases added). Second lever — **warp-tiling**
+        (Boehm "kernel 10") for the big lm_head matmul: a warp tile sits between the block and
+        per-thread tiles, so each warp's shared-memory slice feeds WMITER·WNITER register subtiles
+        (more FMAs per smem word — the ratio a compute-bound GEMM lives on). lm_head 51% → **90%**
+        of cuBLAS (13.9 TFLOP/s), still bit-identical (test_cuda n=8192 cases). But end-to-end
+        prefill stays ~flat: lm_head is one op of ~360, and at prefill=128 the step is only ~15ms
+        of matmul vs ~55ms total — the naive G2 attention (×24) + ~360 per-op launches dominate now
+        (same Amdahl shape as G5b's decode). The narrow projections can't take warp-tiling (they're
+        occupancy-bound at m=128, not reuse-bound) and gate/up is already ~89%, so lm_head is its
+        only home. Still ahead: cp.async double-buffering (another lm_head-local micro-gain); the
+        real end-to-end prefill lever is now attention (FlashAttention — G5's named "second" kernel)
+        and per-op launch overhead.
   - [ ] **G5d** — low precision (stretch). **fp16 wmma landed** (linear_wmma_kernel, opt-in
         g_cuda_use_wmma): a 64×64 / 2×2-warp tensor-core kernel, correct (fp16 cost ~1-2% vs
         the oracle — test_cuda) but the naive version is SLOWER than the tuned fp32 tiled GEMM
