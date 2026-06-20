@@ -641,6 +641,66 @@ __global__ void attention_kernel(const float* __restrict__ q, const float* __res
     for (int64_t d = 0; d < D; ++d) oi[d] = acc[d] * inv;
 }
 
+// Attention, WARP-per-query (G5e): the naive kernel above runs one THREAD per (head,query) — only
+// H*sq threads (14*128 = 1792 at prefill), ~3% of the GPU, each grinding a serial key loop. This
+// gives each (head,query) a whole WARP: the 32 lanes stride the keys (lane l takes keys l, l+32,
+// …), so there are 32× the threads and 32× less serial work per thread — the parallelism win that
+// matters at short context, where K/V already fit in L2 (FlashAttention's IO tiling is the
+// long-context lever, deferred). Same two-pass max-subtract softmax as the naive kernel and the CPU
+// op — pass 1 reduces the global max (a warp xor-butterfly; max has no rounding, so it equals the
+// CPU's max exactly), pass 2 re-scores and accumulates e and e·V per lane, then reduces to lane 0.
+// Only the per-key SUMS are reordered vs the CPU's sequential add (~1e-6), so it stays within GPU
+// tolerance and golden tokens hold. Full warps only (the warpId guard is warp-uniform), so every
+// __shfl_*_sync sees all 32 lanes.
+__global__ void attention_warp_kernel(const float* __restrict__ q, const float* __restrict__ k,
+                                      const float* __restrict__ v, float* __restrict__ out,
+                                      int64_t H, int64_t sq, int64_t sk, int64_t D, int causal,
+                                      int64_t query_offset, float scale) {
+    const int warpsPerBlock = static_cast<int>(blockDim.x) / 32;
+    const int64_t warpId = static_cast<int64_t>(blockIdx.x) * warpsPerBlock + threadIdx.x / 32;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    if (warpId >= H * sq) return;  // warp-uniform: all 32 lanes return together
+    const int64_t h = warpId / sq, i = warpId % sq;
+    const float* qi = q + (h * sq + i) * D;
+    const float* kh = k + h * sk * D;
+    const float* vh = v + h * sk * D;
+    const int64_t limit = causal ? (query_offset + i + 1) : sk;
+
+    // Pass 1: max over this query's visible keys, lanes striding keys, xor-butterfly so every lane
+    // ends holding the global max (needed for the stable exp in pass 2).
+    float lmax = -INFINITY;
+    for (int64_t j = lane; j < limit; j += 32) {
+        const float* kj = kh + j * D;
+        float s = 0.0f;
+        for (int64_t d = 0; d < D; ++d) s += qi[d] * kj[d];
+        lmax = fmaxf(lmax, s * scale);
+    }
+    for (int off = 16; off > 0; off >>= 1)
+        lmax = fmaxf(lmax, __shfl_xor_sync(0xffffffff, lmax, off));
+
+    // Pass 2: each lane sums e and e·V over its keys, then reduce to lane 0 (which writes the row).
+    float lsum = 0.0f;
+    float lacc[kMaxHeadDim];
+    for (int64_t d = 0; d < D; ++d) lacc[d] = 0.0f;
+    for (int64_t j = lane; j < limit; j += 32) {
+        const float* kj = kh + j * D;
+        float s = 0.0f;
+        for (int64_t d = 0; d < D; ++d) s += qi[d] * kj[d];
+        const float e = expf(s * scale - lmax);
+        lsum += e;
+        const float* vj = vh + j * D;
+        for (int64_t d = 0; d < D; ++d) lacc[d] += e * vj[d];
+    }
+    for (int off = 16; off > 0; off >>= 1) lsum += __shfl_down_sync(0xffffffff, lsum, off);
+    for (int64_t d = 0; d < D; ++d)
+        for (int off = 16; off > 0; off >>= 1) lacc[d] += __shfl_down_sync(0xffffffff, lacc[d], off);
+    if (lane == 0) {
+        const float inv = 1.0f / lsum;
+        float* oi = out + (h * sq + i) * D;
+        for (int64_t d = 0; d < D; ++d) oi[d] = lacc[d] * inv;
+    }
+}
+
 // Write the t new tokens' K/V ([n_kv, t, hd]) into this sequence's blocks for one layer.
 // One thread per (head, token, dim); the block + offset come from the block table.
 __global__ void paged_write_kernel(const float* __restrict__ k, const float* __restrict__ v,
@@ -760,6 +820,8 @@ bool g_cuda_force_naive_gemm = false;
 bool g_cuda_use_wmma = false;
 // Opt-in switch (see cuda_backend.hpp) to upload the layer weights as fp16 (G5d).
 bool g_cuda_fp16_weights = false;
+// Bench/diagnostic knob (G5e): force the naive one-thread-per-query attention for A/B timing.
+bool g_cuda_force_naive_attn = false;
 
 Tensor CudaBackend::linear(const Tensor& x, const Tensor& weight, const Tensor* bias) {
     const int64_t m = x.size(0), k = x.size(1), n = weight.size(0);
@@ -922,9 +984,17 @@ Tensor CudaBackend::attention(const Tensor& q, const Tensor& k, const Tensor& v,
         throw std::runtime_error("CudaBackend::attention: head_dim > 128 not supported (G2)");
     Tensor out = device_alloc({H, sq, D});
     const float scale = 1.0f / sqrtf(static_cast<float>(D));
-    attention_kernel<<<grid1d(H * sq, kBlock), kBlock>>>(dptr(q), dptr(k), dptr(v), dptr(out), H, sq,
-                                                         sk, D, causal ? 1 : 0, query_offset, scale);
-    launch_check("attention_kernel");
+    if (g_cuda_force_naive_attn) {
+        attention_kernel<<<grid1d(H * sq, kBlock), kBlock>>>(
+            dptr(q), dptr(k), dptr(v), dptr(out), H, sq, sk, D, causal ? 1 : 0, query_offset, scale);
+        launch_check("attention_kernel");
+    } else {
+        const int threads = 256;  // 8 warps/block, one warp per (head,query)
+        const int blocks = static_cast<int>((H * sq + threads / 32 - 1) / (threads / 32));
+        attention_warp_kernel<<<blocks, threads>>>(dptr(q), dptr(k), dptr(v), dptr(out), H, sq, sk, D,
+                                                   causal ? 1 : 0, query_offset, scale);
+        launch_check("attention_warp_kernel");
+    }
     return out;
 }
 

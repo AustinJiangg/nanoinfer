@@ -54,6 +54,33 @@ static bool check_linear(int64_t m, int64_t n, int64_t k, double tol, bool f16w,
     return ok;
 }
 
+// Warp-per-query attention (G5e) vs the CPU oracle. Random q[H,sq,D], k/v[H,sk,D]; ok if the GPU
+// output matches within tol (only the per-key sums are reordered vs the CPU's sequential add).
+static bool check_attention(int64_t H, int64_t sq, int64_t sk, int64_t D, bool causal,
+                            int64_t query_offset, double tol, std::mt19937& rng) {
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    Tensor q({H, sq, D}), k({H, sk, D}), v({H, sk, D});
+    for (int64_t i = 0; i < q.numel(); ++i) q[i] = dist(rng);
+    for (int64_t i = 0; i < k.numel(); ++i) k[i] = dist(rng);
+    for (int64_t i = 0; i < v.numel(); ++i) v[i] = dist(rng);
+
+    CpuBackend cpu;
+    Tensor o_cpu = cpu.attention(q, k, v, causal, query_offset);  // the oracle
+
+    CudaBackend gpu;
+    Tensor qd = to_device(q), kd = to_device(k), vd = to_device(v);
+    Tensor o_gpu = to_host(gpu.attention(qd, kd, vd, causal, query_offset));
+
+    double maxdiff = 0.0;
+    for (int64_t i = 0; i < o_cpu.numel(); ++i)
+        maxdiff = std::max(maxdiff, std::fabs(static_cast<double>(o_cpu[i]) - o_gpu[i]));
+    const bool ok = maxdiff < tol;
+    std::printf("test_cuda: attn H=%lld sq=%4lld sk=%4lld D=%lld %-6s qoff=%-3lld max|diff|=%.3e (tol %.0e) %s\n",
+                (long long)H, (long long)sq, (long long)sk, (long long)D, causal ? "causal" : "full",
+                (long long)query_offset, maxdiff, tol, ok ? "ok" : "FAIL");
+    return ok;
+}
+
 int main() {
     if (!cuda_available()) {
         std::printf("test_cuda: no CUDA device visible — skipping\n");
@@ -80,6 +107,13 @@ int main() {
     ok &= check_linear(4, 896, 896, 1e-1, true, rng);      // gemv-h (decode, fp16 weight)
     ok &= check_linear(128, 896, 896, 3e-1, true, rng);    // wmma-h (prefill, fp16 weight)
     ok &= check_linear(100, 896, 4864, 1e0, true, rng);    // wmma-h, ragged + wide k
+
+    // Warp-per-query attention (G5e): prefill (limit>32 → lane key-striding), decode (sq=1, large
+    // sk), and full (non-causal). Tight tol — only the key sums reorder vs the CPU oracle.
+    ok &= check_attention(2, 40, 40, 64, true, 0, 1e-3, rng);    // prefill, causal, limit up to 40
+    ok &= check_attention(2, 1, 100, 64, true, 99, 1e-3, rng);   // decode, large sk
+    ok &= check_attention(3, 16, 16, 64, false, 0, 1e-3, rng);   // full (non-causal)
+    ok &= check_attention(1, 64, 64, 64, true, 0, 1e-3, rng);    // longer prefill, multiple lane passes
 
     std::printf("test_cuda: %s\n", ok ? "ok" : "FAIL");
     return ok ? 0 : 1;

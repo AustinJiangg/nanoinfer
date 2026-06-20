@@ -36,6 +36,10 @@ extern bool g_cuda_use_wmma;
 // weights force the tensor-core kernel for prefill). Default off; not thread-safe.
 extern bool g_cuda_fp16_weights;
 
+// Bench/diagnostic knob (G5e): force the naive one-thread-per-query attention kernel instead of
+// the warp-per-query kernel, so a bench can A/B the attention speedup. Default false; not thread-safe.
+extern bool g_cuda_force_naive_attn;
+
 class CudaBackend : public Backend {
 public:
     Device device() const override;

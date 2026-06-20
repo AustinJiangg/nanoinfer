@@ -76,6 +76,9 @@ int main(int argc, char** argv) {
         // NI_FP16W=1 uploads the layer weights as fp16 (G5d) — must be set before the Model
         // is built, since the conversion happens at the once-per-load upload.
         if (const char* e = std::getenv("NI_FP16W")) g_cuda_fp16_weights = (e[0] == '1');
+        // NI_NAIVE_ATTN=1 forces the naive one-thread-per-query attention (G5e A/B): hold the GEMM
+        // path fixed and toggle only attention to isolate its prefill/decode contribution.
+        if (const char* e = std::getenv("NI_NAIVE_ATTN")) g_cuda_force_naive_attn = (e[0] == '1');
         Model model(dir, QuantMode::None, Device::CUDA);
         const int64_t vocab = model.config().vocab_size;
         std::printf("layer weights: %s\n", g_cuda_fp16_weights ? "fp16 (G5d)" : "fp32");

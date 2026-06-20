@@ -245,6 +245,22 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
         ~free memory + the dtype path int8 builds on. Still ahead: optimize wmma (128² tiles +
         cp.async double-buffer) so it actually wins, then int8×int8→int32 (C4 weights) +
         quantize lm_head.
+  - [x] **G5e** — attention, the GEMM's successor on the critical path. Once G5c+ made the
+        matmuls fast, a prefill=128 step was only ~15ms of matmul out of ~55ms — the naive G2
+        attention dominated. It ran one THREAD per (head,query): just H·sq = 1792 threads (~3% of
+        the GPU), each grinding a serial key loop. The fix is **warp-per-query**: a whole warp per
+        (head,query), its 32 lanes striding the keys — 32× the threads, 32× less serial work each.
+        Same two-pass max-subtract as the CPU op (pass 1 warp-reduces the global max — bit-exact,
+        max doesn't round; pass 2 re-scores and warp-reduces e and e·V), so only the per-key sums
+        reorder: max|diff| ~1e-7 vs the oracle (test_cuda, incl. sq>32 and decode), golden tokens
+        unchanged. Isolated A/B (NI_NAIVE_ATTN, GEMM held fixed): **prefill 2395 → 3597 tok/s
+        (1.50×), decode 38.7 → 86.9 tok/s (2.25×)**. The decode win is the big one — the naive
+        kernel walked the whole growing KV serially per layer, so it, not the GEMV, was the decode
+        bottleneck (which is why G5's "attention matters once long context / large batch make it"
+        undersold it: under-parallelism bit immediately at ctx 128). Still ahead, the actual
+        FlashAttention levers (for long context, where K/V outgrow L2): online softmax (one pass,
+        no K re-read) + shared-mem K/V tiling; and the same warp-per-query pass over the paged
+        attention kernel (still naive).
 
 ## Cross-platform (portability proof, after the GPU is learned)
 - [ ] **NEON** — fill `simd.hpp`'s `#elif` NEON path so `CpuBackend` runs on Apple ARM
