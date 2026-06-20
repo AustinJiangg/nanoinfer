@@ -259,8 +259,9 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
         bottleneck (which is why G5's "attention matters once long context / large batch make it"
         undersold it: under-parallelism bit immediately at ctx 128). Still ahead, the actual
         FlashAttention levers (for long context, where K/V outgrow L2): online softmax (one pass,
-        no K re-read) + shared-mem K/V tiling; and the same warp-per-query pass over the paged
-        attention kernel (still naive).
+        no K re-read) + shared-mem K/V tiling. The paged attention kernel got the same
+        warp-per-query treatment (paged stays bit-identical to contiguous, run_cuda_paged
+        max|diff|=0, golden MATCH), so both KV paths are now warp-parallel.
 
 ## Cross-platform (portability proof, after the GPU is learned)
 - [ ] **NEON** — fill `simd.hpp`'s `#elif` NEON path so `CpuBackend` runs on Apple ARM

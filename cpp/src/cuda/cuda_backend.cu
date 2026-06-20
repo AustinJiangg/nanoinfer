@@ -762,6 +762,58 @@ __global__ void paged_attention_kernel(const float* __restrict__ q, const float*
     for (int64_t d = 0; d < hd; ++d) oi[d] = acc[d] * inv;
 }
 
+// Paged attention, WARP-per-query (G5e): the warp parallelization of paged_attention_kernel, the
+// same lane-stride-the-keys + two-pass max-subtract as attention_warp_kernel, but each key is read
+// straight from its block (GQA folded in, kvh = h/n_rep). Identical key order and arithmetic to the
+// contiguous warp kernel, so the paged path stays bit-identical to it (run_cuda_paged max|diff|=0).
+__global__ void paged_attention_warp_kernel(
+    const float* __restrict__ q, const float* __restrict__ Kbase, const float* __restrict__ Vbase,
+    const int64_t* __restrict__ block_table, float* __restrict__ out, int64_t n_heads, int64_t sq,
+    int64_t hd, int64_t n_kv, int64_t n_rep, int64_t block_size, int causal, int64_t query_offset,
+    int64_t end, float scale) {
+    const int warpsPerBlock = static_cast<int>(blockDim.x) / 32;
+    const int64_t hi = static_cast<int64_t>(blockIdx.x) * warpsPerBlock + threadIdx.x / 32;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    if (hi >= n_heads * sq) return;  // warp-uniform
+    const int64_t h = hi / sq, i = hi % sq;
+    const int64_t kvh = h / n_rep;  // GQA: this query head's KV head
+    const float* qi = q + (h * sq + i) * hd;
+    const int64_t limit = causal ? (query_offset + i + 1) : end;
+
+    float lmax = -INFINITY;
+    for (int64_t j = lane; j < limit; j += 32) {
+        const int64_t blk = block_table[j / block_size], boff = j % block_size;
+        const float* kj = Kbase + ((blk * n_kv + kvh) * block_size + boff) * hd;
+        float s = 0.0f;
+        for (int64_t d = 0; d < hd; ++d) s += qi[d] * kj[d];
+        lmax = fmaxf(lmax, s * scale);
+    }
+    for (int off = 16; off > 0; off >>= 1)
+        lmax = fmaxf(lmax, __shfl_xor_sync(0xffffffff, lmax, off));
+
+    float lsum = 0.0f;
+    float lacc[kMaxHeadDim];
+    for (int64_t d = 0; d < hd; ++d) lacc[d] = 0.0f;
+    for (int64_t j = lane; j < limit; j += 32) {
+        const int64_t blk = block_table[j / block_size], boff = j % block_size;
+        const float* kj = Kbase + ((blk * n_kv + kvh) * block_size + boff) * hd;
+        float s = 0.0f;
+        for (int64_t d = 0; d < hd; ++d) s += qi[d] * kj[d];
+        const float e = expf(s * scale - lmax);
+        lsum += e;
+        const float* vj = Vbase + ((blk * n_kv + kvh) * block_size + boff) * hd;
+        for (int64_t d = 0; d < hd; ++d) lacc[d] += e * vj[d];
+    }
+    for (int off = 16; off > 0; off >>= 1) lsum += __shfl_down_sync(0xffffffff, lsum, off);
+    for (int64_t d = 0; d < hd; ++d)
+        for (int off = 16; off > 0; off >>= 1) lacc[d] += __shfl_down_sync(0xffffffff, lacc[d], off);
+    if (lane == 0) {
+        const float inv = 1.0f / lsum;
+        float* oi = out + (h * sq + i) * hd;
+        for (int64_t d = 0; d < hd; ++d) oi[d] = lacc[d] * inv;
+    }
+}
+
 }  // namespace
 
 bool cuda_available() {
@@ -1140,10 +1192,19 @@ Tensor CudaPagedKVCache::attend(int64_t layer, const Tensor& q, const Tensor& k,
         throw std::runtime_error("CudaPagedKVCache::attend: head_dim > 128 not supported (G4b)");
     Tensor out = device_alloc({n_heads, sq, D});
     const float scale = 1.0f / sqrtf(static_cast<float>(D));
-    paged_attention_kernel<<<grid1d(n_heads * sq, kBlock), kBlock>>>(
-        dptr(q), Kbase, Vbase, d_bt, dptr(out), n_heads, sq, D, n_kv, n_rep, bs, causal ? 1 : 0,
-        query_offset, end, scale);
-    launch_check("paged_attention_kernel");
+    if (g_cuda_force_naive_attn) {
+        paged_attention_kernel<<<grid1d(n_heads * sq, kBlock), kBlock>>>(
+            dptr(q), Kbase, Vbase, d_bt, dptr(out), n_heads, sq, D, n_kv, n_rep, bs, causal ? 1 : 0,
+            query_offset, end, scale);
+        launch_check("paged_attention_kernel");
+    } else {
+        const int threads = 256;  // 8 warps/block, one warp per (head,query)
+        const int blocks = static_cast<int>((n_heads * sq + threads / 32 - 1) / (threads / 32));
+        paged_attention_warp_kernel<<<blocks, threads>>>(dptr(q), Kbase, Vbase, d_bt, dptr(out),
+                                                         n_heads, sq, D, n_kv, n_rep, bs,
+                                                         causal ? 1 : 0, query_offset, end, scale);
+        launch_check("paged_attention_warp_kernel");
+    }
 
     cudaFree(d_bt);
     return out;
