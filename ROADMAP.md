@@ -206,8 +206,20 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
         64×64×8), ragged m/n bounds-checked. Prefill matmul 3% → 20-68% of cuBLAS (gate/up
         10.9 TFLOP/s = 68%); end-to-end prefill 493 → 2192 tok/s (4.4×, A/B vs naive in
         run_cuda_decode_bench). Verified vs the CPU oracle incl. ragged m (test_cuda),
-        golden tokens unchanged. Further gains (warp tiling / double-buffer / float4 /
-        bank-conflict-free smem) left as G5c+ — would push 68% → ~85%.
+        golden tokens unchanged. Further gains pursued in G5c+ below.
+  - [x] **G5c+** — vectorize the tiled GEMM (Boehm "kernel 6"): float4 (128-bit) global
+        loads/stores, x staged TRANSPOSED in shared memory so the inner-loop register reads are
+        float4 too (and bank-conflict-light), and a size-aware tile dispatch — the huge lm_head
+        (n=151936) takes a 128×128 / 8×8 tile (max reuse, still launches >1000 blocks), the
+        narrower projections a 64×64 / 4×4 tile, since at m=128 a 128-wide tile launches only
+        n/128 blocks (n=896 → 7) and starves the 56-SM GPU. Prefill matmul vs cuBLAS: gate/up
+        61% → **89%** (13.1 TFLOP/s — the dominant matmul, past the ~85% target), lm_head
+        26% → 51%, q/o 36% → 48%, down 22% → 28%; end-to-end prefill 1915 → 2330 tok/s (1.22×
+        over the G5c scalar tile, 4.8× over naive — A/B in run_cuda_decode_bench). Bit-identical
+        to the scalar tiled kernel (a given output still sums its products in ascending-k order,
+        tile shape aside), so golden tokens are unchanged; both tiles parity-tested vs the CPU
+        oracle incl. ragged m (test_cuda, large-n cases added). Still ahead (Boehm kernels 9-10):
+        warp-tiling + cp.async double-buffering, and lm_head's store/occupancy-bound regime.
   - [ ] **G5d** — low precision (stretch). **fp16 wmma landed** (linear_wmma_kernel, opt-in
         g_cuda_use_wmma): a 64×64 / 2×2-warp tensor-core kernel, correct (fp16 cost ~1-2% vs
         the oracle — test_cuda) but the naive version is SLOWER than the tuned fp32 tiled GEMM

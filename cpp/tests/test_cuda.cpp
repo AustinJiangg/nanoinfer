@@ -62,9 +62,13 @@ int main() {
     std::mt19937 rng(1234);  // fixed seed: deterministic, per CLAUDE.md
     bool ok = true;
     ok &= check_linear(4, 896, 896, 5e-3, false, rng);     // warp-GEMV (decode)
-    ok &= check_linear(128, 896, 896, 5e-3, false, rng);   // tiled, square (prefill q/o)
-    ok &= check_linear(128, 4864, 896, 5e-3, false, rng);  // tiled, wide n (gate/up)
-    ok &= check_linear(100, 896, 4864, 5e-3, false, rng);  // tiled, ragged m + wide k (down)
+    // Prefill tiled GEMM (G5c+ float4-vectorized). The dispatch picks the tile by output width n:
+    // narrow n -> 64×64, huge n (>=8192) -> 128×128. Cover both, square + ragged m, to gate each.
+    ok &= check_linear(128, 896, 896, 5e-3, false, rng);   // tiled-vec 64×64, square (prefill q/o)
+    ok &= check_linear(128, 4864, 896, 5e-3, false, rng);  // tiled-vec 64×64, wide n (gate/up)
+    ok &= check_linear(100, 896, 4864, 5e-3, false, rng);  // tiled-vec 64×64, ragged m + wide k (down)
+    ok &= check_linear(128, 8192, 896, 5e-3, false, rng);  // tiled-vec 128×128, large n (lm_head path)
+    ok &= check_linear(100, 8192, 896, 5e-3, false, rng);  // tiled-vec 128×128, large n + ragged m
 
     // Tensor-core (fp32 weight, fp16 staged) — the max|diff| is the fp16 cost.
     g_cuda_use_wmma = true;

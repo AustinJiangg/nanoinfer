@@ -250,6 +250,97 @@ __global__ void linear_tiled_kernel(const float* __restrict__ x, const float* __
     }
 }
 
+// Prefill tiled GEMM, VECTORIZED (G5c+): linear_tiled_kernel sharpened with the three standard
+// levers from the canonical CUDA-GEMM progression (Simon Boehm's "kernel 6"). Same tiled-reduction
+// float math, within GPU tolerance; golden tokens unchanged. The wins over the scalar G5c kernel:
+//   1. float4 (128-bit) global loads/stores — one LDG.128 moves 4 contiguous floats, quartering
+//      the load/store instruction count and saturating the memory pipe.
+//   2. As staged TRANSPOSED in shared memory ([BK][BM], not [BM][BK]), so the inner-loop register
+//      reads As[dot][·] are contiguous too — a float4 LDS instead of TM strided loads, and the
+//      strided-by-BK bank conflicts the scalar kernel hit on its regM reads are gone.
+//   3. a larger 128×128 block tile (TM=TN=8 → 64 outputs/thread): each staged value is reused
+//      more, lifting arithmetic intensity further past the roofline ridge.
+//
+// Preconditions (the dispatch checks them, else falls back to the scalar tiled kernel): n % BN == 0
+// and k % BK == 0, so only the m (row) dimension is ragged. EVERY float4 runs along k (the two
+// staging loads) or n (the store) — both always multiples of 4 for a Qwen linear — so no float4
+// ever straddles a ragged edge; only whole rows are bounds-checked (gr < m), which guards the m
+// tail (e.g. the ragged m=100 parity case). Both x[m,k] and w[n,k] are row-major with k contiguous,
+// so BOTH stage by float4-reading along k and scattering transposed into a [BK][*] tile (As[kl][ml],
+// Bs[kl][nl]); symmetric. Alignment holds because k,n are multiples of 4 and every tile base lands
+// on a 4-float boundary, so each reinterpret_cast<float4*> address is 16-byte aligned.
+template <int BM, int BN, int BK, int TM, int TN>
+__global__ void linear_tiled_vec_kernel(const float* __restrict__ x, const float* __restrict__ w,
+                                        const float* __restrict__ bias, float* __restrict__ y, int m,
+                                        int n, int k) {
+    constexpr int numThreads = (BM / TM) * (BN / TN);
+    __shared__ float As[BK * BM];  // x tile, TRANSPOSED: As[kl * BM + ml]
+    __shared__ float Bs[BK * BN];  // w tile, TRANSPOSED: Bs[kl * BN + nl]
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const int rowBase = static_cast<int>(blockIdx.y) * BM;  // global y-row base of the block
+    const int colBase = static_cast<int>(blockIdx.x) * BN;  // global y-col (output) base
+
+    // Cooperative float4-load indices: each tile row is BK wide = BK/4 float4, so a thread owns
+    // float4 (loadRow, loadCol) and strides loadRow by rowStride to cover all BM/BN rows. (At
+    // 128×128×8 / 256 threads this is one float4 each, single pass — strideA/B == BM/BN.)
+    constexpr int f4PerRow = BK / 4;
+    const int loadRow = tid / f4PerRow, loadCol = (tid % f4PerRow) * 4;
+    constexpr int rowStrideA = numThreads / f4PerRow;
+    constexpr int rowStrideB = numThreads / f4PerRow;
+
+    const int threadRow = tid / (BN / TN), threadCol = tid % (BN / TN);  // this thread's micro-tile
+    float acc[TM * TN] = {0.0f};
+    float regM[TM], regN[TN];
+
+    for (int kIdx = 0; kIdx < k; kIdx += BK) {
+        for (int off = 0; off < BM; off += rowStrideA) {  // stage x, transposed into As
+            const int ml = loadRow + off, gr = rowBase + ml, gc = kIdx + loadCol;
+            float4 t = {0.0f, 0.0f, 0.0f, 0.0f};  // ragged m tail loads 0 (whole row OOB)
+            if (gr < m) t = *reinterpret_cast<const float4*>(&x[static_cast<size_t>(gr) * k + gc]);
+            As[(loadCol + 0) * BM + ml] = t.x;
+            As[(loadCol + 1) * BM + ml] = t.y;
+            As[(loadCol + 2) * BM + ml] = t.z;
+            As[(loadCol + 3) * BM + ml] = t.w;
+        }
+        for (int off = 0; off < BN; off += rowStrideB) {  // stage w, transposed into Bs
+            const int nl = loadRow + off, go = colBase + nl, gk = kIdx + loadCol;
+            // n % BN == 0 (precondition) → go is always valid; only k is strided, never ragged.
+            float4 t = *reinterpret_cast<const float4*>(&w[static_cast<size_t>(go) * k + gk]);
+            Bs[(loadCol + 0) * BN + nl] = t.x;
+            Bs[(loadCol + 1) * BN + nl] = t.y;
+            Bs[(loadCol + 2) * BN + nl] = t.z;
+            Bs[(loadCol + 3) * BN + nl] = t.w;
+        }
+        __syncthreads();
+        for (int dot = 0; dot < BK; ++dot) {  // outer-product accumulate, all reads float4
+            for (int i = 0; i < TM; i += 4)
+                *reinterpret_cast<float4*>(&regM[i]) =
+                    *reinterpret_cast<const float4*>(&As[dot * BM + threadRow * TM + i]);
+            for (int j = 0; j < TN; j += 4)
+                *reinterpret_cast<float4*>(&regN[j]) =
+                    *reinterpret_cast<const float4*>(&Bs[dot * BN + threadCol * TN + j]);
+            for (int i = 0; i < TM; ++i)
+                for (int j = 0; j < TN; ++j) acc[i * TN + j] += regM[i] * regN[j];
+        }
+        __syncthreads();
+    }
+
+    for (int i = 0; i < TM; ++i) {
+        const int gr = rowBase + threadRow * TM + i;
+        if (gr >= m) continue;  // ragged m tail: skip the whole row (n is never ragged here)
+        for (int j = 0; j < TN; j += 4) {
+            const int gc = colBase + threadCol * TN + j;
+            float4 t;
+            t.x = acc[i * TN + j + 0] + (bias ? bias[gc + 0] : 0.0f);
+            t.y = acc[i * TN + j + 1] + (bias ? bias[gc + 1] : 0.0f);
+            t.z = acc[i * TN + j + 2] + (bias ? bias[gc + 2] : 0.0f);
+            t.w = acc[i * TN + j + 3] + (bias ? bias[gc + 3] : 0.0f);
+            *reinterpret_cast<float4*>(&y[static_cast<size_t>(gr) * n + gc]) = t;
+        }
+    }
+}
+
 // Prefill on tensor cores (G5d): the same tiled GEMM, but each warp's 16×16×16 multiply runs
 // on the Ada tensor cores via the wmma API. x/w stay fp32 in DRAM (the engine is fp32); each
 // BM×BK / BK×BN tile is converted to half as it is staged into shared memory, and the matmul
@@ -612,7 +703,31 @@ Tensor CudaBackend::linear(const Tensor& x, const Tensor& weight, const Tensor* 
         const dim3 grid((static_cast<unsigned>(n) + BN - 1) / BN,
                         (static_cast<unsigned>(m) + BM - 1) / BM);
         linear_wmma_kernel<float><<<grid, 128>>>(xp, wp, bp, yp, mi, ni, ki);
+    } else if (n % 128 == 0 && k % 16 == 0) {
+        // G5c+: float4-vectorized tiled GEMM (transposed-As smem, 128-bit loads/stores). Two tile
+        // sizes, picked by output width n — every real Qwen linear meets the n%128, k%16 gate, and
+        // only the m (row) dimension is ever ragged (bounds-checked inside the kernel):
+        //   • huge n (lm_head, n=151936): a 128×128 / 8×8 tile — maximum per-thread reuse, and it
+        //     still launches >1000 blocks, so occupancy is fine.
+        //   • narrow n (the projections): a 64×64 / 4×4 tile — at m=128 a 128-wide tile would launch
+        //     only n/128 blocks (n=896 → 7) and starve a 56-SM GPU; the 64-wide tile keeps ~4× more
+        //     blocks resident. BK=16 so 256 threads still load one float4 of x and w apiece per pass.
+        if (n >= 8192) {
+            constexpr int BM = 128, BN = 128, BK = 8, TM = 8, TN = 8;
+            constexpr int threads = (BM / TM) * (BN / TN);  // 256
+            const dim3 grid((static_cast<unsigned>(n) + BN - 1) / BN,
+                            (static_cast<unsigned>(m) + BM - 1) / BM);
+            linear_tiled_vec_kernel<BM, BN, BK, TM, TN><<<grid, threads>>>(xp, wp, bp, yp, mi, ni, ki);
+        } else {
+            constexpr int BM = 64, BN = 64, BK = 16, TM = 4, TN = 4;
+            constexpr int threads = (BM / TM) * (BN / TN);  // 256
+            const dim3 grid((static_cast<unsigned>(n) + BN - 1) / BN,
+                            (static_cast<unsigned>(m) + BM - 1) / BM);
+            linear_tiled_vec_kernel<BM, BN, BK, TM, TN><<<grid, threads>>>(xp, wp, bp, yp, mi, ni, ki);
+        }
     } else {
+        // Fallback for shapes the vectorized kernel's divisibility preconditions don't cover
+        // (off-checkpoint dims): the scalar G5c tiled kernel, which bounds-checks every edge.
         constexpr int BM = 64, BN = 64, BK = 8, TM = 4, TN = 4;
         constexpr int threads = (BM / TM) * (BN / TN);  // 256
         const dim3 grid((static_cast<unsigned>(n) + BN - 1) / BN,
