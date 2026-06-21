@@ -187,6 +187,12 @@ if(NI_CUDA)
   add_executable(run_cuda_decode_bench tests/run_cuda_decode_bench.cpp)
   target_link_libraries(run_cuda_decode_bench PRIVATE nicore)
   target_include_directories(run_cuda_decode_bench PRIVATE tests)
+
+  # G5f: isolated attention() micro-bench — naive vs non-tiled online vs shared-mem tiled, on
+  # synthetic data (no weights), so the kernel change isn't diluted by the full step.
+  add_executable(run_cuda_attn_bench tests/run_cuda_attn_bench.cpp)
+  target_link_libraries(run_cuda_attn_bench PRIVATE nicore)
+  target_include_directories(run_cuda_attn_bench PRIVATE tests)
 endif()
 
 # F6: pybind11 module exposing the C++ core to Python — the vLLM-shape pivot

@@ -50,6 +50,11 @@ extern bool g_cuda_fp16_weights;
 // the warp-per-query kernel, so a bench can A/B the attention speedup. Default false; not thread-safe.
 extern bool g_cuda_force_naive_attn;
 
+// Opt-in knob (G5f): use the shared-memory K/V tiled attention kernel at prefill (sq>1) instead of
+// the non-tiled online kernel. Default false — tiling only ties on this model (KV fits in L2); it's
+// the FlashAttention structure for when K/V outgrow L2. Bit-identical output either way.
+extern bool g_cuda_use_tiled_attn;
+
 class CudaBackend : public Backend {
 public:
     Device device() const override;

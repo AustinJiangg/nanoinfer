@@ -959,6 +959,93 @@ __global__ void attention_warp_kernel(const float* __restrict__ q, const float* 
     }
 }
 
+// FlashAttention with shared-memory K/V TILING (G5f-tiled) — the IO-aware lever. attention_warp_kernel
+// gives each (head,query) a warp, but every warp re-reads its keys from global/L2; here a thread BLOCK
+// handles one head and a tile of warpsPerBlock queries, and stages each Bc-key slab of K/V into shared
+// memory ONCE so all the block's queries read it from SRAM — warpsPerBlock× fewer global K/V reads.
+// Parity is free: with Bc=32 and lane l taking key (base+l), every lane processes exactly the keys it
+// would in attention_warp_kernel (l, l+32, …) in the same order, so this kernel is BIT-IDENTICAL to the
+// non-tiled online kernel (hence to the paged kernel) — run_cuda_paged stays max|diff|=0 with only the
+// contiguous path tiled. Online softmax (running m,l,acc per lane), so K is still read once. Inactive
+// warps (qi>=sq, ragged last block) must keep hitting the block-wide __syncthreads(), so they take part
+// in the cooperative load and skip only the compute/write. smem = 2·Bc·D floats (dynamic). For this
+// model the per-layer KV fits in L2, so the win is modest (L2 already caches the reuse) — see ROADMAP.
+template <int Bc>
+__global__ void attention_warp_tiled_kernel(const float* __restrict__ q, const float* __restrict__ k,
+                                            const float* __restrict__ v, float* __restrict__ out,
+                                            int64_t H, int64_t sq, int64_t sk, int64_t D, int causal,
+                                            int64_t query_offset, float scale) {
+    extern __shared__ float smem[];
+    float* Ks = smem;             // [Bc][D]
+    float* Vs = smem + Bc * D;    // [Bc][D]
+    const int warpsPerBlock = static_cast<int>(blockDim.x) / 32;
+    const int warpInBlock = static_cast<int>(threadIdx.x) / 32;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int64_t h = blockIdx.y;                                       // one head per block (grid.y=H)
+    const int64_t q0 = static_cast<int64_t>(blockIdx.x) * warpsPerBlock;  // first query in this block
+    const int64_t qi = q0 + warpInBlock;                               // this warp's query (maybe >=sq)
+    const bool active = (qi < sq);
+    const float* qrow = active ? (q + (h * sq + qi) * D) : nullptr;
+    const float* kh = k + h * sk * D;
+    const float* vh = v + h * sk * D;
+    const int64_t limit = active ? (causal ? (query_offset + qi + 1) : sk) : 0;
+    // The block only needs key tiles up to the largest limit among its queries (the last one's).
+    const int64_t q_last = (q0 + warpsPerBlock - 1 < sq) ? (q0 + warpsPerBlock - 1) : (sq - 1);
+    const int64_t block_limit = causal ? (query_offset + q_last + 1) : sk;
+
+    float m = -INFINITY, l = 0.0f;
+    float lacc[kMaxHeadDim];
+    for (int64_t d = 0; d < D; ++d) lacc[d] = 0.0f;
+
+    for (int64_t base = 0; base < block_limit; base += Bc) {
+        // Stage this tile into smem. The tile [base, base+valid) × D is contiguous in kh/vh; the whole
+        // block cooperates (coalesced). Guard the ragged last tile against reading past sk.
+        const int64_t valid = (sk - base < Bc) ? (sk - base) : Bc;
+        for (int idx = static_cast<int>(threadIdx.x); idx < valid * D;
+             idx += static_cast<int>(blockDim.x)) {
+            Ks[idx] = kh[base * D + idx];
+            Vs[idx] = vh[base * D + idx];
+        }
+        __syncthreads();
+        // This warp's lane l scores key (base+l) from smem and online-updates — same key, same order
+        // as attention_warp_kernel's `for j=lane; j<limit; j+=32`.
+        if (active) {
+            const int64_t j = base + lane;
+            if (j < limit) {
+                const float* kj = Ks + lane * D;
+                float s = 0.0f;
+                for (int64_t d = 0; d < D; ++d) s += qrow[d] * kj[d];
+                s *= scale;
+                const float m_new = fmaxf(m, s);
+                const float corr = expf(m - m_new);
+                const float p = expf(s - m_new);
+                l = l * corr + p;
+                const float* vj = Vs + lane * D;
+                for (int64_t d = 0; d < D; ++d) lacc[d] = lacc[d] * corr + p * vj[d];
+                m = m_new;
+            }
+        }
+        __syncthreads();  // all warps, before the next tile overwrites smem
+    }
+    // Merge the 32 lane-partials (identical to attention_warp_kernel, same empty-segment guard).
+    for (int off = 16; off > 0; off >>= 1) {
+        const float m_o = __shfl_down_sync(0xffffffff, m, off);
+        const float l_o = __shfl_down_sync(0xffffffff, l, off);
+        const float m_new = fmaxf(m, m_o);
+        const bool empty = (m_new == -INFINITY);
+        const float a = empty ? 0.0f : expf(m - m_new), a_o = empty ? 0.0f : expf(m_o - m_new);
+        l = l * a + l_o * a_o;
+        for (int64_t d = 0; d < D; ++d)
+            lacc[d] = lacc[d] * a + __shfl_down_sync(0xffffffff, lacc[d], off) * a_o;
+        m = m_new;
+    }
+    if (active && lane == 0) {
+        const float inv = 1.0f / l;
+        float* oi = out + (h * sq + qi) * D;
+        for (int64_t d = 0; d < D; ++d) oi[d] = lacc[d] * inv;
+    }
+}
+
 // Write the t new tokens' K/V ([n_kv, t, hd]) into this sequence's blocks for one layer.
 // One thread per (head, token, dim); the block + offset come from the block table.
 __global__ void paged_write_kernel(const float* __restrict__ k, const float* __restrict__ v,
@@ -1226,6 +1313,11 @@ bool g_cuda_use_wmma = false;
 bool g_cuda_fp16_weights = false;
 // Bench/diagnostic knob (G5e): force the naive one-thread-per-query attention for A/B timing.
 bool g_cuda_force_naive_attn = false;
+// Opt-in knob (G5f): use the shared-memory K/V tiled kernel at prefill (sq>1). Default OFF — on
+// Qwen2.5-0.5B the per-layer KV fits in L2, so tiling only TIES the non-tiled online kernel (and
+// slightly regresses small prefill from the smem staging); it's the correct FlashAttention structure
+// that wins once K/V outgrow L2 (bigger model/batch, smaller-L2 GPU). Bit-identical either way.
+bool g_cuda_use_tiled_attn = false;
 
 Tensor CudaBackend::linear(const Tensor& x, const Tensor& weight, const Tensor* bias) {
     const int64_t m = x.size(0), k = x.size(1), n = weight.size(0);
@@ -1420,10 +1512,22 @@ Tensor CudaBackend::attention(const Tensor& q, const Tensor& k, const Tensor& v,
         throw std::runtime_error("CudaBackend::attention: head_dim > 128 not supported (G2)");
     Tensor out = device_alloc({H, sq, D});
     const float scale = 1.0f / sqrtf(static_cast<float>(D));
+    constexpr int kBc = 32;  // tile width = warp width, so lane l ↔ key (base+l) preserves the order
     if (g_cuda_force_naive_attn) {
         attention_kernel<<<grid1d(H * sq, kBlock), kBlock>>>(
             dptr(q), dptr(k), dptr(v), dptr(out), H, sq, sk, D, causal ? 1 : 0, query_offset, scale);
         launch_check("attention_kernel");
+    } else if (sq > 1 && g_cuda_use_tiled_attn) {
+        // Opt-in: shared-memory K/V tiling (G5f-tiled). A block of 8 warps shares each K/V tile, so
+        // grid is (query-tiles per head, H). Default off — see g_cuda_use_tiled_attn. Decode (sq=1)
+        // has no query reuse anyway, so it always takes the non-tiled path below.
+        const int threads = 256, warpsPerBlock = threads / 32;  // 8 queries/block
+        const dim3 grid(static_cast<unsigned>((sq + warpsPerBlock - 1) / warpsPerBlock),
+                        static_cast<unsigned>(H));
+        const size_t smemBytes = 2u * kBc * static_cast<size_t>(D) * sizeof(float);
+        attention_warp_tiled_kernel<kBc><<<grid, threads, smemBytes>>>(
+            dptr(q), dptr(k), dptr(v), dptr(out), H, sq, sk, D, causal ? 1 : 0, query_offset, scale);
+        launch_check("attention_warp_tiled_kernel");
     } else {
         const int threads = 256;  // 8 warps/block, one warp per (head,query)
         const int blocks = static_cast<int>((H * sq + threads / 32 - 1) / (threads / 32));

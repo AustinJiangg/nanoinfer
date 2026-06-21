@@ -329,7 +329,27 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
           the recorded G5e two-pass): **77.2 vs 70.1 tok/s @ctx128 (1.10×), 56.4 vs 48.4 @ctx512
           (1.17×)** — and 7× over naive attention at ctx 1024 (45.2 vs 6.5). The online body is also
           the *prerequisite* for tiling: you can only stream K in blocks because the running max is
-          rescaled as later blocks arrive.
+          rescaled as later blocks arrive. The isolated kernel (run_cuda_attn_bench, no full-step
+          dilution) shows online's true size vs naive: **4.9× @sq128, 2.6× @sq512, and 20× at decode**
+          (sq=1, sk=4096: 1.68 vs 34.7 ms — the naive kernel walks the whole KV with H=14 threads).
+    - [x] **G5f-tiled** — shared-memory K/V tiling (the IO-aware lever), opt-in (`g_cuda_use_tiled_attn`,
+          default OFF). A thread block handles one head + a tile of 8 queries and stages each 32-key K/V
+          slab into shared memory ONCE, so the block's 8 queries read it from SRAM (8× fewer global
+          reads). Designed to stay parity-clean: with tile width 32 and lane l ↔ key (base+l), every
+          lane processes the same keys in the same order as the non-tiled kernel, so the tiled output is
+          **bit-identical** (run_cuda_attn_bench tile==notile max|diff|=0 at every shape; run_cuda_paged
+          stays max|diff|=0 with only the contiguous path tiled — it equals the non-tiled paged kernel
+          bit-for-bit; run_cuda_parity logits unchanged to the last digit, 3.76701e-05). **Honest
+          result: tiling does NOT win on this model.** Isolated A/B (run_cuda_attn_bench): tiled/notile =
+          0.89× @sq128 (the smem staging + 2 syncs/tile LOSE when reuse is small), 1.00–1.01× at sq
+          512–2048 — a tie. Cause, as predicted: Qwen2.5-0.5B's per-layer KV is ~130 KB at ctx 128 and
+          ~8 MB even at ctx 8k, both inside the 4070S's ~48 MB L2, so the global→smem reuse the tiling
+          buys is ALREADY served by L2 (the textbook HBM→SRAM win needs K/V to outgrow L2 — bigger
+          model/batch, longer context, or a smaller-L2 GPU). So it's kept opt-in as the correct
+          FlashAttention structure (same call as G5d keeping the losing wmma path behind a flag), while
+          the **non-tiled online kernel is the default** — it carries the real G5f win. The genuine
+          long-context decode lever left is Flash-Decoding (split-K over the KV: more blocks per query,
+          combine partials) — backlog.
 
 ## Cross-platform (portability proof, after the GPU is learned)
 - [x] **NEON** — `simd.hpp`'s `#elif` path now carries the three inner products on aarch64
@@ -355,6 +375,14 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
 ## Backlog (pull in when the moment fits)
 Open candidates, not a closed/deferred-forever list — fold one into a stage when it's
 the right moment:
+- Flash-Decoding (split-K attention) — the real long-context DECODE lever G5f left open. At decode
+  sq=1, attention has only H=14 warps (~3% of the GPU); the online-softmax win is from halving the
+  K reads, not parallelism. Splitting the KV across multiple blocks per query (each does a partial
+  online softmax, then combine the partials) would fill the GPU at long context. Pairs with the
+  G5f-tiled kernel (already online-softmax + smem). Decode is the latency-critical serving path.
+- shared-mem tiling for the PAGED attention kernel — G5f tiled only the contiguous path (enough to
+  characterize the muted-by-L2 result). Mirroring it into paged_attention_warp_kernel (gather blocks
+  into smem) is mechanical and would stay bit-identical; do it if/when tiling starts winning.
 - int8×int8→int32 GEMM — DONE (G5d W8A8: CPU oracle linear_w8a8 + simd::dot_qq, GPU cuda_linear_w8a8
   DP4A, model-integrated; the compute win — gate/up 1.11×, down 1.14×, lm_head 1.36×).
 - int8-quantize embedding / lm_head — **DONE** (CPU + GPU; weight-only int8, the biggest single

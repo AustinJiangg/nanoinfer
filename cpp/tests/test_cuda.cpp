@@ -258,6 +258,16 @@ int main() {
     ok &= check_attention(1, 64, 64, 64, true, 0, 1e-3, rng);    // longer prefill, multiple lane passes
     ok &= check_attention(4, 5, 5, 64, true, 0, 1e-3, rng);      // tiny causal: most lanes empty (limit 1..5)
 
+    // Opt-in shared-memory K/V tiled kernel (G5f-tiled): same cases must meet the oracle (it's
+    // bit-identical to the non-tiled path — same key order). Includes a ragged shape (sq,sk not
+    // multiples of 32/warps-per-block) to exercise partial tiles and inactive warps.
+    g_cuda_use_tiled_attn = true;
+    ok &= check_attention(2, 40, 40, 64, true, 0, 1e-3, rng);    // tiled prefill, multi-tile
+    ok &= check_attention(3, 16, 16, 64, false, 0, 1e-3, rng);   // tiled full (non-causal)
+    ok &= check_attention(4, 5, 5, 64, true, 0, 1e-3, rng);      // tiled ragged: sq < warps/block
+    ok &= check_attention(2, 130, 130, 64, true, 0, 1e-3, rng);  // tiled ragged tiles + query blocks
+    g_cuda_use_tiled_attn = false;
+
     // W8A8 DP4A int8 GEMM (G5d): the projection shapes, prefill + small m, with and without bias.
     // The integer core is identical to the CPU oracle, so the tolerance is just the float dequant.
     ok &= check_w8a8(128, 896, 896, true, 2e-3, rng);    // q/o prefill, +bias
