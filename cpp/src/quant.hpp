@@ -49,6 +49,14 @@ Tensor dequantize_q8(const QTensor& w);
 // runs over the int8 codes; the per-row scale is applied once at the end.
 Tensor linear_q8(const Tensor& x, const QTensor& w, const Tensor* bias = nullptr);
 
+// Gather rows of an int8 (Q8) embedding table by id, dequantizing each:
+//   out[r, :] = q[ids[r], :] * scale[ids[r]].
+// The weight-only int8 analogue of ops.cpp's embedding(). The table is the SAME tied
+// [vocab, hidden] QTensor the output projection reads via linear_q8 (out = vocab), so the
+// token embedding and the lm_head stay one quantized weight — G5d's int8 for the biggest
+// single weight, with fp32 activations (the gather output) feeding the rest of the model.
+Tensor embedding_q8(const QTensor& table, const std::vector<int64_t>& ids);
+
 // W8A8: the SAME int8 weight (a QTensor from quantize_q8), but the activations are also quantized
 // to int8 — dynamically, per row: a_scale[i] = max_j|x[i,j]|/127. The inner product is then an
 // int8×int8→int32 integer dot (simd::dot_qq), dequantized by both scales at the end:

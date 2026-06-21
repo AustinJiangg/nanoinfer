@@ -101,6 +101,21 @@ Tensor dequantize_q8(const QTensor& w) {
     return out;
 }
 
+Tensor embedding_q8(const QTensor& table, const std::vector<int64_t>& ids) {
+    check_qtensor(table);
+    const int64_t vocab = table.out, hidden = table.in;  // table is [vocab, hidden]
+    Tensor out({static_cast<int64_t>(ids.size()), hidden});
+    for (size_t r = 0; r < ids.size(); ++r) {
+        const int64_t id = ids[r];
+        require(id >= 0 && id < vocab, "embedding_q8: id out of range");
+        const int8_t* src = table.q.data() + id * hidden;          // int8 codes for token `id`
+        const float scale = table.scale[static_cast<size_t>(id)];  // that row's dequant scale
+        float* dst = out.data() + static_cast<int64_t>(r) * hidden;
+        for (int64_t c = 0; c < hidden; ++c) dst[c] = float(src[c]) * scale;
+    }
+    return out;
+}
+
 Tensor linear_q8(const Tensor& x, const QTensor& w, const Tensor* bias) {
     check_qtensor(w);
     require(x.ndim() == 2, "linear_q8 expects 2-D x");

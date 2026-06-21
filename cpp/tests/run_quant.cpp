@@ -25,21 +25,28 @@ int main(int argc, char** argv) {
     const std::string dir = argv[1];
     const std::string mode_str = argc > 2 ? argv[2] : "q8";
     ni::QuantMode mode = ni::QuantMode::Q8;
-    if (mode_str == "q4") mode = ni::QuantMode::Q4;
+    if (mode_str == "none") mode = ni::QuantMode::None;
+    else if (mode_str == "q4") mode = ni::QuantMode::Q4;
     else if (mode_str == "q4g") mode = ni::QuantMode::Q4G;
     else if (mode_str == "w8a8") mode = ni::QuantMode::W8A8;
     else if (mode_str != "q8") {
-        std::printf("unknown mode '%s' (use q8, q4, q4g, or w8a8)\n", mode_str.c_str());
+        std::printf("unknown mode '%s' (use none, q8, q4, q4g, or w8a8)\n", mode_str.c_str());
         return 2;
     }
+    // Optional trailing "embed": also quantize the tied token-embedding / lm_head to weight-only
+    // int8 (G5d) — the biggest single weight, and it feeds argmax, so this run IS the token guard.
+    // Pair with `none` to isolate the embed/lm_head, or with a layer mode for the full int8 model.
+    const bool embed_q8 = argc > 3 && std::string(argv[3]) == "embed";
+    ni::g_quantize_embed = embed_q8;
+    const std::string label = mode_str + (embed_q8 ? "+embed8" : "");
     try {
         ni::Model model(dir, mode);
-        std::printf("quant mode: %s\n", mode_str.c_str());
+        std::printf("quant mode: %s\n", label.c_str());
         std::vector<int64_t> ids = read_ids(dir + "/ref_ids.txt");
 
         auto bytes = model.weight_bytes();
         std::printf("weights: %.1f MB (%s) vs %.1f MB (fp32) -> %.2fx smaller\n",
-                    bytes.first / 1e6, mode_str.c_str(), bytes.second / 1e6,
+                    bytes.first / 1e6, label.c_str(), bytes.second / 1e6,
                     double(bytes.second) / double(bytes.first));
 
         // Logit error vs the fp32 reference.
@@ -68,7 +75,7 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < ref_gen.size() && i < got.size(); ++i)
             if (ref_gen[i] != got[i]) ++gen_mism;
         print_ids("fp32  greedy:", ref_gen);
-        print_ids((mode_str + " greedy:").c_str(), got);
+        print_ids((label + " greedy:").c_str(), got);
         std::printf("greedy tokens matching fp32: %zu/%zu\n", ref_gen.size() - gen_mism,
                     ref_gen.size());
 
@@ -77,7 +84,7 @@ int main(int argc, char** argv) {
         // group-wise quant is the fix). This is a measurement tool, so a quality
         // loss is reported, not a failure.
         const bool next_ok = !ref_gen.empty() && !got.empty() && ref_gen[0] == got[0];
-        std::printf("next-token under %s: %s\n", mode_str.c_str(),
+        std::printf("next-token under %s: %s\n", label.c_str(),
                     next_ok ? "preserved" : "CHANGED (lossy)");
         std::printf("run_quant: ok\n");
         return 0;

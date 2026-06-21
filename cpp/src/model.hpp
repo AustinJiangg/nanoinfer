@@ -20,6 +20,13 @@
 
 namespace ni {
 
+// Opt-in (G5d): quantize the tied token-embedding / lm_head weight to weight-only int8 — the
+// biggest single weight (~544 MB fp32 on Qwen2.5-0.5B). Set before constructing a Model. It is
+// orthogonal to the layer-projection QuantMode and to g_cuda_fp16_weights: the embed/lm_head get
+// int8, the layer projections whatever `mode` says. Like g_cuda_fp16_weights, a load-time global so
+// a test can toggle it around one constructor. CPU is wired now; the CUDA device path lands next.
+extern bool g_quantize_embed;
+
 class Model {
 public:
     // Load config.txt and every <name>.bin in `weights_dir`. With a quant mode,
@@ -67,6 +74,11 @@ private:
     const Tensor& W(const std::string& name) const;
     // A linear projection that dispatches to the Q8 path when `name` is quantized.
     Tensor project(const Tensor& x, const std::string& name, const Tensor* bias) const;
+    // The token-embedding gather and the output projection to logits — each weight-only int8
+    // (embedding_q8 / linear_q8) when g_quantize_embed quantized that tied weight, else the
+    // fp32/device backend path. One place each so forward() and forward_batch() share the routing.
+    Tensor embed_tokens(const std::vector<int64_t>& ids) const;
+    Tensor lm_head(const Tensor& x) const;
 
     // Device-dispatch seam (G0): forward() runs every op through this. CpuBackend
     // wraps the free ops in ops.cpp; CUDA/Metal backends override them (G1+).
@@ -75,6 +87,12 @@ private:
     std::unordered_map<std::string, Tensor> w_;  // fp32 weights
     // Quantized layer-projection weights (any mode), via the polymorphic wrapper.
     std::unordered_map<std::string, std::unique_ptr<QuantizedWeight>> qweights_;
+    // Weight-only int8 (Q8) for the tied token-embedding / output-projection — the biggest single
+    // weight. Built when g_quantize_embed is set (CPU; CUDA next). The gather dequantizes a row
+    // (embedding_q8); the tied lm_head runs linear_q8. lmhead_q8_ is non-null only for an untied
+    // checkpoint (otherwise the lm_head reuses embed_q8_).
+    std::unique_ptr<QTensor> embed_q8_;
+    std::unique_ptr<QTensor> lmhead_q8_;
     RopeCache rope_;  // built once for max_position_embeddings, sliced per forward
 };
 

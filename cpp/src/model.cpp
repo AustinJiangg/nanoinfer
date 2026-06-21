@@ -35,6 +35,9 @@ bool is_fp16_weight(const std::string& name) {
 }
 }  // namespace
 
+// Default off; a caller (test/bench) sets it before constructing a Model. See model.hpp.
+bool g_quantize_embed = false;
+
 Model::Model(const std::string& weights_dir, QuantMode mode, Device device) {
     // The Backend is the device-dispatch seam (G0): forward() below is written once
     // against it. CPU is the only backend wired in G0; CUDA/Metal throw here until
@@ -82,6 +85,19 @@ Model::Model(const std::string& weights_dir, QuantMode mode, Device device) {
         }
     }
 
+    // G5d: weight-only int8 for the tied token-embedding / output-projection (the biggest single
+    // weight). The gather dequantizes a row; the lm_head runs linear_q8 — fp32 activations into
+    // argmax, so only the weight rounds. CPU oracle here; the CUDA device path lands next, so this
+    // is gated to CPU (on CUDA the embed/lm_head stay fp32/fp16 and upload below as before).
+    if (g_quantize_embed && device == Device::CPU) {
+        embed_q8_ = std::make_unique<QTensor>(quantize_q8(W("embed_tokens.weight")));
+        w_.erase("embed_tokens.weight");
+        if (!cfg_.tie_word_embeddings && w_.count("lm_head.weight")) {
+            lmhead_q8_ = std::make_unique<QTensor>(quantize_q8(W("lm_head.weight")));
+            w_.erase("lm_head.weight");
+        }
+    }
+
 #ifdef NI_CUDA
     // CUDA path: upload every resident weight + the RoPE tables to the GPU once, here,
     // so the forward never copies a weight again — H2D only at load, the GPU analogue of
@@ -122,6 +138,24 @@ Tensor Model::project(const Tensor& x, const std::string& name, const Tensor* bi
     return backend_->linear(x, W(name), bias);
 }
 
+Tensor Model::embed_tokens(const std::vector<int64_t>& ids) const {
+    // Weight-only int8 gather when the embed weight is quantized (g_quantize_embed), else the
+    // backend's fp32/device gather (which also reads the fp16 table under g_cuda_fp16_weights).
+    if (embed_q8_) return embedding_q8(*embed_q8_, ids);
+    return backend_->embedding(W("embed_tokens.weight"), ids);
+}
+
+Tensor Model::lm_head(const Tensor& x) const {
+    // Tied models reuse embed_q8_ as the output projection; an untied checkpoint has its own
+    // lmhead_q8_. Either way linear_q8 is weight-only int8 (fp32 activations × int8 weight).
+    const QTensor* lmq = lmhead_q8_ ? lmhead_q8_.get() : embed_q8_.get();
+    if (lmq) return linear_q8(x, *lmq, nullptr);
+    // fp32/device path: tied models share the embedding (the exporter skips the duplicate
+    // lm_head.weight), so fall back to embed_tokens here.
+    const std::string lm = cfg_.tie_word_embeddings ? "embed_tokens.weight" : "lm_head.weight";
+    return backend_->linear(x, W(lm), nullptr);
+}
+
 std::pair<int64_t, int64_t> Model::weight_bytes() const {
     int64_t actual = 0, fp32 = 0;
     for (const auto& kv : w_) {
@@ -134,6 +168,15 @@ std::pair<int64_t, int64_t> Model::weight_bytes() const {
     for (const auto& kv : qweights_) {
         actual += kv.second->bytes();
         fp32 += kv.second->fp32_bytes();
+    }
+    // The int8 embed/lm_head (G5d): int8 codes + fp32 row scales, vs out*in*4 fp32.
+    if (embed_q8_) {
+        actual += int64_t(embed_q8_->q.size()) + int64_t(embed_q8_->scale.size()) * 4;
+        fp32 += embed_q8_->out * embed_q8_->in * 4;
+    }
+    if (lmhead_q8_) {
+        actual += int64_t(lmhead_q8_->q.size()) + int64_t(lmhead_q8_->scale.size()) * 4;
+        fp32 += lmhead_q8_->out * lmhead_q8_->in * 4;
     }
     return {actual, fp32};
 }
@@ -156,7 +199,7 @@ Tensor Model::forward(const std::vector<int64_t>& ids, KVCacheBase* cache) const
         throw std::runtime_error("forward: position " + std::to_string(start_pos + seq) +
                                  " exceeds context length " + std::to_string(rope_.cos.size(0)));
 
-    Tensor x = backend_->embedding(W("embed_tokens.weight"), ids);  // [seq, hidden]
+    Tensor x = embed_tokens(ids);  // [seq, hidden]
 
     for (int64_t i = 0; i < cfg_.num_layers; ++i) {
         const std::string L = "layers." + std::to_string(i) + ".";
@@ -203,10 +246,7 @@ Tensor Model::forward(const std::vector<int64_t>& ids, KVCacheBase* cache) const
     if (cache) cache->advance(seq);
 
     x = backend_->rmsnorm(x, W("norm.weight"), eps);
-    // Tied models share the embedding as the output projection, so the exporter
-    // skips the duplicate lm_head.weight; fall back to embed_tokens here.
-    const std::string lm = cfg_.tie_word_embeddings ? "embed_tokens.weight" : "lm_head.weight";
-    Tensor logits = backend_->linear(x, W(lm), nullptr);  // [seq, vocab]
+    Tensor logits = lm_head(x);  // [seq, vocab]
 #ifdef NI_CUDA
     if (logits.device() == Device::CUDA) logits = to_host(logits);  // D2H only at the edge
 #endif
@@ -237,7 +277,7 @@ Tensor Model::forward_batch(const std::vector<int64_t>& tokens,
                                      std::to_string(rope_.cos.size(0)));
     }
 
-    Tensor x = backend_->embedding(W("embed_tokens.weight"), tokens);  // [n, hidden]
+    Tensor x = embed_tokens(tokens);  // [n, hidden]
 
     for (int64_t i = 0; i < cfg_.num_layers; ++i) {
         const std::string L = "layers." + std::to_string(i) + ".";
@@ -278,8 +318,7 @@ Tensor Model::forward_batch(const std::vector<int64_t>& tokens,
     for (int64_t s = 0; s < n; ++s) caches[s]->advance(1);
 
     x = backend_->rmsnorm(x, W("norm.weight"), eps);
-    const std::string lm = cfg_.tie_word_embeddings ? "embed_tokens.weight" : "lm_head.weight";
-    Tensor logits = backend_->linear(x, W(lm), nullptr);  // [n, vocab]
+    Tensor logits = lm_head(x);  // [n, vocab]
 #ifdef NI_CUDA
     if (logits.device() == Device::CUDA) logits = to_host(logits);
 #endif

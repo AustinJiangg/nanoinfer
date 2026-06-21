@@ -353,6 +353,36 @@ int main() {
         CHECK(ni::make_quantized(w, ni::QuantMode::None) == nullptr);
     }
 
+    // --- embedding_q8 (weight-only int8 token embedding / tied lm_head) ---
+
+    // Gathering rows of the int8 table (dequantized on the fly) equals gathering rows of
+    // the dequantized fp32 table — embedding_q8 IS the row-gather of dequantize_q8, using
+    // the same per-row scale the tied lm_head's linear_q8 applies. One int8 weight, two ops.
+    {
+        std::mt19937_64 rng(20);
+        std::normal_distribution<float> nd;
+        Tensor table({6, 8});  // [vocab=6, hidden=8]
+        for (int64_t i = 0; i < table.numel(); ++i) table[i] = nd(rng);
+        ni::QTensor q = ni::quantize_q8(table);
+        Tensor dq = ni::dequantize_q8(q);                 // fp32 reconstruction
+        std::vector<int64_t> ids = {0, 5, 3, 3, 1};       // a repeat + the last row
+        Tensor got = ni::embedding_q8(q, ids);
+        CHECK(got.size(0) == 5 && got.size(1) == 8);
+        for (size_t r = 0; r < ids.size(); ++r)
+            for (int64_t c = 0; c < 8; ++c)
+                CHECK_CLOSE(got.at(static_cast<int64_t>(r), c), dq.at(ids[r], c), 1e-6);
+    }
+
+    // An out-of-range id is rejected (the gather indexes the table directly).
+    {
+        Tensor table({3, 4});
+        for (int64_t i = 0; i < table.numel(); ++i) table[i] = float(i);
+        ni::QTensor q = ni::quantize_q8(table);
+        bool threw = false;
+        try { ni::embedding_q8(q, {3}); } catch (const std::exception&) { threw = true; }
+        CHECK(threw);
+    }
+
     std::printf(g_failures ? "test_quant: %d failures\n" : "test_quant: ok\n", g_failures);
     return g_failures ? 1 : 0;
 }
