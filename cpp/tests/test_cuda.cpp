@@ -14,6 +14,7 @@
 // -DNI_CUDA=ON.
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <random>
 
@@ -72,10 +73,17 @@ static bool check_attention(int64_t H, int64_t sq, int64_t sk, int64_t D, bool c
     Tensor qd = to_device(q), kd = to_device(k), vd = to_device(v);
     Tensor o_gpu = to_host(gpu.attention(qd, kd, vd, causal, query_offset));
 
+    // NaN-aware: std::max(x, NaN) silently returns x, so a NaN output (e.g. an empty-lane combine
+    // poisoning the softmax) would slip past a plain max reduction. Catch it explicitly and fail.
     double maxdiff = 0.0;
-    for (int64_t i = 0; i < o_cpu.numel(); ++i)
-        maxdiff = std::max(maxdiff, std::fabs(static_cast<double>(o_cpu[i]) - o_gpu[i]));
-    const bool ok = maxdiff < tol;
+    bool nan = false;
+    for (int64_t i = 0; i < o_cpu.numel(); ++i) {
+        const double d = std::fabs(static_cast<double>(o_cpu[i]) - o_gpu[i]);
+        if (std::isnan(d)) nan = true;
+        else maxdiff = std::max(maxdiff, d);
+    }
+    if (nan) maxdiff = std::numeric_limits<double>::quiet_NaN();
+    const bool ok = !nan && maxdiff < tol;
     std::printf("test_cuda: attn H=%lld sq=%4lld sk=%4lld D=%lld %-6s qoff=%-3lld max|diff|=%.3e (tol %.0e) %s\n",
                 (long long)H, (long long)sq, (long long)sk, (long long)D, causal ? "causal" : "full",
                 (long long)query_offset, maxdiff, tol, ok ? "ok" : "FAIL");
@@ -240,12 +248,15 @@ int main() {
     ok &= check_embedding(2048, 896, 8, false, 1e-6, rng);  // fp32 table — exact
     ok &= check_embedding(2048, 896, 8, true, 1e-3, rng);   // fp16 table — fp16 rounding
 
-    // Warp-per-query attention (G5e): prefill (limit>32 → lane key-striding), decode (sq=1, large
-    // sk), and full (non-causal). Tight tol — only the key sums reorder vs the CPU oracle.
+    // Warp-per-query + online-softmax attention (G5f): prefill (limit>32 → lane key-striding),
+    // decode (sq=1, large sk), and full (non-causal). Tight tol — only the key sums reorder vs the
+    // CPU oracle. The causal cases exercise the empty-lane combine: query i sees limit=i+1 keys, so
+    // for i<31 the lanes i+1..31 have no keys (m=−inf) and must merge to 0, not NaN.
     ok &= check_attention(2, 40, 40, 64, true, 0, 1e-3, rng);    // prefill, causal, limit up to 40
     ok &= check_attention(2, 1, 100, 64, true, 99, 1e-3, rng);   // decode, large sk
     ok &= check_attention(3, 16, 16, 64, false, 0, 1e-3, rng);   // full (non-causal)
     ok &= check_attention(1, 64, 64, 64, true, 0, 1e-3, rng);    // longer prefill, multiple lane passes
+    ok &= check_attention(4, 5, 5, 64, true, 0, 1e-3, rng);      // tiny causal: most lanes empty (limit 1..5)
 
     // W8A8 DP4A int8 GEMM (G5d): the projection shapes, prefill + small m, with and without bias.
     // The integer core is identical to the CPU oracle, so the tolerance is just the float dequant.

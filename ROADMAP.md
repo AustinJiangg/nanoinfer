@@ -306,6 +306,30 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
         no K re-read) + shared-mem K/V tiling. The paged attention kernel got the same
         warp-per-query treatment (paged stays bit-identical to contiguous, run_cuda_paged
         max|diff|=0, golden MATCH), so both KV paths are now warp-parallel.
+  - [x] **G5f** — FlashAttention (IO-aware): the two levers G5e named "still ahead" — **online
+        softmax (one pass)** + **shared-mem K/V tiling**. Honest scope first: for Qwen2.5-0.5B the
+        per-layer KV is ~130 KB at ctx 128 and ~8 MB even at ctx 8k, both inside the 4070S's large
+        L2, so FlashAttention's textbook HBM→SRAM win is *muted* (L2 already catches the reuse). The
+        clean measurable win here is the one-pass online softmax; tiling is the structurally-correct
+        FlashAttention that matters more as context/batch grow and on smaller-L2 GPUs.
+    - [x] **G5f-online** — one-pass online softmax in the warp-per-query kernel. G5e read each key
+          TWICE (pass 1 for the global max, pass 2 to re-score + accumulate). Now each lane keeps a
+          running (m, l, acc) over its strided keys and rescales acc/l by exp(m_old−m_new) when the
+          max moves; the 32 lane-partials then merge by the associative FlashAttention combine. Same
+          D-vector op count as two-pass but the score dot is computed ONCE → **K read once not twice**,
+          the win growing with context (decode walks the whole KV each step). Sharp edge found & fixed:
+          a query with limit<32 leaves lanes limit..31 empty (m=−inf), and the both-empty combine does
+          exp(−inf−(−inf))=exp(NaN)=NaN — which poisoned the model's logits (every prefill has a
+          query 0 with limit 1). The isolated attention test *passed* anyway because its max-diff used
+          std::max(x,NaN)=x, silently swallowing the NaN; fixed the combine (empty segment ⇒ correction
+          0) AND made the test NaN-aware (+ a tiny-causal case). Parity restored: test_cuda attn
+          ~1e-7, run_cuda_parity logits 3.5e-5→3.77e-5 (the extra online rescaling, golden tokens
+          MATCH), run_cuda_paged still max|diff|=0 vs contiguous (the paged kernel runs the same body
+          verbatim), run_cuda_cache / run_cuda_batch max|diff|=0. Decode A/B (real GEMM held fixed, vs
+          the recorded G5e two-pass): **77.2 vs 70.1 tok/s @ctx128 (1.10×), 56.4 vs 48.4 @ctx512
+          (1.17×)** — and 7× over naive attention at ctx 1024 (45.2 vs 6.5). The online body is also
+          the *prerequisite* for tiling: you can only stream K in blocks because the running max is
+          rescaled as later blocks arrive.
 
 ## Cross-platform (portability proof, after the GPU is learned)
 - [x] **NEON** — `simd.hpp`'s `#elif` path now carries the three inner products on aarch64

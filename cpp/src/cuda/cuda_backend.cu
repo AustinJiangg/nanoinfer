@@ -889,17 +889,21 @@ __global__ void attention_kernel(const float* __restrict__ q, const float* __res
     for (int64_t d = 0; d < D; ++d) oi[d] = acc[d] * inv;
 }
 
-// Attention, WARP-per-query (G5e): the naive kernel above runs one THREAD per (head,query) — only
-// H*sq threads (14*128 = 1792 at prefill), ~3% of the GPU, each grinding a serial key loop. This
-// gives each (head,query) a whole WARP: the 32 lanes stride the keys (lane l takes keys l, l+32,
-// …), so there are 32× the threads and 32× less serial work per thread — the parallelism win that
-// matters at short context, where K/V already fit in L2 (FlashAttention's IO tiling is the
-// long-context lever, deferred). Same two-pass max-subtract softmax as the naive kernel and the CPU
-// op — pass 1 reduces the global max (a warp xor-butterfly; max has no rounding, so it equals the
-// CPU's max exactly), pass 2 re-scores and accumulates e and e·V per lane, then reduces to lane 0.
-// Only the per-key SUMS are reordered vs the CPU's sequential add (~1e-6), so it stays within GPU
-// tolerance and golden tokens hold. Full warps only (the warpId guard is warp-uniform), so every
-// __shfl_*_sync sees all 32 lanes.
+// Attention, WARP-per-query with ONLINE SOFTMAX (G5f): the naive kernel above runs one THREAD per
+// (head,query) — only H*sq threads (14*128 = 1792 at prefill), ~3% of the GPU, each grinding a
+// serial key loop. This gives each (head,query) a whole WARP: the 32 lanes stride the keys (lane l
+// takes keys l, l+32, …), 32× the threads and 32× less serial work per thread. G5f then makes the
+// softmax ONE PASS (FlashAttention's online-softmax): each lane keeps a running (m, l, acc) over its
+// keys, rescaling acc/l by exp(m_old − m_new) when the running max moves — instead of a first pass
+// for the global max + a second to re-score. Same D-vector op count as the two-pass kernel, but the
+// score dot is computed ONCE so K is read once not twice; the win grows with context (decode walks
+// the whole KV every step). The 32 lane-partials then merge by the associative FlashAttention
+// combine (m=max; a=exp(m−m); l,acc scaled by a), reduced to lane 0. Online rescaling reorders the
+// per-key sums a little more than the two-pass add (~1e-6 vs the CPU oracle), still within GPU
+// tolerance, golden tokens hold. The empty-lane case is clean: m=−inf ⇒ a=exp(−inf)=0 contributes
+// nothing. Full warps only (warpId guard is warp-uniform), so every __shfl_*_sync sees all 32 lanes.
+// This one-pass body is the prerequisite for K/V tiling — you can only stream K in blocks because the
+// running max is rescaled as later blocks arrive. The paged kernel runs this same body verbatim.
 __global__ void attention_warp_kernel(const float* __restrict__ q, const float* __restrict__ k,
                                       const float* __restrict__ v, float* __restrict__ out,
                                       int64_t H, int64_t sq, int64_t sk, int64_t D, int causal,
@@ -914,36 +918,42 @@ __global__ void attention_warp_kernel(const float* __restrict__ q, const float* 
     const float* vh = v + h * sk * D;
     const int64_t limit = causal ? (query_offset + i + 1) : sk;
 
-    // Pass 1: max over this query's visible keys, lanes striding keys, xor-butterfly so every lane
-    // ends holding the global max (needed for the stable exp in pass 2).
-    float lmax = -INFINITY;
-    for (int64_t j = lane; j < limit; j += 32) {
-        const float* kj = kh + j * D;
-        float s = 0.0f;
-        for (int64_t d = 0; d < D; ++d) s += qi[d] * kj[d];
-        lmax = fmaxf(lmax, s * scale);
-    }
-    for (int off = 16; off > 0; off >>= 1)
-        lmax = fmaxf(lmax, __shfl_xor_sync(0xffffffff, lmax, off));
-
-    // Pass 2: each lane sums e and e·V over its keys, then reduce to lane 0 (which writes the row).
-    float lsum = 0.0f;
+    // ONE PASS: this lane keeps a running max m, denom l, and output acc over its strided keys,
+    // rescaling acc/l whenever a key raises the max. corr = exp(m_old − m_new) ≤ 1 (well-conditioned);
+    // on the first key m=−inf ⇒ corr=exp(−inf)=0 zeroes the empty start (no NaN).
+    float m = -INFINITY, l = 0.0f;
     float lacc[kMaxHeadDim];
     for (int64_t d = 0; d < D; ++d) lacc[d] = 0.0f;
     for (int64_t j = lane; j < limit; j += 32) {
         const float* kj = kh + j * D;
         float s = 0.0f;
         for (int64_t d = 0; d < D; ++d) s += qi[d] * kj[d];
-        const float e = expf(s * scale - lmax);
-        lsum += e;
+        s *= scale;
+        const float m_new = fmaxf(m, s);
+        const float corr = expf(m - m_new);
+        const float p = expf(s - m_new);
+        l = l * corr + p;
         const float* vj = vh + j * D;
-        for (int64_t d = 0; d < D; ++d) lacc[d] += e * vj[d];
+        for (int64_t d = 0; d < D; ++d) lacc[d] = lacc[d] * corr + p * vj[d];
+        m = m_new;
     }
-    for (int off = 16; off > 0; off >>= 1) lsum += __shfl_down_sync(0xffffffff, lsum, off);
-    for (int64_t d = 0; d < D; ++d)
-        for (int off = 16; off > 0; off >>= 1) lacc[d] += __shfl_down_sync(0xffffffff, lacc[d], off);
+    // Merge the 32 lane-partials (FlashAttention combine, associative) down to lane 0, which writes.
+    // Guard the both-empty case: a query with limit<32 leaves lanes limit..31 with no keys (m=−inf),
+    // and −inf−(−inf)=NaN would poison exp. When m_new=−inf the whole segment is empty and must
+    // contribute nothing, so force the corrections to 0 (keeping the lane at m=−inf, l=0, acc=0).
+    for (int off = 16; off > 0; off >>= 1) {
+        const float m_o = __shfl_down_sync(0xffffffff, m, off);
+        const float l_o = __shfl_down_sync(0xffffffff, l, off);
+        const float m_new = fmaxf(m, m_o);
+        const bool empty = (m_new == -INFINITY);
+        const float a = empty ? 0.0f : expf(m - m_new), a_o = empty ? 0.0f : expf(m_o - m_new);
+        l = l * a + l_o * a_o;
+        for (int64_t d = 0; d < D; ++d)
+            lacc[d] = lacc[d] * a + __shfl_down_sync(0xffffffff, lacc[d], off) * a_o;
+        m = m_new;
+    }
     if (lane == 0) {
-        const float inv = 1.0f / lsum;
+        const float inv = 1.0f / l;
         float* oi = out + (h * sq + i) * D;
         for (int64_t d = 0; d < D; ++d) oi[d] = lacc[d] * inv;
     }
@@ -1010,10 +1020,11 @@ __global__ void paged_attention_kernel(const float* __restrict__ q, const float*
     for (int64_t d = 0; d < hd; ++d) oi[d] = acc[d] * inv;
 }
 
-// Paged attention, WARP-per-query (G5e): the warp parallelization of paged_attention_kernel, the
-// same lane-stride-the-keys + two-pass max-subtract as attention_warp_kernel, but each key is read
-// straight from its block (GQA folded in, kvh = h/n_rep). Identical key order and arithmetic to the
-// contiguous warp kernel, so the paged path stays bit-identical to it (run_cuda_paged max|diff|=0).
+// Paged attention, WARP-per-query + online softmax (G5f): the warp parallelization of
+// paged_attention_kernel, the same lane-stride-the-keys + ONE-PASS online softmax as
+// attention_warp_kernel, but each key is read straight from its block (GQA folded in, kvh = h/n_rep).
+// Identical key order and arithmetic to the contiguous warp kernel, so the paged path stays
+// bit-identical to it (run_cuda_paged max|diff|=0).
 __global__ void paged_attention_warp_kernel(
     const float* __restrict__ q, const float* __restrict__ Kbase, const float* __restrict__ Vbase,
     const int64_t* __restrict__ block_table, float* __restrict__ out, int64_t n_heads, int64_t sq,
@@ -1028,18 +1039,10 @@ __global__ void paged_attention_warp_kernel(
     const float* qi = q + (h * sq + i) * hd;
     const int64_t limit = causal ? (query_offset + i + 1) : end;
 
-    float lmax = -INFINITY;
-    for (int64_t j = lane; j < limit; j += 32) {
-        const int64_t blk = block_table[j / block_size], boff = j % block_size;
-        const float* kj = Kbase + ((blk * n_kv + kvh) * block_size + boff) * hd;
-        float s = 0.0f;
-        for (int64_t d = 0; d < hd; ++d) s += qi[d] * kj[d];
-        lmax = fmaxf(lmax, s * scale);
-    }
-    for (int off = 16; off > 0; off >>= 1)
-        lmax = fmaxf(lmax, __shfl_xor_sync(0xffffffff, lmax, off));
-
-    float lsum = 0.0f;
+    // ONE PASS online softmax — identical arithmetic/order to attention_warp_kernel (only the K/V
+    // addresses come from the block table), so the paged path stays bit-identical to the contiguous
+    // one (run_cuda_paged max|diff|=0).
+    float m = -INFINITY, l = 0.0f;
     float lacc[kMaxHeadDim];
     for (int64_t d = 0; d < hd; ++d) lacc[d] = 0.0f;
     for (int64_t j = lane; j < limit; j += 32) {
@@ -1047,16 +1050,28 @@ __global__ void paged_attention_warp_kernel(
         const float* kj = Kbase + ((blk * n_kv + kvh) * block_size + boff) * hd;
         float s = 0.0f;
         for (int64_t d = 0; d < hd; ++d) s += qi[d] * kj[d];
-        const float e = expf(s * scale - lmax);
-        lsum += e;
+        s *= scale;
+        const float m_new = fmaxf(m, s);
+        const float corr = expf(m - m_new);
+        const float p = expf(s - m_new);
+        l = l * corr + p;
         const float* vj = Vbase + ((blk * n_kv + kvh) * block_size + boff) * hd;
-        for (int64_t d = 0; d < hd; ++d) lacc[d] += e * vj[d];
+        for (int64_t d = 0; d < hd; ++d) lacc[d] = lacc[d] * corr + p * vj[d];
+        m = m_new;
     }
-    for (int off = 16; off > 0; off >>= 1) lsum += __shfl_down_sync(0xffffffff, lsum, off);
-    for (int64_t d = 0; d < hd; ++d)
-        for (int off = 16; off > 0; off >>= 1) lacc[d] += __shfl_down_sync(0xffffffff, lacc[d], off);
+    for (int off = 16; off > 0; off >>= 1) {
+        const float m_o = __shfl_down_sync(0xffffffff, m, off);
+        const float l_o = __shfl_down_sync(0xffffffff, l, off);
+        const float m_new = fmaxf(m, m_o);
+        const bool empty = (m_new == -INFINITY);  // both segments empty — see attention_warp_kernel
+        const float a = empty ? 0.0f : expf(m - m_new), a_o = empty ? 0.0f : expf(m_o - m_new);
+        l = l * a + l_o * a_o;
+        for (int64_t d = 0; d < hd; ++d)
+            lacc[d] = lacc[d] * a + __shfl_down_sync(0xffffffff, lacc[d], off) * a_o;
+        m = m_new;
+    }
     if (lane == 0) {
-        const float inv = 1.0f / lsum;
+        const float inv = 1.0f / l;
         float* oi = out + (h * sq + i) * hd;
         for (int64_t d = 0; d < hd; ++d) oi[d] = lacc[d] * inv;
     }
