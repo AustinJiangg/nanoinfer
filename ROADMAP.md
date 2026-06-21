@@ -333,16 +333,18 @@ Open candidates, not a closed/deferred-forever list — fold one into a stage wh
 the right moment:
 - int8×int8→int32 GEMM — DONE (G5d W8A8: CPU oracle linear_w8a8 + simd::dot_qq, GPU cuda_linear_w8a8
   DP4A, model-integrated; the compute win — gate/up 1.11×, down 1.14×, lm_head 1.36×).
-- int8-quantize embedding / lm_head — **CPU DONE** (weight-only int8, the biggest single weight).
-  A per-vocab-row Q8 of the tied embed_tokens, shared by the gather (embedding_q8: dequant the
-  looked-up row) and the lm_head (linear_q8) — fp32 activations into argmax, the lowest-risk place
-  for int8 next to a token decision. Opt-in `g_quantize_embed` (orthogonal to the layer QuantMode and
-  to g_cuda_fp16_weights). Token guard on Qwen2.5-0.5B (`run_quant <dir> none embed`): the embed/lm_head
-  int8 ALONE preserves the next token + argmax 0/5, 11/12 greedy (same quality bar as Q8 layers); the
-  full int8 model (`q8 embed`) is 3.97× smaller (1979→499 MB), next-token preserved. fp16 storage of
-  the same weight also remains (G5d, ~lossless). **Next:** the GPU device path (I8 gather kernel + int8
-  lm_head, parity vs this CPU oracle). A W8A8 lm_head (the compute win, reusing DP4A) is a later lever
-  once weight-only is locked.
+- int8-quantize embedding / lm_head — **DONE** (CPU + GPU; weight-only int8, the biggest single
+  weight). A per-vocab-row Q8 of the tied embed_tokens, shared by the gather (embedding_q8 /
+  cuda_embedding_q8: dequant the looked-up row) and the lm_head (linear_q8 / cuda_linear_q8) — fp32
+  activations into argmax, the lowest-risk place for int8 next to a token decision. Opt-in
+  `g_quantize_embed` (orthogonal to the layer QuantMode + g_cuda_fp16_weights); on CUDA the codes+scale
+  are device-resident (a dedicated I8 gather kernel + a tiled weight-only int8 GEMM). GPU == CPU oracle:
+  the int8 embed/lm_head ALONE gives the SAME logits max|diff|=0.333 + 11/12 greedy on both, next-token
+  preserved (`run_quant <dir> none embed`, run_cuda_parity); test_cuda parity gather max|diff|=0,
+  linear_q8 ~1e-4 vs the CPU oracle. The full int8 GPU model (W8A8 DP4A layers + int8 embed) is 3.97×
+  smaller (1979→499 MB), next-token preserved. fp16 storage of the same weight also remains (G5d,
+  ~lossless). Open follow-ups: a decode GEMV / warp-tiling for the int8 lm_head (the kernel is a correct
+  tiled GEMM, not yet speed-tuned), and a W8A8 lm_head (the compute win) once the memory win is banked.
 - batched sampling — the token draw is still per-sequence in Python; fits the G4/G5 decode path.
 - SIMD nibble-unpack for q4/q4g — helps compute-bound q4 prefill.
 - NEON `simd.hpp` `#elif` path — DONE (the Cross-platform NEON stage above: NEON

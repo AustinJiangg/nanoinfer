@@ -147,6 +147,52 @@ int main(int argc, char** argv) {
         std::printf("W8A8 (GPU int8 DP4A): greedy vs fp32 %d/%zu differ, next-token %s; weights %.0f MB\n",
                     genq, ref_gen.size(), nextq ? "preserved" : "CHANGED", double(wbq.first) / 1e6);
 
+        // --- 5. int8 embed/lm_head on the GPU (G5d): the tied token-embedding / output-projection run
+        // weight-only int8 on the device (cuda_embedding_q8 gather + cuda_linear_q8), the GPU mirror of
+        // the CPU oracle. Like W8A8 it feeds argmax, so this is the token guard (informational, not
+        // gated). First the embed/lm_head int8 ALONE (layers fp32), then the full int8 GPU model
+        // (W8A8 layers + int8 embed) for the memory headline. ---
+        g_quantize_embed = true;
+        Model modele(dir, QuantMode::None, Device::CUDA);     // int8 embed/lm_head, fp32 layers
+        Model modelfull(dir, QuantMode::W8A8, Device::CUDA);  // int8 layers (DP4A) + int8 embed
+        g_quantize_embed = false;
+        auto greedy = [&](Model& mdl) {
+            std::vector<int64_t> ctx = ids, out;
+            for (size_t t = 0; t < ref_gen.size(); ++t) {
+                Tensor lg = mdl.forward(ctx);
+                out.push_back(argmax_row(lg, lg.size(0) - 1, lg.size(1)));
+                ctx.push_back(out.back());
+            }
+            return out;
+        };
+        double maxde = 0.0;
+        {
+            Tensor lg = modele.forward(ids);
+            for (int64_t i = 0; i < lg.numel() && i < ref.numel(); ++i)
+                maxde = std::fmax(maxde, std::fabs(double(lg[i]) - double(ref[i])));
+        }
+        std::vector<int64_t> gote = greedy(modele);
+        int gene = 0;
+        for (size_t i = 0; i < ref_gen.size() && i < gote.size(); ++i)
+            if (ref_gen[i] != gote[i]) ++gene;
+        const bool nexte = !ref_gen.empty() && !gote.empty() && ref_gen[0] == gote[0];
+        print_ids("emb8  :", gote);
+        std::printf("int8 embed/lm_head ALONE: greedy vs fp32 %d/%zu differ, next-token %s, "
+                    "logits max|diff|=%g; weights %.0f MB\n",
+                    gene, ref_gen.size(), nexte ? "preserved" : "CHANGED", maxde,
+                    double(modele.weight_bytes().first) / 1e6);
+        std::vector<int64_t> gotf = greedy(modelfull);
+        int genf = 0;
+        for (size_t i = 0; i < ref_gen.size() && i < gotf.size(); ++i)
+            if (ref_gen[i] != gotf[i]) ++genf;
+        const bool nextf = !ref_gen.empty() && !gotf.empty() && ref_gen[0] == gotf[0];
+        print_ids("full8 :", gotf);
+        std::printf("full int8 GPU model (W8A8 layers + int8 embed): greedy vs fp32 %d/%zu differ, "
+                    "next-token %s; weights %.0f MB (%.2fx vs fp32)\n",
+                    genf, ref_gen.size(), nextf ? "preserved" : "CHANGED",
+                    double(modelfull.weight_bytes().first) / 1e6,
+                    double(wb32.first) / double(modelfull.weight_bytes().first));
+
         if (has_nan) std::printf("WARNING: GPU logits contain NaN\n");
         // Correctness = the tokens (argmax + greedy); maxd is a loose drift guard, looser
         // than the CPU's 0.1 because float error compounds across the 24 layers.

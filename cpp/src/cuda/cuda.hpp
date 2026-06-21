@@ -35,4 +35,16 @@ Tensor to_device_i8(const int8_t* host, const std::vector<int64_t>& shape);
 // Requires k % 16 == 0 (the DP4A tile's K step); m and n may be ragged.
 Tensor cuda_linear_w8a8(const Tensor& x, const Tensor& wq, const Tensor& w_scale, const Tensor* bias);
 
+// Weight-only int8 embedding gather on the GPU (G5d): codes int8 [vocab, hidden] + scale fp32 [vocab]
+// on device, ids on host. out[r,:] = float(codes[ids[r],:]) * scale[ids[r]] -> fp32 [n, hidden] on
+// device. The GPU mirror of the CPU embedding_q8 oracle (exact dequant; only the gather is on device).
+Tensor cuda_embedding_q8(const Tensor& codes, const Tensor& scale, const std::vector<int64_t>& ids);
+
+// Weight-only int8 linear on the GPU (G5d): x fp32 [m,k]; codes int8 [n,k] + scale fp32 [n]; bias or
+// null. y[i,o] = (sum_j x[i,j]*codes[o,j]) * scale[o] + bias[o], fp32 accumulate (x is NOT quantized,
+// unlike cuda_linear_w8a8). Matches the CPU linear_q8 oracle within accelerator tolerance — the int8
+// codes are identical, only the fp32 reduction order drifts. The tied lm_head reads the same
+// codes+scale as the gather above.
+Tensor cuda_linear_q8(const Tensor& x, const Tensor& codes, const Tensor& scale, const Tensor* bias);
+
 }  // namespace ni

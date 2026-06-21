@@ -109,6 +109,18 @@ scale and crushes the rest, so even the first token changes. Group-wise
 scale and recovers the next token; the greedy continuation still drifts (4-bit is
 lossy), but far less than per-channel.
 
+**int8 embed/lm_head** (`g_quantize_embed`): the modes above leave the tied
+token-embedding / output projection — Qwen2.5-0.5B's single biggest weight, 544 MB
+fp32 — at fp32. Setting `g_quantize_embed` also quantizes it to weight-only int8: one
+per-vocab-row Q8 shared by the embedding gather (dequant the looked-up row) and the
+lm_head (fp32 activations × int8 weight, so only the weight rounds before argmax).
+Verified CPU and GPU (`run_quant <dir> none embed`, `run_cuda_parity` — the GPU uses a
+dedicated I8 gather kernel + a tiled weight-only int8 GEMM, matching the CPU oracle):
+the embed/lm_head int8 alone preserves the next token and 11/12 greedy (the Q8 bar),
+and the whole model in int8 (`q8`/W8A8 layers + int8 embed) is **3.97× smaller**
+(1979→499 MB), next-token preserved. fp16 storage of the same weight (~lossless, 2×)
+is the other option.
+
 The C++ logits match nanoinfer to ~4e-5 max abs diff (float accumulation order),
 argmax token-for-token. Greedy generation matches nanoinfer exactly — e.g. "The
 capital of France is" → " Paris. It is the largest city in Europe and the second".

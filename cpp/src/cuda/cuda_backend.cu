@@ -692,6 +692,53 @@ __global__ void linear_w8a8_kernel(const int8_t* __restrict__ xq, const int8_t* 
     }
 }
 
+// Weight-only int8 GEMM (G5d): x fp32 [m,k], codes int8 [n,k] (K-contiguous), w_scale fp32 [n].
+// y[i,o] = (sum_j x[i,j]*float(codes[o,j])) * w_scale[o] + bias[o]. fp32 accumulate (x is NOT
+// quantized — unlike linear_w8a8_kernel's int8 activations), so it matches the CPU linear_q8 oracle
+// within accelerator tolerance. One correct tiled kernel for decode (m=1) and prefill; a decode GEMV
+// / warp-tiling for the huge lm_head are later levers (G5's staging: a correct kernel first, then
+// tune). The k-bounds check lets any k through (the synthetic parity tests use small, ragged k).
+template <int BM, int BN, int BK, int TM, int TN>
+__global__ void linear_q8_kernel(const float* __restrict__ x, const int8_t* __restrict__ codes,
+                                 const float* __restrict__ w_scale, const float* __restrict__ bias,
+                                 float* __restrict__ y, int m, int n, int k) {
+    constexpr int numThreads = (BM / TM) * (BN / TN);
+    __shared__ float As[BM * BK];  // x tile [BM][BK]
+    __shared__ float Bs[BN * BK];  // codes tile [BN][BK], dequant-to-float on stage (scale at store)
+    const int tid = static_cast<int>(threadIdx.x);
+    const int threadRow = tid / (BN / TN), threadCol = tid % (BN / TN);
+    const int rowBase = static_cast<int>(blockIdx.y) * BM, colBase = static_cast<int>(blockIdx.x) * BN;
+    float acc[TM * TN] = {0.0f};
+    for (int kk = 0; kk < k; kk += BK) {
+        for (int idx = tid; idx < BM * BK; idx += numThreads) {
+            const int r = idx / BK, c = idx % BK, gr = rowBase + r;
+            As[idx] = (gr < m && kk + c < k) ? x[static_cast<size_t>(gr) * k + kk + c] : 0.0f;
+        }
+        for (int idx = tid; idx < BN * BK; idx += numThreads) {
+            const int o = idx / BK, c = idx % BK, go = colBase + o;
+            Bs[idx] = (go < n && kk + c < k) ? float(codes[static_cast<size_t>(go) * k + kk + c]) : 0.0f;
+        }
+        __syncthreads();
+        for (int g = 0; g < BK; ++g) {
+            float aReg[TM], bReg[TN];
+            for (int i = 0; i < TM; ++i) aReg[i] = As[(threadRow * TM + i) * BK + g];
+            for (int j = 0; j < TN; ++j) bReg[j] = Bs[(threadCol * TN + j) * BK + g];
+            for (int i = 0; i < TM; ++i)
+                for (int j = 0; j < TN; ++j) acc[i * TN + j] += aReg[i] * bReg[j];
+        }
+        __syncthreads();
+    }
+    for (int i = 0; i < TM; ++i) {
+        const int gr = rowBase + threadRow * TM + i;
+        if (gr >= m) continue;
+        for (int j = 0; j < TN; ++j) {
+            const int gc = colBase + threadCol * TN + j;
+            if (gc >= n) continue;
+            y[static_cast<size_t>(gr) * n + gc] = acc[i * TN + j] * w_scale[gc] + (bias ? bias[gc] : 0.0f);
+        }
+    }
+}
+
 // out[r,c] = table[ids[r], c]. One thread per output element; ids already on device. Templated
 // on the table type so an fp16 embedding (G5d: embed_tokens, the largest weight, uploaded as
 // half) reads through ldf and converts to fp32 on store — activations stay fp32, only the
@@ -703,6 +750,18 @@ __global__ void embedding_kernel(const WT* __restrict__ table, const int64_t* __
     if (idx >= n * hidden) return;
     const int64_t r = idx / hidden, c = idx % hidden;
     out[idx] = ldf(table, static_cast<size_t>(ids[r] * hidden + c));
+}
+
+// Weight-only int8 embedding gather (G5d): out[r,c] = float(codes[ids[r],c]) * scale[ids[r]]. The
+// per-row scale means this can't be a plain embedding_kernel<int8_t> instantiation (ldf carries no
+// scale), so it's its own kernel — the GPU mirror of the CPU embedding_q8.
+__global__ void embedding_q8_kernel(const int8_t* __restrict__ codes, const float* __restrict__ scale,
+                                    const int64_t* __restrict__ ids, float* __restrict__ out,
+                                    int64_t n, int64_t hidden) {
+    const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= n * hidden) return;
+    const int64_t r = idx / hidden, c = idx % hidden, id = ids[r];
+    out[idx] = float(codes[id * hidden + c]) * scale[id];
 }
 
 // RMSNorm over the last dim: out = x / sqrt(mean(x²)+eps) * weight. One thread per row;
@@ -1075,6 +1134,34 @@ Tensor cuda_linear_w8a8(const Tensor& x, const Tensor& wq, const Tensor& w_scale
         dptr(a_scale), dptr(w_scale), bias ? dptr(*bias) : nullptr, dptr(y), static_cast<int>(m),
         static_cast<int>(n), static_cast<int>(k));
     launch_check("linear_w8a8_kernel");
+    return y;
+}
+
+Tensor cuda_embedding_q8(const Tensor& codes, const Tensor& scale, const std::vector<int64_t>& ids) {
+    const int64_t n = static_cast<int64_t>(ids.size()), hidden = codes.size(1);
+    Tensor out = device_alloc({n, hidden});
+    int64_t* d_ids = nullptr;
+    cuda_check(cudaMalloc(&d_ids, n * sizeof(int64_t)), "embedding_q8 ids malloc");
+    cuda_check(cudaMemcpy(d_ids, ids.data(), n * sizeof(int64_t), cudaMemcpyHostToDevice),
+               "embedding_q8 ids H2D");
+    embedding_q8_kernel<<<grid1d(n * hidden, kBlock), kBlock>>>(
+        static_cast<const int8_t*>(codes.device_ptr()), dptr(scale), d_ids, dptr(out), n, hidden);
+    launch_check("embedding_q8_kernel");
+    cudaFree(d_ids);
+    return out;
+}
+
+Tensor cuda_linear_q8(const Tensor& x, const Tensor& codes, const Tensor& scale, const Tensor* bias) {
+    const int64_t m = x.size(0), k = x.size(1), n = codes.size(0);
+    Tensor y = device_alloc({m, n});
+    constexpr int BM = 64, BN = 64, BK = 16, TM = 4, TN = 4;
+    constexpr int threads = (BM / TM) * (BN / TN);  // 256
+    const dim3 grid((static_cast<unsigned>(n) + BN - 1) / BN, (static_cast<unsigned>(m) + BM - 1) / BM);
+    linear_q8_kernel<BM, BN, BK, TM, TN><<<grid, threads>>>(
+        dptr(x), static_cast<const int8_t*>(codes.device_ptr()), dptr(scale),
+        bias ? dptr(*bias) : nullptr, dptr(y), static_cast<int>(m), static_cast<int>(n),
+        static_cast<int>(k));
+    launch_check("linear_q8_kernel");
     return y;
 }
 

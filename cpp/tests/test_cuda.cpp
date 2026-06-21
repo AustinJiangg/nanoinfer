@@ -142,6 +142,66 @@ static bool check_w8a8(int64_t m, int64_t n, int64_t k, bool with_bias, double t
     return ok;
 }
 
+// Weight-only int8 embedding gather (G5d) vs the CPU embedding_q8 oracle. quantize_q8(table) gives
+// int8 codes + per-row scales (uploaded); the gather is one multiply per element (no reduction), so
+// GPU and CPU compute the identical float — exact up to the single float multiply.
+static bool check_embedding_q8(int64_t vocab, int64_t hidden, int64_t n, double tol,
+                               std::mt19937& rng) {
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    Tensor table({vocab, hidden});
+    for (int64_t i = 0; i < table.numel(); ++i) table[i] = dist(rng);
+    std::uniform_int_distribution<int64_t> idd(0, vocab - 1);
+    std::vector<int64_t> ids(static_cast<size_t>(n));
+    for (auto& v : ids) v = idd(rng);
+
+    QTensor q = quantize_q8(table);
+    Tensor o_cpu = embedding_q8(q, ids);  // oracle
+
+    Tensor ws({vocab});
+    for (int64_t o = 0; o < vocab; ++o) ws[o] = q.scale[static_cast<size_t>(o)];
+    Tensor codesd = to_device_i8(q.q.data(), {vocab, hidden}), wsd = to_device(ws);
+    Tensor o_gpu = to_host(cuda_embedding_q8(codesd, wsd, ids));
+
+    double maxdiff = 0.0;
+    for (int64_t i = 0; i < o_cpu.numel(); ++i)
+        maxdiff = std::max(maxdiff, std::fabs(static_cast<double>(o_cpu[i]) - o_gpu[i]));
+    const bool ok = maxdiff < tol;
+    std::printf("test_cuda: embed_q8 [%6lld x %4lld] gather n=%lld max|diff|=%.3e (tol %.0e) %s\n",
+                (long long)vocab, (long long)hidden, (long long)n, maxdiff, tol, ok ? "ok" : "FAIL");
+    return ok;
+}
+
+// Weight-only int8 linear (G5d) vs the CPU linear_q8 oracle. quantize_q8(w) gives int8 codes + per-row
+// scales (uploaded); x stays fp32. The codes are identical, so the only gap is the fp32 (GPU) vs
+// double (CPU dot_qf32) reduction order — the same ~1e-3 drift as the fp32 tiled GEMM, not the
+// fp16/W8A8 cost. The ragged-k case exercises the kernel's kk+c<k bound.
+static bool check_linear_q8(int64_t m, int64_t n, int64_t k, bool with_bias, double tol,
+                            std::mt19937& rng) {
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    Tensor x({m, k}), w({n, k}), bias({n});
+    for (int64_t i = 0; i < x.numel(); ++i) x[i] = dist(rng);
+    for (int64_t i = 0; i < w.numel(); ++i) w[i] = dist(rng);
+    for (int64_t i = 0; i < bias.numel(); ++i) bias[i] = dist(rng);
+
+    QTensor qw = quantize_q8(w);
+    Tensor y_cpu = linear_q8(x, qw, with_bias ? &bias : nullptr);  // oracle
+
+    Tensor ws({n});
+    for (int64_t o = 0; o < n; ++o) ws[o] = qw.scale[static_cast<size_t>(o)];
+    Tensor xd = to_device(x), codesd = to_device_i8(qw.q.data(), {n, k}), wsd = to_device(ws);
+    Tensor bd = to_device(bias);
+    Tensor y_gpu = to_host(cuda_linear_q8(xd, codesd, wsd, with_bias ? &bd : nullptr));
+
+    double maxdiff = 0.0;
+    for (int64_t i = 0; i < y_cpu.numel(); ++i)
+        maxdiff = std::max(maxdiff, std::fabs(static_cast<double>(y_cpu[i]) - y_gpu[i]));
+    const bool ok = maxdiff < tol;
+    std::printf("test_cuda: linear_q8 [%4lld x %4lld] @ [%5lld x %4lld]^T %-7s max|diff|=%.3e (tol %.0e) %s\n",
+                (long long)m, (long long)k, (long long)n, (long long)k, with_bias ? "+bias" : "no-bias",
+                maxdiff, tol, ok ? "ok" : "FAIL");
+    return ok;
+}
+
 int main() {
     if (!cuda_available()) {
         std::printf("test_cuda: no CUDA device visible — skipping\n");
@@ -193,6 +253,16 @@ int main() {
     ok &= check_w8a8(128, 4864, 896, false, 2e-3, rng);  // gate/up prefill, no bias
     ok &= check_w8a8(100, 896, 4864, false, 2e-3, rng);  // down: ragged m + wide k
     ok &= check_w8a8(4, 896, 896, true, 2e-3, rng);      // small m (decode-ish), +bias
+
+    // Weight-only int8 embed/lm_head (G5d): the gather is exact (one multiply); the linear matches the
+    // CPU linear_q8 oracle within the fp32-reduction tolerance. Cover the lm_head's huge n at decode +
+    // prefill m, a projection shape with bias, ragged m + wide k, and a ragged k (k%16!=0).
+    ok &= check_embedding_q8(2048, 896, 8, 1e-4, rng);        // int8 table gather — exact
+    ok &= check_linear_q8(4, 8192, 896, false, 5e-3, rng);    // lm_head decode (small m, huge n)
+    ok &= check_linear_q8(128, 8192, 896, false, 5e-3, rng);  // lm_head prefill (large m, huge n)
+    ok &= check_linear_q8(128, 896, 896, true, 5e-3, rng);    // projection shape, +bias
+    ok &= check_linear_q8(100, 896, 4864, false, 5e-3, rng);  // ragged m + wide k
+    ok &= check_linear_q8(8, 100, 90, false, 5e-3, rng);      // ragged k (k%16!=0 — the k-bound)
 
     std::printf("test_cuda: %s\n", ok ? "ok" : "FAIL");
     return ok ? 0 : 1;

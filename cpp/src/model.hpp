@@ -93,6 +93,12 @@ private:
     // checkpoint (otherwise the lm_head reuses embed_q8_).
     std::unique_ptr<QTensor> embed_q8_;
     std::unique_ptr<QTensor> lmhead_q8_;
+#ifdef NI_CUDA
+    // The CUDA mirror of embed_q8_ (G5d): int8 codes [vocab, hidden] + fp32 per-row scale, resident on
+    // the device. The gather (cuda_embedding_q8) and the tied lm_head (cuda_linear_q8) read these.
+    // unique_ptr so "unset" is just null (no Tensor default ctor needed). Untied-on-CUDA isn't wired.
+    std::unique_ptr<Tensor> embed_q8_codes_, embed_q8_scale_;
+#endif
     RopeCache rope_;  // built once for max_position_embeddings, sliced per forward
 };
 
