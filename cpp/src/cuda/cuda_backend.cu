@@ -1292,6 +1292,70 @@ __global__ void paged_attention_warp_kernel(
     }
 }
 
+// Flash-Decoding pass 1 for the PAGED cache (G5g): the split-KV analogue of paged_attention_warp_kernel,
+// exactly as attention_split_kv_kernel is to attention_warp_kernel. Each (head,query) gets num_splits
+// warps; warp s runs the one-pass online softmax over its key chunk [k0,k1) — keys read straight from
+// the blocks (GQA folded in, kvh=h/n_rep) — and writes an UNNORMALIZED partial (m,l,acc) to the SAME
+// scratch layout the contiguous split kernel uses, so it shares attention_combine_kernel (pass 2). Same
+// key order and arithmetic as the contiguous split kernel (only the K/V addresses differ), so the paged
+// split path stays bit-identical to the contiguous split path (run_cuda_paged max|diff|=0). The chunks
+// tile [0,end) and causal clamps each to `limit`.
+__global__ void paged_attention_split_kv_kernel(
+    const float* __restrict__ q, const float* __restrict__ Kbase, const float* __restrict__ Vbase,
+    const int64_t* __restrict__ block_table, float* __restrict__ m_part, float* __restrict__ l_part,
+    float* __restrict__ acc_part, int64_t n_heads, int64_t sq, int64_t hd, int64_t n_kv, int64_t n_rep,
+    int64_t block_size, int causal, int64_t query_offset, int64_t end, float scale, int num_splits,
+    int64_t chunk) {
+    const int warpsPerBlock = static_cast<int>(blockDim.x) / 32;
+    const int64_t gwarp = static_cast<int64_t>(blockIdx.x) * warpsPerBlock + threadIdx.x / 32;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int64_t nq = n_heads * sq;
+    if (gwarp >= nq * num_splits) return;  // warp-uniform
+    const int64_t hi = gwarp / num_splits, s = gwarp % num_splits;
+    const int64_t h = hi / sq, i = hi % sq;
+    const int64_t kvh = h / n_rep;  // GQA: this query head's KV head
+    const float* qi = q + (h * sq + i) * hd;
+    const int64_t limit = causal ? (query_offset + i + 1) : end;
+    const int64_t k0 = s * chunk;  // this split's key range [k0,k1), tiling [0,end)
+    const int64_t k1raw = (k0 + chunk < end) ? (k0 + chunk) : end;
+    const int64_t k1 = causal ? (k1raw < limit ? k1raw : limit) : k1raw;
+
+    float m = -INFINITY, l = 0.0f;
+    float lacc[kMaxHeadDim];
+    for (int64_t d = 0; d < hd; ++d) lacc[d] = 0.0f;
+    for (int64_t j = k0 + lane; j < k1; j += 32) {
+        const int64_t blk = block_table[j / block_size], boff = j % block_size;
+        const float* kj = Kbase + ((blk * n_kv + kvh) * block_size + boff) * hd;
+        float sdot = 0.0f;
+        for (int64_t d = 0; d < hd; ++d) sdot += qi[d] * kj[d];
+        sdot *= scale;
+        const float m_new = fmaxf(m, sdot);
+        const float corr = expf(m - m_new);
+        const float p = expf(sdot - m_new);
+        l = l * corr + p;
+        const float* vj = Vbase + ((blk * n_kv + kvh) * block_size + boff) * hd;
+        for (int64_t d = 0; d < hd; ++d) lacc[d] = lacc[d] * corr + p * vj[d];
+        m = m_new;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        const float m_o = __shfl_down_sync(0xffffffff, m, off);
+        const float l_o = __shfl_down_sync(0xffffffff, l, off);
+        const float m_new = fmaxf(m, m_o);
+        const bool empty = (m_new == -INFINITY);
+        const float a = empty ? 0.0f : expf(m - m_new), a_o = empty ? 0.0f : expf(m_o - m_new);
+        l = l * a + l_o * a_o;
+        for (int64_t d = 0; d < hd; ++d)
+            lacc[d] = lacc[d] * a + __shfl_down_sync(0xffffffff, lacc[d], off) * a_o;
+        m = m_new;
+    }
+    if (lane == 0) {  // write the UNNORMALIZED partial; attention_combine_kernel divides
+        m_part[gwarp] = m;
+        l_part[gwarp] = l;
+        float* ap = acc_part + gwarp * hd;
+        for (int64_t d = 0; d < hd; ++d) ap[d] = lacc[d];
+    }
+}
+
 }  // namespace
 
 bool cuda_available() {
@@ -1835,6 +1899,25 @@ Tensor CudaPagedKVCache::attend(int64_t layer, const Tensor& q, const Tensor& k,
             dptr(q), Kbase, Vbase, d_bt, dptr(out), n_heads, sq, D, n_kv, n_rep, bs, causal ? 1 : 0,
             query_offset, end, scale);
         launch_check("paged_attention_kernel");
+    } else if (g_cuda_use_split_attn && split_count(n_heads * sq, end) >= 2) {
+        // Flash-Decoding (G5g) on the paged path — the split-KV analogue, sharing attention_combine_kernel
+        // with the contiguous path. The paged cache has no O(ctx) cat_seq copy, so this is where the split
+        // win shows up end-to-end (the contiguous cache's growing per-step copy diluted it).
+        const int64_t nq = n_heads * sq;
+        const int num_splits = split_count(nq, end);
+        const int64_t chunk = (end + num_splits - 1) / num_splits;  // keys per split, tiling [0,end)
+        Tensor m_part = device_alloc({nq * num_splits});
+        Tensor l_part = device_alloc({nq * num_splits});
+        Tensor acc_part = device_alloc({nq * num_splits, D});
+        const int threads = 256, warpsPerBlock = threads / 32;  // one warp per (head,query,split)
+        const int blocks = static_cast<int>((nq * num_splits + warpsPerBlock - 1) / warpsPerBlock);
+        paged_attention_split_kv_kernel<<<blocks, threads>>>(
+            dptr(q), Kbase, Vbase, d_bt, dptr(m_part), dptr(l_part), dptr(acc_part), n_heads, sq, D,
+            n_kv, n_rep, bs, causal ? 1 : 0, query_offset, end, scale, num_splits, chunk);
+        launch_check("paged_attention_split_kv_kernel");
+        attention_combine_kernel<<<grid1d(nq * D, kBlock), kBlock>>>(
+            dptr(m_part), dptr(l_part), dptr(acc_part), dptr(out), nq, D, num_splits);
+        launch_check("attention_combine_kernel");
     } else {
         const int threads = 256;  // 8 warps/block, one warp per (head,query)
         const int blocks = static_cast<int>((n_heads * sq + threads / 32 - 1) / (threads / 32));

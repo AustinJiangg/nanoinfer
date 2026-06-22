@@ -371,9 +371,12 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
         online kernel; prefill ties (split_count=1 → no-op, bit-identical — a built-in control). End-to-end
         decode (run_cuda_decode_bench): **1.30× @ctx~512, 2.15× @ctx~2048** — the win grows with context as
         attention's share of the step grows, but is Amdahl-diluted by the contiguous cache's O(ctx) cat_seq
-        copy + ~360 per-op launches (paged territory). Contiguous path only; the paged kernel gets the same
-        split treatment as a mechanical follow-up (backlog), and pairing split-KV with the paged cache
-        (no cat_seq) is where the end-to-end win catches up to the kernel's.
+        copy + ~360 per-op launches (paged territory). **Paged path also done** (`paged_attention_split_kv_kernel`,
+        sharing the same `attention_combine_kernel`): bit-identical to the contiguous split path
+        (run_cuda_paged max|diff|=0, ctx 515), so paging stays pure indexing under split too. The paged cache
+        has no cat_seq copy, so it's where the win lands undiluted — at ctx~2048 paged+split reaches ~81 tok/s
+        (the fastest of contiguous/paged × split-off/on; split ~2.8× on paged vs ~2.4× on contiguous), and at
+        ctx 4096 the contiguous cache OOMs (its non-reusing cat_seq buffers) while paged+split runs at ~74 tok/s.
 
 ## Cross-platform (portability proof, after the GPU is learned)
 - [x] **NEON** — `simd.hpp`'s `#elif` path now carries the three inner products on aarch64
@@ -402,11 +405,12 @@ the right moment:
 - Flash-Decoding (split-K attention) — **DONE** (G5g above: split the KV across num_splits warps per
   (head,query), one-pass online softmax per chunk → partial (m,l,acc), then an associative combine.
   Isolated decode 6.8–23×, end-to-end decode 1.30× @ctx512 / 2.15× @ctx2048, oracle ~1e-8,
-  split-on==split-off greedy). Open follow-ups: (a) the PAGED attention kernel gets the same split
-  treatment (G5g did the contiguous path only — mechanical, would stay bit-identical to the non-split
-  paged kernel); (b) pairing split-KV with the paged cache (no O(ctx) cat_seq copy) is where the
-  end-to-end win catches up to the isolated-kernel win — the contiguous cache's per-step copy is the
-  current end-to-end limiter.
+  split-on==split-off greedy). Both follow-ups now DONE: (a) the PAGED attention kernel got the same
+  split treatment (`paged_attention_split_kv_kernel`, sharing `attention_combine_kernel`) — bit-identical
+  to the contiguous split path (run_cuda_paged max|diff|=0); (b) paired with the paged cache (no cat_seq),
+  the win lands undiluted — paged+split ~81 tok/s @ctx2048 (fastest of all four), and runs at ctx4096
+  where the contiguous cache OOMs. Remaining: Flash-Decoding combines partials in a separate kernel pass
+  — could fuse, and the split kernel could share the G5f-tiled smem staging (low priority on this model).
 - shared-mem tiling for the PAGED attention kernel — G5f tiled only the contiguous path (enough to
   characterize the muted-by-L2 result). Mirroring it into paged_attention_warp_kernel (gather blocks
   into smem) is mechanical and would stay bit-identical; do it if/when tiling starts winning.

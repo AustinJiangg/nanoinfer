@@ -88,8 +88,37 @@ int main(int argc, char** argv) {
         std::printf("greedy vs golden: %s (%d/%zu mismatches)\n", greedy_ok ? "MATCH" : "MISMATCH",
                     genmism, ref_gen.size());
 
-        // Paging is pure indexing — same K/V, same order — so expect bit-identical.
-        const bool ok = maxd < 1e-4 && greedy_ok;
+        // Flash-Decoding (G5g) on the paged path: with split-KV ON, paged must STILL equal contiguous
+        // bit-for-bit — the split kernels read the same chunks in the same order, only the K/V address
+        // differs (contiguous buffer vs blocks), exactly like the warp kernels above. The golden prompt
+        // is too short to engage split_count, so prefill a long synthetic context (>512, split engages
+        // from the first decode step) into a fresh pair of caches and compare in lockstep.
+        g_cuda_use_split_attn = true;
+        std::vector<int64_t> longctx;
+        while (static_cast<int64_t>(longctx.size()) < 512)
+            longctx.insert(longctx.end(), ids.begin(), ids.end());
+        const int split_steps = 8;
+        std::unique_ptr<KVCacheBase> cont2 =
+            model.make_kv_cache(static_cast<int64_t>(longctx.size()) + split_steps + 8);
+        CudaBlockPool pool2(c.num_layers, c.num_kv_heads, c.head_dim, block_size, num_blocks);
+        CudaPagedKVCache paged2(&pool2);
+        Tensor lc2 = model.forward(longctx, cont2.get());
+        Tensor lp2 = model.forward(longctx, &paged2);
+        double splitd = full_maxdiff(lc2, lp2);
+        int64_t st = argmax_row(lc2, lc2.size(0) - 1, vocab);
+        for (int s = 1; s < split_steps; ++s) {  // decode: sq=1, sk>=512 -> split engages on both paths
+            Tensor dc = model.forward({st}, cont2.get());
+            Tensor dp = model.forward({st}, &paged2);
+            splitd = std::fmax(splitd, full_maxdiff(dc, dp));
+            st = argmax_row(dc, 0, vocab);
+        }
+        g_cuda_use_split_attn = false;
+        const bool split_ok = splitd < 1e-4;
+        std::printf("flash-decoding: paged-split == contiguous-split max|diff|=%g over %d steps (ctx=%zu)\n",
+                    splitd, split_steps, longctx.size());
+
+        // Paging is pure indexing — same K/V, same order — so expect bit-identical (split path too).
+        const bool ok = maxd < 1e-4 && greedy_ok && split_ok;
         std::printf(ok ? "run_cuda_paged: ok\n" : "run_cuda_paged: FAIL\n");
         return ok ? 0 : 1;
     } catch (const std::exception& e) {

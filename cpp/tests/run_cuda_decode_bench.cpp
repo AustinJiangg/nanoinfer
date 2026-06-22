@@ -33,16 +33,35 @@ struct Timing {
     double prefill_s, decode_s;
 };
 static Timing run_one(const Model& model, const std::vector<int64_t>& prompt, int64_t decode_len,
-                      int64_t vocab, bool force_naive) {
+                      int64_t vocab, bool force_naive, bool use_paged) {
     g_cuda_force_naive_gemm = force_naive;
-    auto cache = model.make_kv_cache(static_cast<int64_t>(prompt.size()) + decode_len + 8);
+    const int64_t max_seq = static_cast<int64_t>(prompt.size()) + decode_len + 8;
+    // Contiguous (G3, default) or paged (G4b) KV cache. The contiguous cache's cat_seq copies the whole
+    // history each step (O(ctx)); the paged cache writes only the new token into a block — so NI_PAGED=1
+    // is where the Flash-Decoding (split-KV) decode win shows up undiluted.
+    std::unique_ptr<KVCacheBase> cont;
+    std::unique_ptr<CudaBlockPool> pool;
+    std::unique_ptr<CudaPagedKVCache> paged;
+    KVCacheBase* cache = nullptr;
+    if (use_paged) {
+        const Config& c = model.config();
+        const int64_t block_size = 16;
+        const int64_t num_blocks = (max_seq + block_size - 1) / block_size + 4;
+        pool = std::make_unique<CudaBlockPool>(c.num_layers, c.num_kv_heads, c.head_dim, block_size,
+                                               num_blocks);
+        paged = std::make_unique<CudaPagedKVCache>(pool.get());
+        cache = paged.get();
+    } else {
+        cont = model.make_kv_cache(max_seq);
+        cache = cont.get();
+    }
     Clock::time_point t0 = Clock::now();
-    Tensor l = model.forward(prompt, cache.get());  // prefill (naive in both runs: m>16)
+    Tensor l = model.forward(prompt, cache);  // prefill (naive in both runs: m>16)
     Clock::time_point t1 = Clock::now();
     int64_t next = argmax_row(l, l.size(0) - 1, vocab);
     Clock::time_point t2 = Clock::now();
     for (int64_t d = 0; d < decode_len; ++d) {  // decode one token at a time (m=1)
-        Tensor ld = model.forward({next}, cache.get());
+        Tensor ld = model.forward({next}, cache);
         next = argmax_row(ld, 0, vocab);
     }
     Clock::time_point t3 = Clock::now();
@@ -85,9 +104,14 @@ int main(int argc, char** argv) {
         // NI_SPLIT_ATTN=1 opts into Flash-Decoding / split-KV attention (G5g): the long-context decode
         // lever. A/B the decode tok/s by running this bench at a long context with and without it set.
         if (const char* e = std::getenv("NI_SPLIT_ATTN")) g_cuda_use_split_attn = (e[0] == '1');
+        // NI_PAGED=1 decodes through the paged KV cache (G4b) instead of the contiguous one — no
+        // O(ctx) cat_seq copy per step, so it pairs with NI_SPLIT_ATTN to show the undiluted decode win.
+        bool use_paged = false;
+        if (const char* e = std::getenv("NI_PAGED")) use_paged = (e[0] == '1');
         Model model(dir, QuantMode::None, Device::CUDA);
         const int64_t vocab = model.config().vocab_size;
-        std::printf("layer weights: %s\n", g_cuda_fp16_weights ? "fp16 (G5d)" : "fp32");
+        std::printf("layer weights: %s; KV cache: %s\n", g_cuda_fp16_weights ? "fp16 (G5d)" : "fp32",
+                    use_paged ? "paged (G4b)" : "contiguous (G3)");
 
         // Synthesize a prompt by cycling the reference ids (any valid ids time the same).
         std::vector<int64_t> seed;
@@ -103,10 +127,10 @@ int main(int argc, char** argv) {
         std::printf("run_cuda_decode_bench: %s  prefill=%lld decode=%lld  (CUDA backend)\n",
                     dir.c_str(), (long long)prefill_len, (long long)decode_len);
 
-        run_one(model, prompt, 4, vocab, false);  // warm CUDA context / reach steady state
+        run_one(model, prompt, 4, vocab, false, use_paged);  // warm CUDA context / reach steady state
 
-        const Timing naive = run_one(model, prompt, decode_len, vocab, true);
-        const Timing gemv = run_one(model, prompt, decode_len, vocab, false);
+        const Timing naive = run_one(model, prompt, decode_len, vocab, true, use_paged);
+        const Timing gemv = run_one(model, prompt, decode_len, vocab, false, use_paged);
         g_cuda_force_naive_gemm = false;
 
         auto tps = [](int64_t n, double s) { return static_cast<double>(n) / s; };
