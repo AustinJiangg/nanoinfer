@@ -33,6 +33,11 @@ std::unique_ptr<QuantizedWeight> make_cuda_w8a8(const Tensor& w);
 // everything else held constant. Left false in all normal use; not thread-safe to flip.
 extern bool g_cuda_force_naive_gemm;
 
+// Bench/diagnostic knob (G5d follow-up): force the prefill-tuned tiled kernel for weight-only int8
+// (cuda_linear_q8) even at small m, so a bench can A/B the int8 decode GEMV's win on the quantized
+// lm_head. Left false in all normal use (decode then uses the GEMV); not thread-safe to flip.
+extern bool g_cuda_force_tiled_q8;
+
 // Opt-in (G5d): run the prefill GEMM on the tensor cores (fp16 inputs, fp32 accumulate).
 // Default off — fp16 is lossy, so it stays opt-in until the accuracy/speed tradeoff is
 // accepted; flip it to measure (test_cuda, run_cuda_bench NI_WMMA=1). Not thread-safe.

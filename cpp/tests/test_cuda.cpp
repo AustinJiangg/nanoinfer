@@ -287,14 +287,18 @@ int main() {
     ok &= check_w8a8(4, 896, 896, true, 2e-3, rng);      // small m (decode-ish), +bias
 
     // Weight-only int8 embed/lm_head (G5d): the gather is exact (one multiply); the linear matches the
-    // CPU linear_q8 oracle within the fp32-reduction tolerance. Cover the lm_head's huge n at decode +
-    // prefill m, a projection shape with bias, ragged m + wide k, and a ragged k (k%16!=0).
+    // CPU linear_q8 oracle within the fp32-reduction tolerance. m<=16 routes to the decode GEMV (one
+    // warp per output, ¼ the fp32 bytes), m>16 to the tiled GEMM — cover both at the lm_head's huge n,
+    // a projection shape with bias, ragged m + wide k, and a ragged k (k%16!=0). The GEMV cases include
+    // m=1 (true decode) and a +bias case (the dequant-scale+bias store the tiled path also exercises).
     ok &= check_embedding_q8(2048, 896, 8, 1e-4, rng);        // int8 table gather — exact
-    ok &= check_linear_q8(4, 8192, 896, false, 5e-3, rng);    // lm_head decode (small m, huge n)
-    ok &= check_linear_q8(128, 8192, 896, false, 5e-3, rng);  // lm_head prefill (large m, huge n)
-    ok &= check_linear_q8(128, 896, 896, true, 5e-3, rng);    // projection shape, +bias
-    ok &= check_linear_q8(100, 896, 4864, false, 5e-3, rng);  // ragged m + wide k
-    ok &= check_linear_q8(8, 100, 90, false, 5e-3, rng);      // ragged k (k%16!=0 — the k-bound)
+    ok &= check_linear_q8(1, 8192, 896, false, 5e-3, rng);    // lm_head decode, true m=1 (GEMV, huge n)
+    ok &= check_linear_q8(4, 8192, 896, false, 5e-3, rng);    // lm_head batched decode (GEMV, huge n)
+    ok &= check_linear_q8(2, 896, 896, true, 5e-3, rng);      // GEMV + bias (decode projection shape)
+    ok &= check_linear_q8(128, 8192, 896, false, 5e-3, rng);  // lm_head prefill (tiled, large m, huge n)
+    ok &= check_linear_q8(128, 896, 896, true, 5e-3, rng);    // projection shape, +bias (tiled)
+    ok &= check_linear_q8(100, 896, 4864, false, 5e-3, rng);  // ragged m + wide k (tiled)
+    ok &= check_linear_q8(8, 100, 90, false, 5e-3, rng);      // GEMV, ragged k (k%16!=0 — the k-bound)
 
     std::printf("test_cuda: %s\n", ok ? "ok" : "FAIL");
     return ok ? 0 : 1;

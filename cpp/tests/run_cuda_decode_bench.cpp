@@ -27,14 +27,22 @@ static double secs(Clock::time_point a, Clock::time_point b) {
     return std::chrono::duration<double>(b - a).count();
 }
 
-// Prefill `prompt`, then greedily decode `decode_len` tokens, timing each phase. The decode
-// kernel is selected by `force_naive` — the only thing that differs between the two calls.
+// NI_QEMBED mode (set in main): A/B the weight-only int8 lm_head kernel instead of the layer GEMM.
+static bool g_ab_int8_lmhead = false;
+
+// Prefill `prompt`, then greedily decode `decode_len` tokens, timing each phase. `force_slow` selects
+// the SLOW variant of the kernel under test — the only thing that differs between the two calls.
 struct Timing {
     double prefill_s, decode_s;
 };
 static Timing run_one(const Model& model, const std::vector<int64_t>& prompt, int64_t decode_len,
-                      int64_t vocab, bool force_naive, bool use_paged) {
-    g_cuda_force_naive_gemm = force_naive;
+                      int64_t vocab, bool force_slow, bool use_paged) {
+    // Default (G5b): the layer-projection GEMM (naive vs warp-GEMV). NI_QEMBED: the int8 lm_head
+    // (prefill-tiled vs decode GEMV) — layers stay on the GEMV so only the lm_head kernel changes.
+    if (g_ab_int8_lmhead)
+        g_cuda_force_tiled_q8 = force_slow;
+    else
+        g_cuda_force_naive_gemm = force_slow;
     const int64_t max_seq = static_cast<int64_t>(prompt.size()) + decode_len + 8;
     // Contiguous (G3, default) or paged (G4b) KV cache. The contiguous cache's cat_seq copies the whole
     // history each step (O(ctx)); the paged cache writes only the new token into a block — so NI_PAGED=1
@@ -56,7 +64,7 @@ static Timing run_one(const Model& model, const std::vector<int64_t>& prompt, in
         cache = cont.get();
     }
     Clock::time_point t0 = Clock::now();
-    Tensor l = model.forward(prompt, cache);  // prefill (naive in both runs: m>16)
+    Tensor l = model.forward(prompt, cache);  // prefill: the control (kernel under test unchanged at m>16)
     Clock::time_point t1 = Clock::now();
     int64_t next = argmax_row(l, l.size(0) - 1, vocab);
     Clock::time_point t2 = Clock::now();
@@ -108,10 +116,19 @@ int main(int argc, char** argv) {
         // O(ctx) cat_seq copy per step, so it pairs with NI_SPLIT_ATTN to show the undiluted decode win.
         bool use_paged = false;
         if (const char* e = std::getenv("NI_PAGED")) use_paged = (e[0] == '1');
+        // NI_QEMBED=1 quantizes the tied embedding / lm_head to weight-only int8 (G5d) and shifts the
+        // A/B to that lm_head kernel: prefill-tiled vs the decode GEMV (the layer GEMM stays on the
+        // GEMV in both runs). Must be set before the Model is built (the quantize happens at load).
+        if (const char* e = std::getenv("NI_QEMBED")) {
+            g_ab_int8_lmhead = (e[0] == '1');
+            g_quantize_embed = g_ab_int8_lmhead;
+        }
         Model model(dir, QuantMode::None, Device::CUDA);
         const int64_t vocab = model.config().vocab_size;
-        std::printf("layer weights: %s; KV cache: %s\n", g_cuda_fp16_weights ? "fp16 (G5d)" : "fp32",
-                    use_paged ? "paged (G4b)" : "contiguous (G3)");
+        std::printf("layer weights: %s; KV cache: %s; A/B: %s\n",
+                    g_cuda_fp16_weights ? "fp16 (G5d)" : "fp32",
+                    use_paged ? "paged (G4b)" : "contiguous (G3)",
+                    g_ab_int8_lmhead ? "int8 lm_head tiled vs GEMV" : "layer GEMM naive vs GEMV");
 
         // Synthesize a prompt by cycling the reference ids (any valid ids time the same).
         std::vector<int64_t> seed;
@@ -129,20 +146,22 @@ int main(int argc, char** argv) {
 
         run_one(model, prompt, 4, vocab, false, use_paged);  // warm CUDA context / reach steady state
 
-        const Timing naive = run_one(model, prompt, decode_len, vocab, true, use_paged);
-        const Timing gemv = run_one(model, prompt, decode_len, vocab, false, use_paged);
+        const Timing slow = run_one(model, prompt, decode_len, vocab, true, use_paged);
+        const Timing fast = run_one(model, prompt, decode_len, vocab, false, use_paged);
         g_cuda_force_naive_gemm = false;
+        g_cuda_force_tiled_q8 = false;
 
+        const char* slow_label = g_ab_int8_lmhead ? "tiled" : "naive";  // the slow kernel under test
         auto tps = [](int64_t n, double s) { return static_cast<double>(n) / s; };
         std::printf("\n%-8s %14s %14s\n", "kernel", "prefill tok/s", "decode tok/s");
-        std::printf("%-8s %14.1f %14.1f\n", "naive", tps(prefill_len, naive.prefill_s),
-                    tps(decode_len, naive.decode_s));
-        std::printf("%-8s %14.1f %14.1f\n", "GEMV", tps(prefill_len, gemv.prefill_s),
-                    tps(decode_len, gemv.decode_s));
+        std::printf("%-8s %14.1f %14.1f\n", slow_label, tps(prefill_len, slow.prefill_s),
+                    tps(decode_len, slow.decode_s));
+        std::printf("%-8s %14.1f %14.1f\n", "GEMV", tps(prefill_len, fast.prefill_s),
+                    tps(decode_len, fast.decode_s));
         std::printf("\ndecode: %.1f -> %.1f tok/s (%.2fx)   prefill control: %.1f -> %.1f tok/s\n",
-                    tps(decode_len, naive.decode_s), tps(decode_len, gemv.decode_s),
-                    naive.decode_s / gemv.decode_s, tps(prefill_len, naive.prefill_s),
-                    tps(prefill_len, gemv.prefill_s));
+                    tps(decode_len, slow.decode_s), tps(decode_len, fast.decode_s),
+                    slow.decode_s / fast.decode_s, tps(prefill_len, slow.prefill_s),
+                    tps(prefill_len, fast.prefill_s));
         std::printf("run_cuda_decode_bench: ok\n");
         return 0;
     } catch (const std::exception& e) {

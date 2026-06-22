@@ -133,6 +133,11 @@ Tensor cat_seq(const Tensor& a, const Tensor& b) {
 int grid1d(int64_t total, int block) { return static_cast<int>((total + block - 1) / block); }
 constexpr int kBlock = 256;
 
+// The m at/below which linear() is memory-bound and runs the warp-per-output GEMV (G5b) instead of
+// the compute-bound tiled GEMM (G5c): decode (m=1) and small batched decode. Shared by the fp32/fp16
+// linear() dispatch and the weight-only int8 cuda_linear_q8 (so the int8 lm_head decodes via GEMV too).
+constexpr int64_t kGemvMaxM = 16;
+
 // SM count of the current device, queried once. Flash-Decoding (G5g) sizes its split count from this
 // rather than hardcoding a number — the engine reads its dimensions, it doesn't bake in magic ones.
 int sm_count() {
@@ -767,6 +772,37 @@ __global__ void linear_q8_kernel(const float* __restrict__ x, const int8_t* __re
             if (gc >= n) continue;
             y[static_cast<size_t>(gr) * n + gc] = acc[i * TN + j] * w_scale[gc] + (bias ? bias[gc] : 0.0f);
         }
+    }
+}
+
+// Weight-only int8 decode GEMV (G5d follow-up): the linear_q8 mirror of linear_gemv_kernel, for the
+// quantized lm_head/embed at decode (m<=kGemvMaxM). The tiled linear_q8_kernel is prefill-tuned —
+// at m=1 its 64-row tile leaves ~63/64 of the warps idle yet still streams the whole int8 weight,
+// so the huge lm_head (n=151936) runs far under the bandwidth wall. Here one WARP owns output o: the
+// 32 lanes coalesce-stride the int8 codes[o,:] (¼ the DRAM bytes of fp32, ½ of fp16 — the decode
+// memory win int8 was leaving on the table), a __shfl reduction folds the 32 partials, and the
+// per-channel dequant scale + bias apply once at the store — the SAME accumulate-then-scale order as
+// linear_q8_kernel and the CPU linear_q8 oracle (dot_qf32 · scale + b). x is NOT quantized (weight-
+// only, fp32 accumulate), so only the warp-reduce reorders the sum: ~1e-6 vs the tiled kernel, the
+// same reorder the fp32 GEMV already takes — golden tokens unchanged. m>1 loops the rows so codes[o]
+// streams once and is reused across them from L2 (the batched-decode weight reuse, as in G5b).
+__global__ void linear_q8_gemv_kernel(const float* __restrict__ x, const int8_t* __restrict__ codes,
+                                      const float* __restrict__ w_scale,
+                                      const float* __restrict__ bias, float* __restrict__ y,
+                                      int m, int n, int k) {
+    const int o = (blockIdx.x * blockDim.x + threadIdx.x) / 32;  // one warp per output channel
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    if (o >= n) return;
+    const size_t wbase = static_cast<size_t>(o) * k;
+    const float scale = w_scale[o];
+    const float b = bias ? bias[o] : 0.0f;
+    for (int i = 0; i < m; ++i) {
+        const float* xr = x + static_cast<size_t>(i) * k;
+        float partial = 0.0f;
+        for (int j = lane; j < k; j += 32) partial += xr[j] * float(codes[wbase + j]);  // coalesced
+        for (int off = 16; off > 0; off >>= 1)  // warp-reduce the 32 partials
+            partial += __shfl_down_sync(0xffffffff, partial, off);
+        if (lane == 0) y[static_cast<size_t>(i) * n + o] = partial * scale + b;  // dequant once
     }
 }
 
@@ -1448,13 +1484,23 @@ Tensor cuda_embedding_q8(const Tensor& codes, const Tensor& scale, const std::ve
 Tensor cuda_linear_q8(const Tensor& x, const Tensor& codes, const Tensor& scale, const Tensor* bias) {
     const int64_t m = x.size(0), k = x.size(1), n = codes.size(0);
     Tensor y = device_alloc({m, n});
+    const int8_t* cp = static_cast<const int8_t*>(codes.device_ptr());
+    const float* bp = bias ? dptr(*bias) : nullptr;
+    const int mi = static_cast<int>(m), ni = static_cast<int>(n), ki = static_cast<int>(k);
+    // Decode (small m): memory-bound, so the warp-per-output GEMV (¼ the fp32 bytes for the huge
+    // lm_head); prefill (large m): compute-bound, the tiled GEMM. Same m split as CudaBackend::linear.
+    if (m <= kGemvMaxM && !g_cuda_force_tiled_q8) {
+        const int threads = 128;  // 4 warps/block, one output channel per warp
+        const int blocks = static_cast<int>((n + threads / 32 - 1) / (threads / 32));
+        linear_q8_gemv_kernel<<<blocks, threads>>>(dptr(x), cp, dptr(scale), bp, dptr(y), mi, ni, ki);
+        launch_check("linear_q8_gemv_kernel");
+        return y;
+    }
     constexpr int BM = 64, BN = 64, BK = 16, TM = 4, TN = 4;
     constexpr int threads = (BM / TM) * (BN / TN);  // 256
     const dim3 grid((static_cast<unsigned>(n) + BN - 1) / BN, (static_cast<unsigned>(m) + BM - 1) / BM);
-    linear_q8_kernel<BM, BN, BK, TM, TN><<<grid, threads>>>(
-        dptr(x), static_cast<const int8_t*>(codes.device_ptr()), dptr(scale),
-        bias ? dptr(*bias) : nullptr, dptr(y), static_cast<int>(m), static_cast<int>(n),
-        static_cast<int>(k));
+    linear_q8_kernel<BM, BN, BK, TM, TN><<<grid, threads>>>(dptr(x), cp, dptr(scale), bp, dptr(y), mi,
+                                                            ni, ki);
     launch_check("linear_q8_kernel");
     return y;
 }
@@ -1499,6 +1545,8 @@ static void launch_check(const char* what) {
 
 // Bench-only switch (see cuda_backend.hpp) to force the naive GEMM path for A/B timing.
 bool g_cuda_force_naive_gemm = false;
+// Bench-only switch (see cuda_backend.hpp) to force the tiled int8 kernel for A/B timing the GEMV.
+bool g_cuda_force_tiled_q8 = false;
 // Opt-in switch (see cuda_backend.hpp) to run the prefill GEMM on the tensor cores (G5d).
 bool g_cuda_use_wmma = false;
 // Opt-in switch (see cuda_backend.hpp) to upload the layer weights as fp16 (G5d).
@@ -1527,8 +1575,8 @@ Tensor CudaBackend::linear(const Tensor& x, const Tensor& weight, const Tensor* 
     // for the projections (where wmma's small-n fragment overhead loses) — both stream ½ the weight
     // bytes. Otherwise the bench knob forces the naive GEMM (the A/B baseline); else small m (decode)
     // is memory-bound → warp-GEMV (G5b), large m (prefill) is compute-bound → tiled GEMM (G5c).
-    // Each output row is independent in all paths, so batching never changes a row.
-    constexpr int64_t kGemvMaxM = 16;
+    // Each output row is independent in all paths, so batching never changes a row. kGemvMaxM is
+    // the shared decode/prefill split (file scope — cuda_linear_q8 routes the int8 lm_head the same).
     if (weight.dtype() == DType::F16) {
         const half* wh = static_cast<const half*>(weight.device_ptr());
         if (m <= kGemvMaxM) {

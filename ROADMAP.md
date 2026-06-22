@@ -426,8 +426,21 @@ the right moment:
   preserved (`run_quant <dir> none embed`, run_cuda_parity); test_cuda parity gather max|diff|=0,
   linear_q8 ~1e-4 vs the CPU oracle. The full int8 GPU model (W8A8 DP4A layers + int8 embed) is 3.97×
   smaller (1979→499 MB), next-token preserved. fp16 storage of the same weight also remains (G5d,
-  ~lossless). Open follow-ups: a decode GEMV / warp-tiling for the int8 lm_head (the kernel is a correct
-  tiled GEMM, not yet speed-tuned), and a W8A8 lm_head (the compute win) once the memory win is banked.
+  ~lossless). **Decode GEMV — DONE**: cuda_linear_q8 ran the prefill-tiled GEMM at every m, so at decode
+  (m=1) its 64-row tile left ~63/64 of the warps idle yet still streamed the whole int8 weight — the huge
+  lm_head ran at only 6% of bandwidth. `linear_q8_gemv_kernel` gives it the G5b warp-per-output treatment
+  (one warp per output channel, 32 lanes coalesce-striding the int8 codes — ¼ the fp32 bytes — a __shfl
+  reduction, the per-channel dequant scale folded in once at the store, the SAME accumulate-then-scale
+  order as the tiled kernel and the CPU oracle). Routed by the shared kGemvMaxM=16 split (decode→GEMV,
+  prefill→tiled), parity-tested vs the CPU oracle at the true m=1 shape (test_cuda linear_q8 ~5e-6, incl.
+  +bias and ragged k) and golden tokens unchanged (run_cuda_parity 1/12 + 0/12, IDENTICAL to the tiled
+  path — the warp-reduce only reorders the sum). Isolated A/B (run_cuda_bench, g_cuda_force_tiled_q8):
+  the lm_head decode op **6% → 82% of bandwidth, 13.5× @m=1** (2.0× @m=16 batched decode); end-to-end
+  (run_cuda_decode_bench NI_QEMBED=1, lm_head kernel toggled, layers held on the GEMV) **decode 1.40× @ctx
+  32/64, 1.45× @ctx 128**, prefill control flat — Amdahl-diluted (the lm_head is one op of ~360/step, but
+  the biggest single weight, ~27% of decode traffic). Remaining follow-up: a W8A8 lm_head (the int8 COMPUTE
+  win at prefill, where lm_head is compute- not memory-bound) once that prefill matmul matters — it feeds
+  argmax, so it needs a token guard.
 - batched sampling — the token draw is still per-sequence in Python; fits the G4/G5 decode path.
 - SIMD nibble-unpack for q4/q4g — helps compute-bound q4 prefill.
 - NEON `simd.hpp` `#elif` path — DONE (the Cross-platform NEON stage above: NEON

@@ -207,6 +207,54 @@ int main() {
         }
     }
 
+    // --- weight-only int8 lm_head: decode GEMV vs the prefill-tuned tiled kernel (G5d follow-up).
+    // The quantized lm_head (cuda_linear_q8) ran the tiled GEMM at every m; at decode (small m) its
+    // 64-row tile leaves ~63/64 of the warps idle yet still streams the whole int8 weight, so the huge
+    // lm_head runs under the bandwidth wall. The warp-per-output GEMV fixes that. A/B via
+    // g_cuda_force_tiled_q8 with everything else fixed; the two share the accumulate-then-scale math, so
+    // GEMV==tiled within the fp32-reduction tolerance (the speed differs, not the result). Decode is
+    // memory-bound, so effective GB/s (counting the int8 codes — the dominant traffic) is the metric. ---
+    std::printf("\nweight-only int8 lm_head: decode GEMV vs tiled (cuda_linear_q8, A/B, %% of BW):\n");
+    std::printf("%-9s %4s | %10s %5s | %10s %5s | %8s | %9s\n", "shape", "m", "GEMV GB/s", "%BW",
+                "tiled GB/s", "%BW", "speedup", "GEMV-tiled");
+    {
+        const Shape lm = {"lm_head", 151936, 896};
+        for (int64_t m : {int64_t(1), int64_t(16)}) {  // decode, batched decode
+            const int64_t n = lm.n, k = lm.k;
+            Tensor x({m, k}), w({n, k});
+            for (int64_t i = 0; i < x.numel(); ++i) x[i] = dist(rng);
+            for (int64_t i = 0; i < w.numel(); ++i) w[i] = dist(rng);
+            QTensor qw = quantize_q8(w);
+            Tensor ws({n});
+            for (int64_t o = 0; o < n; ++o) ws[o] = qw.scale[static_cast<size_t>(o)];
+            Tensor xd = to_device(x);
+            Tensor codesd = to_device_i8(qw.q.data(), {n, k}), wsd = to_device(ws);
+            auto run_q8 = [&] { Tensor y = cuda_linear_q8(xd, codesd, wsd, nullptr); };
+
+            g_cuda_force_tiled_q8 = false;
+            Tensor y_gemv = to_host(cuda_linear_q8(xd, codesd, wsd, nullptr));
+            g_cuda_force_tiled_q8 = true;
+            Tensor y_tiled = to_host(cuda_linear_q8(xd, codesd, wsd, nullptr));
+            double diff = 0.0;
+            for (int64_t i = 0; i < y_gemv.numel(); ++i)
+                diff = std::max(diff, std::fabs((double)y_gemv[i] - y_tiled[i]));
+
+            g_cuda_force_tiled_q8 = false;
+            const double gemv_ms = time_ms(run_q8, 50, 10);
+            g_cuda_force_tiled_q8 = true;
+            const double tiled_ms = time_ms(run_q8, 50, 10);
+            g_cuda_force_tiled_q8 = false;
+
+            // int8 codes (n·k) + fp32 x (m·k) + fp32 scales (n) + fp32 y (m·n): total DRAM traffic.
+            const double bytes = double(n) * k + 4.0 * (double(m) * k + n + double(m) * n);
+            const double gemv_gbps = bytes / (gemv_ms * 1e-3) / 1e9;
+            const double tiled_gbps = bytes / (tiled_ms * 1e-3) / 1e9;
+            std::printf("%-9s %4lld | %10.0f %4.0f%% | %10.0f %4.0f%% | %7.2fx | %9.1e\n", lm.label,
+                        (long long)m, gemv_gbps, 100.0 * gemv_gbps / (kPeakBW / 1e9), tiled_gbps,
+                        100.0 * tiled_gbps / (kPeakBW / 1e9), tiled_ms / gemv_ms, diff);
+        }
+    }
+
     cublasDestroy(handle);
     std::printf("run_cuda_bench: ok\n");
     return 0;
