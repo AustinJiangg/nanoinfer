@@ -350,6 +350,30 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
           the **non-tiled online kernel is the default** — it carries the real G5f win. The genuine
           long-context decode lever left is Flash-Decoding (split-K over the KV: more blocks per query,
           combine partials) — backlog.
+  - [x] **G5g** — Flash-Decoding (split-KV), the long-context DECODE lever G5f named "still ahead". G5e
+        gave each (head,query) a warp and G5f-online halved its K reads, but at decode (sq=1) the kernel
+        still launches only H·sq = 14 warps — ~3% of the 56-SM GPU — each walking the WHOLE KV serially,
+        so at long context attention (not the GEMV) is the decode bottleneck. The win G5f-online couldn't
+        add was *parallelism*. Flash-Decoding splits the KV across `num_splits` warps per (head,query):
+        **pass 1** (`attention_split_kv_kernel`) runs the SAME one-pass online softmax over each key
+        chunk and writes an UNNORMALIZED partial (m, l, acc) to a pooled scratch; **pass 2**
+        (`attention_combine_kernel`) merges the splits with the associative FlashAttention rule (M=max
+        m_s; rescale l_s,acc_s by exp(m_s−M); divide). H·sq·num_splits warps fill the GPU and each warp's
+        serial key-walk shrinks num_splits×. `num_splits` is sized from the device SM count (`split_count`:
+        ~8 warps/SM, ≥128 keys/split, and =1 for short context or prefill — where it degrades to the plain
+        warp kernel, bit-identical). The chunks tile [0,sk) disjointly and causal clamps each to `limit`,
+        so the merge is the exact softmax over [0,limit) — only the reduction ORDER differs (chunked, not
+        lane-strided-over-all), so it is **not bit-identical** to the non-split kernel but matches the CPU
+        oracle to ~1e-8 (test_cuda sk=1024/4096), and split-on == split-off greedy over a 515-token
+        context (run_cuda_cache, the decode-path token gate). Opt-in (`g_cuda_use_split_attn`,
+        `NI_SPLIT_ATTN`), default OFF — run_cuda_parity unchanged. Isolated kernel A/B
+        (run_cuda_attn_bench): decode **6.8× @ctx1024, 23× @ctx4096, 13× @ctx16384** over the non-split
+        online kernel; prefill ties (split_count=1 → no-op, bit-identical — a built-in control). End-to-end
+        decode (run_cuda_decode_bench): **1.30× @ctx~512, 2.15× @ctx~2048** — the win grows with context as
+        attention's share of the step grows, but is Amdahl-diluted by the contiguous cache's O(ctx) cat_seq
+        copy + ~360 per-op launches (paged territory). Contiguous path only; the paged kernel gets the same
+        split treatment as a mechanical follow-up (backlog), and pairing split-KV with the paged cache
+        (no cat_seq) is where the end-to-end win catches up to the kernel's.
 
 ## Cross-platform (portability proof, after the GPU is learned)
 - [x] **NEON** — `simd.hpp`'s `#elif` path now carries the three inner products on aarch64
@@ -375,11 +399,14 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
 ## Backlog (pull in when the moment fits)
 Open candidates, not a closed/deferred-forever list — fold one into a stage when it's
 the right moment:
-- Flash-Decoding (split-K attention) — the real long-context DECODE lever G5f left open. At decode
-  sq=1, attention has only H=14 warps (~3% of the GPU); the online-softmax win is from halving the
-  K reads, not parallelism. Splitting the KV across multiple blocks per query (each does a partial
-  online softmax, then combine the partials) would fill the GPU at long context. Pairs with the
-  G5f-tiled kernel (already online-softmax + smem). Decode is the latency-critical serving path.
+- Flash-Decoding (split-K attention) — **DONE** (G5g above: split the KV across num_splits warps per
+  (head,query), one-pass online softmax per chunk → partial (m,l,acc), then an associative combine.
+  Isolated decode 6.8–23×, end-to-end decode 1.30× @ctx512 / 2.15× @ctx2048, oracle ~1e-8,
+  split-on==split-off greedy). Open follow-ups: (a) the PAGED attention kernel gets the same split
+  treatment (G5g did the contiguous path only — mechanical, would stay bit-identical to the non-split
+  paged kernel); (b) pairing split-KV with the paged cache (no O(ctx) cat_seq copy) is where the
+  end-to-end win catches up to the isolated-kernel win — the contiguous cache's per-step copy is the
+  current end-to-end limiter.
 - shared-mem tiling for the PAGED attention kernel — G5f tiled only the contiguous path (enough to
   characterize the muted-by-L2 result). Mirroring it into paged_attention_warp_kernel (gather blocks
   into smem) is mechanical and would stay bit-identical; do it if/when tiling starts winning.

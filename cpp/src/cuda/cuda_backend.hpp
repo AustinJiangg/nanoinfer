@@ -55,6 +55,15 @@ extern bool g_cuda_force_naive_attn;
 // the FlashAttention structure for when K/V outgrow L2. Bit-identical output either way.
 extern bool g_cuda_use_tiled_attn;
 
+// Opt-in knob (G5g — Flash-Decoding): split the KV across multiple blocks per (head,query), so decode
+// attention fills the GPU instead of launching only H*sq warps (~3% of it at sq=1, each then walking
+// the whole KV serially). Each split runs the one-pass online softmax over its key chunk and writes a
+// partial (m,l,acc); a combine kernel merges the partials. Default false; engages only when the shape
+// warrants it (small sq, long context — see split_count in the .cu) and otherwise degrades to the
+// non-split warp kernel. Reorders the per-key reduction, so NOT bit-identical to the non-split kernel,
+// but within GPU tolerance of the CPU oracle. The long-context decode lever G5f left open.
+extern bool g_cuda_use_split_attn;
+
 class CudaBackend : public Backend {
 public:
     Device device() const override;

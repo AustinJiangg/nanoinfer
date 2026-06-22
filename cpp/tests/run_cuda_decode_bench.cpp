@@ -82,6 +82,9 @@ int main(int argc, char** argv) {
         // NI_TILE_ATTN=1 opts into the shared-memory K/V tiled kernel at prefill (G5f A/B): isolate
         // the tiling's prefill contribution (bit-identical output either way; default is non-tiled).
         if (const char* e = std::getenv("NI_TILE_ATTN")) g_cuda_use_tiled_attn = (e[0] == '1');
+        // NI_SPLIT_ATTN=1 opts into Flash-Decoding / split-KV attention (G5g): the long-context decode
+        // lever. A/B the decode tok/s by running this bench at a long context with and without it set.
+        if (const char* e = std::getenv("NI_SPLIT_ATTN")) g_cuda_use_split_attn = (e[0] == '1');
         Model model(dir, QuantMode::None, Device::CUDA);
         const int64_t vocab = model.config().vocab_size;
         std::printf("layer weights: %s\n", g_cuda_fp16_weights ? "fp16 (G5d)" : "fp32");

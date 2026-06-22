@@ -268,6 +268,17 @@ int main() {
     ok &= check_attention(2, 130, 130, 64, true, 0, 1e-3, rng);  // tiled ragged tiles + query blocks
     g_cuda_use_tiled_attn = false;
 
+    // Flash-Decoding / split-KV (G5g): the KV is split across warps and recombined, so the reduction
+    // order differs from the non-split kernel — match the CPU oracle within tol (same 1e-3, not
+    // bit-identical). Long-context decode (sq=1) is where split_count engages many splits; short
+    // context and prefill fall back to the warp kernel (split_count<2), exercised here too.
+    g_cuda_use_split_attn = true;
+    ok &= check_attention(14, 1, 1024, 64, true, 1023, 1e-3, rng);  // decode, splits engage (~8)
+    ok &= check_attention(14, 1, 4096, 64, true, 4095, 1e-3, rng);  // decode, more splits (~32)
+    ok &= check_attention(2, 1, 100, 64, true, 99, 1e-3, rng);      // short decode: num_splits=1 fallback
+    ok &= check_attention(2, 40, 40, 64, true, 0, 1e-3, rng);       // prefill: num_splits=1 fallback (no-op)
+    g_cuda_use_split_attn = false;
+
     // W8A8 DP4A int8 GEMM (G5d): the projection shapes, prefill + small m, with and without bias.
     // The integer core is identical to the CPU oracle, so the tolerance is just the float dequant.
     ok &= check_w8a8(128, 896, 896, true, 2e-3, rng);    // q/o prefill, +bias

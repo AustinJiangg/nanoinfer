@@ -133,6 +133,37 @@ Tensor cat_seq(const Tensor& a, const Tensor& b) {
 int grid1d(int64_t total, int block) { return static_cast<int>((total + block - 1) / block); }
 constexpr int kBlock = 256;
 
+// SM count of the current device, queried once. Flash-Decoding (G5g) sizes its split count from this
+// rather than hardcoding a number — the engine reads its dimensions, it doesn't bake in magic ones.
+int sm_count() {
+    static int n = [] {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceProp p;
+        cudaGetDeviceProperties(&p, dev);
+        return p.multiProcessorCount;
+    }();
+    return n;
+}
+
+// How many KV splits Flash-Decoding should use, given nq = H*sq (head,query) pairs and key length sk.
+// The non-split kernel launches nq warps; at decode nq=H (14 here) leaves the GPU nearly idle, so we
+// split the KV to launch nq*splits warps (~kTargetWavesPerSM per SM) — but never finer than
+// kMinKeysPerSplit keys per split (below that the split + combine overhead outweighs the parallelism).
+// Returns 1 when splitting isn't worth it (short context, or prefill where nq already saturates the
+// GPU); the caller then runs the plain warp kernel. Scales with context: more keys -> more (capped)
+// splits, so a longer decode — where attention dominates — gets more parallelism.
+int split_count(int64_t nq, int64_t sk) {
+    constexpr int kMinKeysPerSplit = 128;
+    constexpr int kTargetWavesPerSM = 8;
+    const int64_t by_keys = sk / kMinKeysPerSplit;  // cap: keep >= kMinKeysPerSplit keys per split
+    if (by_keys <= 1 || nq <= 0) return 1;
+    int64_t splits = (static_cast<int64_t>(sm_count()) * kTargetWavesPerSM + nq - 1) / nq;  // ceil
+    if (splits > by_keys) splits = by_keys;
+    if (splits < 1) splits = 1;
+    return static_cast<int>(splits);
+}
+
 // Weight loaders that fold the dtype into the read, so one templated kernel serves both fp32
 // and fp16 weights (G5d). ldf returns float (for the fp32-accumulate GEMV/tiled paths); ldh
 // returns half (for the wmma staging). On a float* both are the identity / the same round the
@@ -1046,6 +1077,103 @@ __global__ void attention_warp_tiled_kernel(const float* __restrict__ q, const f
     }
 }
 
+// Flash-Decoding pass 1 (G5g — split-KV attention). The warp-per-query kernel above launches only
+// H*sq warps; at decode (sq=1) that is H (14) warps for the whole GPU, each walking the entire KV
+// serially — so at long context attention, not the GEMV, is the decode bottleneck (G5f-online halved
+// the K reads but could add no parallelism). This gives each (head,query) `num_splits` warps, one per
+// contiguous KV chunk [k0,k1). Each runs the SAME one-pass online softmax as attention_warp_kernel
+// over just its chunk and writes a PARTIAL (m, l, acc) — UNNORMALIZED (acc=Σ p·v, l=Σ p, NOT divided)
+// — to scratch; attention_combine_kernel merges them. The chunks tile [0,sk) disjointly and causal
+// clamps each to `limit`, so the merged result is the exact softmax over [0,limit) — only the
+// reduction ORDER differs (chunked, not lane-strided-over-all), so it is within GPU tolerance of the
+// CPU oracle but NOT bit-identical to the non-split kernel. An empty split (k0>=k1, e.g. a causal
+// chunk past `limit`) stays m=−inf,l=0 and the combine's exp(−inf−M)=0 drops it (no NaN).
+__global__ void attention_split_kv_kernel(const float* __restrict__ q, const float* __restrict__ k,
+                                          const float* __restrict__ v, float* __restrict__ m_part,
+                                          float* __restrict__ l_part, float* __restrict__ acc_part,
+                                          int64_t H, int64_t sq, int64_t sk, int64_t D, int causal,
+                                          int64_t query_offset, float scale, int num_splits,
+                                          int64_t chunk) {
+    const int warpsPerBlock = static_cast<int>(blockDim.x) / 32;
+    const int64_t gwarp = static_cast<int64_t>(blockIdx.x) * warpsPerBlock + threadIdx.x / 32;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int64_t nq = H * sq;
+    if (gwarp >= nq * num_splits) return;  // warp-uniform
+    const int64_t hi = gwarp / num_splits;  // (head,query) pair; consecutive warps share hi (L2-friendly)
+    const int64_t s = gwarp % num_splits;   // which KV split
+    const int64_t h = hi / sq, i = hi % sq;
+    const float* qi = q + (h * sq + i) * D;
+    const float* kh = k + h * sk * D;
+    const float* vh = v + h * sk * D;
+    const int64_t limit = causal ? (query_offset + i + 1) : sk;
+    const int64_t k0 = s * chunk;                                   // this split's key range [k0,k1)
+    const int64_t k1raw = (k0 + chunk < sk) ? (k0 + chunk) : sk;
+    const int64_t k1 = causal ? (k1raw < limit ? k1raw : limit) : k1raw;  // clamp to the causal limit
+
+    // One-pass online softmax over THIS split's keys — the body is identical to attention_warp_kernel,
+    // only the j-range is [k0,k1) instead of [0,limit).
+    float m = -INFINITY, l = 0.0f;
+    float lacc[kMaxHeadDim];
+    for (int64_t d = 0; d < D; ++d) lacc[d] = 0.0f;
+    for (int64_t j = k0 + lane; j < k1; j += 32) {
+        const float* kj = kh + j * D;
+        float sdot = 0.0f;
+        for (int64_t d = 0; d < D; ++d) sdot += qi[d] * kj[d];
+        sdot *= scale;
+        const float m_new = fmaxf(m, sdot);
+        const float corr = expf(m - m_new);
+        const float p = expf(sdot - m_new);
+        l = l * corr + p;
+        const float* vj = vh + j * D;
+        for (int64_t d = 0; d < D; ++d) lacc[d] = lacc[d] * corr + p * vj[d];
+        m = m_new;
+    }
+    // Merge the 32 lane-partials to lane 0 (same associative combine + empty guard as the warp kernel).
+    for (int off = 16; off > 0; off >>= 1) {
+        const float m_o = __shfl_down_sync(0xffffffff, m, off);
+        const float l_o = __shfl_down_sync(0xffffffff, l, off);
+        const float m_new = fmaxf(m, m_o);
+        const bool empty = (m_new == -INFINITY);
+        const float a = empty ? 0.0f : expf(m - m_new), a_o = empty ? 0.0f : expf(m_o - m_new);
+        l = l * a + l_o * a_o;
+        for (int64_t d = 0; d < D; ++d)
+            lacc[d] = lacc[d] * a + __shfl_down_sync(0xffffffff, lacc[d], off) * a_o;
+        m = m_new;
+    }
+    if (lane == 0) {  // write the UNNORMALIZED partial; attention_combine_kernel divides
+        m_part[gwarp] = m;
+        l_part[gwarp] = l;
+        float* ap = acc_part + gwarp * D;
+        for (int64_t d = 0; d < D; ++d) ap[d] = lacc[d];
+    }
+}
+
+// Flash-Decoding pass 2 (G5g): combine the num_splits partials per (head,query) into the final output
+// with the associative FlashAttention rule — M=max_s m_s; out[d] = (Σ_s acc_s[d]·e_s)/(Σ_s l_s·e_s),
+// e_s=exp(m_s−M). One thread per (head,query,dim). A real query always sees key 0, so M is finite and
+// e_s∈[0,1] (an empty split has m_s=−inf ⇒ e_s=0, contributing nothing). num_splits is small, so the
+// denom (d-independent) is recomputed per d rather than shared — this kernel is negligible vs pass 1.
+__global__ void attention_combine_kernel(const float* __restrict__ m_part,
+                                         const float* __restrict__ l_part,
+                                         const float* __restrict__ acc_part, float* __restrict__ out,
+                                         int64_t nq, int64_t D, int num_splits) {
+    const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= nq * D) return;
+    const int64_t hi = idx / D, d = idx % D;
+    const float* mp = m_part + hi * num_splits;
+    const float* lp = l_part + hi * num_splits;
+    const float* ap = acc_part + hi * num_splits * D;
+    float M = -INFINITY;
+    for (int s = 0; s < num_splits; ++s) M = fmaxf(M, mp[s]);
+    float num = 0.0f, den = 0.0f;
+    for (int s = 0; s < num_splits; ++s) {
+        const float e = (mp[s] == -INFINITY) ? 0.0f : expf(mp[s] - M);
+        num += ap[s * D + d] * e;
+        den += lp[s] * e;
+    }
+    out[hi * D + d] = num / den;
+}
+
 // Write the t new tokens' K/V ([n_kv, t, hd]) into this sequence's blocks for one layer.
 // One thread per (head, token, dim); the block + offset come from the block table.
 __global__ void paged_write_kernel(const float* __restrict__ k, const float* __restrict__ v,
@@ -1318,6 +1446,9 @@ bool g_cuda_force_naive_attn = false;
 // slightly regresses small prefill from the smem staging); it's the correct FlashAttention structure
 // that wins once K/V outgrow L2 (bigger model/batch, smaller-L2 GPU). Bit-identical either way.
 bool g_cuda_use_tiled_attn = false;
+// Opt-in knob (G5g): Flash-Decoding / split-KV attention at decode (see cuda_backend.hpp). Default
+// OFF; even when on, split_count() gates it to the shapes where it helps (small sq + long context).
+bool g_cuda_use_split_attn = false;
 
 Tensor CudaBackend::linear(const Tensor& x, const Tensor& weight, const Tensor* bias) {
     const int64_t m = x.size(0), k = x.size(1), n = weight.size(0);
@@ -1528,6 +1659,25 @@ Tensor CudaBackend::attention(const Tensor& q, const Tensor& k, const Tensor& v,
         attention_warp_tiled_kernel<kBc><<<grid, threads, smemBytes>>>(
             dptr(q), dptr(k), dptr(v), dptr(out), H, sq, sk, D, causal ? 1 : 0, query_offset, scale);
         launch_check("attention_warp_tiled_kernel");
+    } else if (g_cuda_use_split_attn && split_count(H * sq, sk) >= 2) {
+        // Flash-Decoding (G5g): split the KV so nq*num_splits warps fill the GPU. Pass 1 writes each
+        // split's partial (m,l,acc) to pooled scratch; pass 2 combines them. split_count returns >=2
+        // only when worth it (small sq + long context); otherwise the warp kernel below runs instead.
+        const int64_t nq = H * sq;
+        const int num_splits = split_count(nq, sk);
+        const int64_t chunk = (sk + num_splits - 1) / num_splits;  // keys per split, tiling [0,sk)
+        Tensor m_part = device_alloc({nq * num_splits});           // pooled scratch (tiny, reused)
+        Tensor l_part = device_alloc({nq * num_splits});
+        Tensor acc_part = device_alloc({nq * num_splits, D});
+        const int threads = 256, warpsPerBlock = threads / 32;  // one warp per (head,query,split)
+        const int blocks = static_cast<int>((nq * num_splits + warpsPerBlock - 1) / warpsPerBlock);
+        attention_split_kv_kernel<<<blocks, threads>>>(
+            dptr(q), dptr(k), dptr(v), dptr(m_part), dptr(l_part), dptr(acc_part), H, sq, sk, D,
+            causal ? 1 : 0, query_offset, scale, num_splits, chunk);
+        launch_check("attention_split_kv_kernel");
+        attention_combine_kernel<<<grid1d(nq * D, kBlock), kBlock>>>(
+            dptr(m_part), dptr(l_part), dptr(acc_part), dptr(out), nq, D, num_splits);
+        launch_check("attention_combine_kernel");
     } else {
         const int threads = 256;  // 8 warps/block, one warp per (head,query)
         const int blocks = static_cast<int>((H * sq + threads / 32 - 1) / (threads / 32));

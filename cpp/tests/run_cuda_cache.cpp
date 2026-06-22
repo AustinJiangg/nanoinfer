@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "cuda/cuda.hpp"
+#include "cuda/cuda_backend.hpp"  // g_cuda_use_split_attn (Flash-Decoding check, G5g)
 #include "model.hpp"
 #include "parity_util.hpp"
 
@@ -103,7 +104,41 @@ int main(int argc, char** argv) {
         std::printf("incremental greedy: %s (%d/%zu mismatches)\n", greedy_ok ? "MATCH" : "MISMATCH",
                     genmism, ref_gen.size());
 
-        const bool ok = maxd < 1e-3 && greedy_ok;
+        // 3. Flash-Decoding (G5g): on the real decode path, enabling split-KV must not change the
+        // greedy tokens. The golden continuation is only a handful of tokens (context < the split
+        // threshold), so we build a long synthetic context (the prompt repeated past 512 tokens, so
+        // split_count engages from the first decode step) and require the split-ON token stream to
+        // equal the split-OFF (warp-kernel) one — the decode-path analogue of "tiled == non-tiled".
+        // Split matches the oracle to ~1e-8, so argmax must be unmoved; a mismatch is a real bug.
+        std::vector<int64_t> longctx;
+        while (static_cast<int64_t>(longctx.size()) < 512)
+            longctx.insert(longctx.end(), ids.begin(), ids.end());
+        auto decode_split = [&](bool use_split) {
+            g_cuda_use_split_attn = use_split;
+            const int steps = 16;
+            std::unique_ptr<KVCacheBase> c =
+                model.make_kv_cache(static_cast<int64_t>(longctx.size()) + steps + 8);
+            Tensor pl = model.forward(longctx, c.get());  // long prefill (split no-ops: sq large)
+            int64_t t = argmax_row(pl, pl.size(0) - 1, vocab);
+            std::vector<int64_t> out{t};
+            for (int s = 1; s < steps; ++s) {  // decode: sq=1, sk>=512 -> split engages when ON
+                Tensor ld = model.forward({t}, c.get());
+                t = argmax_row(ld, 0, vocab);
+                out.push_back(t);
+            }
+            g_cuda_use_split_attn = false;
+            return out;
+        };
+        std::vector<int64_t> tok_off = decode_split(false);  // warp kernel (default)
+        std::vector<int64_t> tok_on = decode_split(true);    // split-KV
+        int splitmism = 0;
+        for (size_t i = 0; i < tok_off.size() && i < tok_on.size(); ++i)
+            if (tok_off[i] != tok_on[i]) ++splitmism;
+        const bool split_ok = tok_off.size() == tok_on.size() && splitmism == 0;
+        std::printf("flash-decoding: split-on vs split-off greedy %s (%d/%zu mism, ctx=%zu)\n",
+                    split_ok ? "MATCH" : "MISMATCH", splitmism, tok_off.size(), longctx.size());
+
+        const bool ok = maxd < 1e-3 && greedy_ok && split_ok;
         std::printf(ok ? "run_cuda_cache: ok\n" : "run_cuda_cache: FAIL\n");
         return ok ? 0 : 1;
     } catch (const std::exception& e) {

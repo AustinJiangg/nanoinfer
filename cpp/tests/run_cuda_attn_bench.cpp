@@ -1,15 +1,16 @@
 // G5f isolated attention micro-bench — the sibling of run_cuda_bench (which times linear()). The
 // full-step decode bench dilutes attention (it's a minority of a prefill step, and the GEMMs
-// dominate), so to see what the shared-memory K/V tiling does to the KERNEL we time attention() on
-// its own. Three kernels on the same inputs: naive (1 thread/query, G5e floor), non-tiled online
-// (G5f-online), and shared-mem tiled (G5f-tiled). Also checks tiled == non-tiled bit-for-bit
-// (max|diff|=0 — the tiling keeps the key order) and both ~1e-6 vs naive. Only built with -DNI_CUDA.
+// dominate), so to see what the attention kernels do on their own we time attention() in isolation.
+// Four kernels on the same inputs: naive (1 thread/query, G5e floor), non-tiled online (G5f-online,
+// the default), shared-mem tiled (G5f-tiled), and split-KV / Flash-Decoding (G5g). Checks tiled ==
+// non-tiled bit-for-bit (max|diff|=0 — tiling keeps the key order), and split ~ non-tiled within tol
+// (split reorders the reduction across chunks, so ~1e-6, not 0). Only built with -DNI_CUDA.
 //
-// Honest read of the result: for Qwen2.5-0.5B (H=14, D=64) the per-layer KV fits in the 4070S's
-// large L2 even at long context, so the global→smem reuse the tiling buys is already served by L2 —
-// expect the tiled kernel to roughly TIE the non-tiled one here, and to pull ahead only when K/V
-// outgrow L2 (bigger model / batch, or a smaller-L2 GPU). The win that DID land is online softmax
-// (one pass) over the naive two-pass-style floor.
+// Honest read: for Qwen2.5-0.5B (H=14, D=64) the per-layer KV fits in the 4070S's large L2 even at
+// long context, so the global→smem reuse TILING buys is already served by L2 — expect tiled to TIE
+// non-tiled here, winning only when K/V outgrow L2 (bigger model/batch, smaller-L2 GPU). SPLIT-KV is
+// a different lever: it adds parallelism (H*sq warps fill ~3% of the GPU at decode), so it wins on
+// the decode rows (sq=1, long sk) and no-ops on prefill (sq large already saturates → split_count=1).
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -72,7 +73,11 @@ int main() {
     struct Cfg {
         int64_t sq, sk;
     };
-    const std::vector<Cfg> cfgs = {{128, 128}, {512, 512}, {1024, 1024}, {2048, 2048}, {1, 4096}};
+    // Prefill rows (sq=sk): split no-ops (sq large → split_count=1), a built-in control. Decode rows
+    // (sq=1, growing sk): the Flash-Decoding regime, where split-KV adds the parallelism that the
+    // 14-warp non-split kernel lacks — the win should grow with context.
+    const std::vector<Cfg> cfgs = {{128, 128}, {512, 512}, {1024, 1024}, {2048, 2048},
+                                   {1, 1024},  {1, 4096},  {1, 16384}};
 
     std::mt19937 rng(1234);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
@@ -80,8 +85,8 @@ int main() {
 
     std::printf("run_cuda_attn_bench: isolated attention(), Qwen2.5-0.5B shape (H=%lld, D=%lld), causal\n",
                 (long long)H, (long long)D);
-    std::printf("%5s %6s | %9s %9s %9s | %7s %7s | %10s %10s\n", "sq", "sk", "naive ms", "notile ms",
-                "tiled ms", "t/notile", "t/naive", "tile==notl", "notl~naive");
+    std::printf("%5s %6s | %9s %9s %9s %9s | %8s %8s | %10s %10s\n", "sq", "sk", "naive ms",
+                "notile ms", "tiled ms", "split ms", "notl/spl", "t/notile", "tile==notl", "spl~notl");
 
     bool ok = true;
     for (const Cfg& c : cfgs) {
@@ -108,15 +113,23 @@ int main() {
         Tensor o_tiled = to_host(gpu.attention(qd, kd, vd, true, qoff));
         const double ms_tiled = time_ms(run, 30, 5);
 
+        g_cuda_use_tiled_attn = false;
+        g_cuda_use_split_attn = true;  // Flash-Decoding / split-KV (engages for small sq + long sk)
+        Tensor o_split = to_host(gpu.attention(qd, kd, vd, true, qoff));
+        const double ms_split = time_ms(run, 30, 5);
+        g_cuda_use_split_attn = false;
+
         const double d_tn = maxdiff(o_tiled, o_notile);   // must be 0 (same key order)
         const double d_na = maxdiff(o_notile, o_naive);   // ~1e-6 (reduction reorder)
-        ok &= (d_tn == 0.0) && (d_na < 1e-3);
-        std::printf("%5lld %6lld | %9.3f %9.3f %9.3f | %6.2fx %6.2fx | %10.1e %10.1e\n", (long long)sq,
-                    (long long)sk, ms_naive, ms_notile, ms_tiled, ms_notile / ms_tiled,
-                    ms_naive / ms_tiled, d_tn, d_na);
+        const double d_sn = maxdiff(o_split, o_notile);   // ~1e-6 (split reorders across chunks)
+        ok &= (d_tn == 0.0) && (d_na < 1e-3) && (d_sn < 1e-3);
+        std::printf("%5lld %6lld | %9.3f %9.3f %9.3f %9.3f | %7.2fx %7.2fx | %10.1e %10.1e\n",
+                    (long long)sq, (long long)sk, ms_naive, ms_notile, ms_tiled, ms_split,
+                    ms_notile / ms_split, ms_notile / ms_tiled, d_tn, d_sn);
     }
     g_cuda_force_naive_attn = false;
     g_cuda_use_tiled_attn = false;
+    g_cuda_use_split_attn = false;
     std::printf("run_cuda_attn_bench: %s\n", ok ? "ok" : "FAIL (parity)");
     return ok ? 0 : 1;
 }
