@@ -63,6 +63,24 @@ int main() {
     }
     CHECK_CLOSE(ni::simd::dot_f32(nullptr, nullptr, 0), 0.0, 0.0);  // empty -> 0
 
+    // simd::unpack_q4 must reproduce quant.cpp's q4_code() bit-for-bit (integer-exact): low nibble
+    // of byte i -> column 2i, high nibble -> column 2i+1, code = nibble - 8. Lengths 0..70 cover the
+    // empty case, the 32-code SIMD block, multiple blocks, every tail, and odd n (a lone final low
+    // nibble). Random packed bytes exercise all 16 nibble values — a superset of the real [-7,7] codes.
+    std::uniform_int_distribution<int> ubyte(0, 255);
+    for (int64_t n = 0; n <= 70; ++n) {
+        std::vector<uint8_t> packed(static_cast<size_t>((n + 1) / 2));
+        for (auto& byte : packed) byte = static_cast<uint8_t>(ubyte(rng));
+        std::vector<int8_t> got(static_cast<size_t>(n)), ref(static_cast<size_t>(n));
+        for (int64_t j = 0; j < n; ++j) {
+            const uint8_t byte = packed[static_cast<size_t>(j / 2)];
+            const uint8_t nib = (j & 1) ? (byte >> 4) : (byte & 0x0F);
+            ref[static_cast<size_t>(j)] = static_cast<int8_t>(int(nib) - 8);
+        }
+        ni::simd::unpack_q4(packed.data(), got.data(), n);
+        CHECK(n == 0 || std::memcmp(got.data(), ref.data(), static_cast<size_t>(n)) == 0);
+    }
+
     // Threaded linear is bit-identical run-to-run and across thread counts: each
     // output channel is one thread's complete reduction, so nothing depends on how
     // the channels are split. (in is not a multiple of 8 -> exercises the tail;

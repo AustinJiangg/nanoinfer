@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <vector>
 
 #include "parallel.hpp"
 #include "simd.hpp"
@@ -12,6 +13,12 @@ namespace ni {
 namespace {
 constexpr float kQ8Max = 127.0f;
 constexpr float kQ4Max = 7.0f;
+
+// Q4/Q4G unpack the packed weight row to an int8 scratch buffer once and reuse it across the m
+// activation rows (then SIMD dot_qf32). That extra unpack pass only pays off once it amortizes:
+// below this many rows (decode / tiny batches) the materialization costs more than the SIMD dot
+// saves, so we keep the fused scalar q4_code dot there. Prefill (m = prompt length) clears it.
+constexpr int64_t kQ4UnpackMinRows = 8;
 
 void require(bool cond, const char* msg) {
     if (!cond) throw std::invalid_argument(msg);
@@ -240,21 +247,36 @@ Tensor linear_q4(const Tensor& x, const Q4Tensor& w, const Tensor* bias) {
     const float* sp = w.scale.data();
     const float* bp = bias ? bias->data() : nullptr;
     float* yp = y.data();
-    // Output-channel parallel, row loop inner so the packed weight row streams once
-    // per call (see linear()). The nibble unpack stays scalar — threading + weight
-    // reuse are the wins; SIMD unpack would help only compute-bound q4 prefill.
+    // Output-channel parallel, row loop inner so the packed weight row streams once per call (see
+    // linear()). Prefill (m large): unpack each row's nibbles to int8 ONCE (simd::unpack_q4) and reuse
+    // across the m activation rows via the SIMD dot_qf32 — the unpack is vectorized and amortized over
+    // m. Decode (m < kQ4UnpackMinRows): the unpack wouldn't amortize, so keep the fused scalar q4_code
+    // dot (materializing the whole weight for one dot is net slower). codes is per-thread scratch.
+    const bool unpack = m >= kQ4UnpackMinRows;
 #if defined(_OPENMP)
-#pragma omp parallel for schedule(static) if (out >= kParallelMinRows)
+#pragma omp parallel if (out >= kParallelMinRows)
 #endif
-    for (int64_t o = 0; o < out; ++o) {
-        const uint8_t* row = qp + o * row_bytes;
-        const double scale = double(sp[o]);
-        const double b = bp ? double(bp[o]) : 0.0;
-        for (int64_t i = 0; i < m; ++i) {
-            const float* xr = xp + i * in;
-            double acc = 0.0;
-            for (int64_t j = 0; j < in; ++j) acc += double(xr[j]) * q4_code(row, j);
-            yp[i * out + o] = float(acc * scale + b);
+    {
+        std::vector<int8_t> codes(unpack ? static_cast<size_t>(in) : 0);
+#if defined(_OPENMP)
+#pragma omp for schedule(static)
+#endif
+        for (int64_t o = 0; o < out; ++o) {
+            const uint8_t* row = qp + o * row_bytes;
+            const double scale = double(sp[o]);
+            const double b = bp ? double(bp[o]) : 0.0;
+            if (unpack) {
+                simd::unpack_q4(row, codes.data(), in);
+                for (int64_t i = 0; i < m; ++i)
+                    yp[i * out + o] = float(simd::dot_qf32(xp + i * in, codes.data(), in) * scale + b);
+            } else {
+                for (int64_t i = 0; i < m; ++i) {
+                    const float* xr = xp + i * in;
+                    double acc = 0.0;
+                    for (int64_t j = 0; j < in; ++j) acc += double(xr[j]) * q4_code(row, j);
+                    yp[i * out + o] = float(acc * scale + b);
+                }
+            }
         }
     }
     return y;
@@ -316,26 +338,41 @@ Tensor linear_q4g(const Tensor& x, const Q4GTensor& w, const Tensor* bias) {
     const float* sp = w.scale.data();
     const float* bp = bias ? bias->data() : nullptr;
     float* yp = y.data();
-    // Output-channel parallel, row loop inner so the packed weight row streams once
-    // per call (see linear()).
+    // Output-channel parallel, row loop inner so the packed weight row streams once per call (see
+    // linear()). Prefill (m large): unpack each row's nibbles to int8 ONCE (simd::unpack_q4), then
+    // dot_qf32 each group's slice — the per-block scale applies to each group's partial sum, the dot
+    // is SIMD, the unpack amortizes over m. Decode (m < kQ4UnpackMinRows): fused scalar (the unpack
+    // wouldn't amortize). codes is per-thread scratch. (Same m split as linear_q4.)
+    const bool unpack = m >= kQ4UnpackMinRows;
 #if defined(_OPENMP)
-#pragma omp parallel for schedule(static) if (out >= kParallelMinRows)
+#pragma omp parallel if (out >= kParallelMinRows)
 #endif
-    for (int64_t o = 0; o < out; ++o) {
-        const uint8_t* row = qp + o * row_bytes;
-        const float* srow = sp + o * blocks;
-        const double bias_o = bp ? double(bp[o]) : 0.0;
-        for (int64_t i = 0; i < m; ++i) {
-            const float* xr = xp + i * in;
-            double acc = 0.0;
-            // The scale varies per block, so apply it to each block's partial sum.
-            for (int64_t bk = 0; bk < blocks; ++bk) {
-                const int64_t j0 = bk * w.group, j1 = std::min(j0 + w.group, in);
-                double bsum = 0.0;
-                for (int64_t j = j0; j < j1; ++j) bsum += double(xr[j]) * q4_code(row, j);
-                acc += bsum * double(srow[bk]);
+    {
+        std::vector<int8_t> codes(unpack ? static_cast<size_t>(in) : 0);
+#if defined(_OPENMP)
+#pragma omp for schedule(static)
+#endif
+        for (int64_t o = 0; o < out; ++o) {
+            const uint8_t* row = qp + o * row_bytes;
+            const float* srow = sp + o * blocks;
+            const double bias_o = bp ? double(bp[o]) : 0.0;
+            if (unpack) simd::unpack_q4(row, codes.data(), in);
+            for (int64_t i = 0; i < m; ++i) {
+                const float* xr = xp + i * in;
+                double acc = 0.0;
+                // The scale varies per block, so apply it to each block's partial sum.
+                for (int64_t bk = 0; bk < blocks; ++bk) {
+                    const int64_t j0 = bk * w.group, j1 = std::min(j0 + w.group, in);
+                    if (unpack)
+                        acc += simd::dot_qf32(xr + j0, codes.data() + j0, j1 - j0) * double(srow[bk]);
+                    else {
+                        double bsum = 0.0;
+                        for (int64_t j = j0; j < j1; ++j) bsum += double(xr[j]) * q4_code(row, j);
+                        acc += bsum * double(srow[bk]);
+                    }
+                }
+                yp[i * out + o] = float(acc + bias_o);
             }
-            yp[i * out + o] = float(acc + bias_o);
         }
     }
     return y;

@@ -173,11 +173,13 @@ int main() {
         }
     }
 
-    // linear_q4(x, q) == linear(x, dequant(q)) with and without bias.
-    {
+    // linear_q4(x, q) == linear(x, dequant(q)) with and without bias, at m below and at/above
+    // kQ4UnpackMinRows (8) — covering BOTH the fused-scalar decode path and the unpack+dot_qf32
+    // prefill path. in=40 exercises the SIMD unpack's 32-code block plus its 8-wide tail.
+    for (int64_t m : {3, 16}) {
         std::mt19937_64 rng(4);
         std::normal_distribution<float> nd;
-        Tensor x({3, 20}), w({5, 20}), bias({5});
+        Tensor x({m, 40}), w({5, 40}), bias({5});
         for (int64_t i = 0; i < x.numel(); ++i) x[i] = nd(rng);
         for (int64_t i = 0; i < w.numel(); ++i) w[i] = nd(rng);
         for (int64_t i = 0; i < bias.numel(); ++i) bias[i] = nd(rng);
@@ -257,11 +259,12 @@ int main() {
             }
     }
 
-    // linear_q4g(x, q) == linear(x, dequant(q)), with and without bias.
-    {
+    // linear_q4g(x, q) == linear(x, dequant(q)), with and without bias, at m below and at/above
+    // kQ4UnpackMinRows — both the fused-scalar decode path and the unpack+per-group dot_qf32 path.
+    for (int64_t m : {3, 16}) {
         std::mt19937_64 rng(6);
         std::normal_distribution<float> nd;
-        Tensor x({3, 32}), w({5, 32}), bias({5});
+        Tensor x({m, 32}), w({5, 32}), bias({5});
         for (int64_t i = 0; i < x.numel(); ++i) x[i] = nd(rng);
         for (int64_t i = 0; i < w.numel(); ++i) w[i] = nd(rng);
         for (int64_t i = 0; i < bias.numel(); ++i) bias[i] = nd(rng);

@@ -453,7 +453,19 @@ the right moment:
   greedy+penalized batch); isolated sampling step ~1.6–2× (the saved per-row copies). Honest scope: a
   scheduling/cleanliness win, not a headline number — sampling is <1% of the decode step (the forward
   dominates), so the value is the architecture (batched forward → batched selection) + removed copies.
-- SIMD nibble-unpack for q4/q4g — helps compute-bound q4 prefill.
+- SIMD nibble-unpack for q4/q4g — **DONE**. The Q4/Q4G linears were the one quant format whose inner
+  loop was still scalar (a `q4_code()` nibble-extract per element, redone per activation row).
+  `simd::unpack_q4` (AVX2 + NEON + scalar) unpacks a packed weight row to int8 codes once (low nibble
+  → col 2i, high → col 2i+1, code = nibble−8), then the existing SIMD `dot_qf32` runs over the buffer,
+  reused across all m rows — so the nibble work is vectorized AND amortized, and the dot is SIMD. The
+  unpack only pays once it amortizes, so it's gated on `m ≥ kQ4UnpackMinRows (8)`: prefill takes the
+  unpacked path, decode (m=1) keeps the fused scalar dot (materializing the whole weight for one dot is
+  net slower — measured a decode regression without the gate). Parity-safe (the dot re-associates in
+  double like every C5 SIMD path): `test_quant` `linear_q4/q4g == linear(dequant)` within 1e-4 on BOTH
+  the scalar and unpacked paths, and `unpack_q4` is bit-exact vs the scalar `q4_code` ref
+  (`test_simd`), both on AVX2 (native) and NEON (qemu). End-to-end prefill (`run_bench`, 20 cores):
+  **q4 28.5 → 66 tok/s (2.3×), q4g 26.9 → 67 tok/s (2.5×)**; decode unchanged (identical scalar path at
+  m=1). q4/q4g model outputs are the same as before (only the dot order changed, not the values).
 - NEON `simd.hpp` `#elif` path — DONE (the Cross-platform NEON stage above: NEON
   dot_f32/dot_qf32/dot_qq, cross-compiled + qemu-parity-tested vs the scalar oracle).
 - float32-accumulation in the SIMD dot — **has a real cost**: it trades away the

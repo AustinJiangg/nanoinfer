@@ -196,5 +196,46 @@ inline int32_t dot_qq(const int8_t* a, const int8_t* b, int64_t n) {
 #endif
 }
 
+// Unpack n packed int4 weight codes into int8 codes in [-7, 7]. The packing is two-per-byte:
+// column 2i in the low nibble of byte i, column 2i+1 in the high nibble; the stored nibble is
+// code+8, so a code is nibble-8 (quant.cpp's q4_code). The Q4/Q4G linears unpack a weight row
+// ONCE with this, then run the existing int8×fp32 dot_qf32 over the buffer and reuse it across
+// all m activation rows — so the nibble work is SIMD and amortized over m, instead of a scalar
+// q4_code() per element *per row*. Integer-exact on every path (it must reproduce q4_code()
+// bit-for-bit — test_simd checks it vs the scalar ref); the speed comes from the SIMD dot.
+inline void unpack_q4(const uint8_t* packed, int8_t* out, int64_t n) {
+    int64_t j = 0;
+#if defined(__AVX2__) && defined(__FMA__)
+    const __m128i lomask = _mm_set1_epi8(0x0F);
+    const __m128i eight = _mm_set1_epi8(8);
+    for (; j + 32 <= n; j += 32) {  // 16 packed bytes -> 32 codes
+        const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(packed + j / 2));
+        const __m128i lo = _mm_and_si128(b, lomask);                    // even cols: low nibbles
+        const __m128i hi = _mm_and_si128(_mm_srli_epi16(b, 4), lomask);  // odd cols: high nibbles
+        const __m128i loc = _mm_sub_epi8(lo, eight);  // nibble-8 -> code in [-7, 7]
+        const __m128i hic = _mm_sub_epi8(hi, eight);
+        // Re-interleave to column order: out = [lo0,hi0,lo1,hi1,...] = cols 0,1,2,3,...
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out + j), _mm_unpacklo_epi8(loc, hic));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out + j + 16), _mm_unpackhi_epi8(loc, hic));
+    }
+#elif defined(__aarch64__)
+    const uint8x16_t lomask = vdupq_n_u8(0x0F);
+    const int8x16_t eight = vdupq_n_s8(8);
+    for (; j + 32 <= n; j += 32) {
+        const uint8x16_t b = vld1q_u8(packed + j / 2);
+        const int8x16_t lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(b, lomask)), eight);  // even cols
+        const int8x16_t hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(b, 4)), eight);     // odd cols
+        vst1q_s8(out + j, vzip1q_s8(lo, hi));       // cols 0..15 interleaved
+        vst1q_s8(out + j + 16, vzip2q_s8(lo, hi));  // cols 16..31
+    }
+#endif
+    for (; j + 2 <= n; j += 2) {  // scalar tail (and the whole loop on non-SIMD targets)
+        const uint8_t byte = packed[j / 2];
+        out[j] = static_cast<int8_t>((byte & 0x0F) - 8);
+        out[j + 1] = static_cast<int8_t>((byte >> 4) - 8);
+    }
+    if (j < n) out[j] = static_cast<int8_t>((packed[j / 2] & 0x0F) - 8);  // odd n: final low nibble
+}
+
 }  // namespace simd
 }  // namespace ni
