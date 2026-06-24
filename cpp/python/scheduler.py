@@ -129,6 +129,31 @@ def sample_token(logits: np.ndarray, req: Request, context: list[int], rng) -> i
     return int(rng.choice(logits.shape[0], p=probs))
 
 
+def sample_batch(logits: np.ndarray, seqs: list["Sequence"]) -> np.ndarray:
+    """Select one token per row of a [N, vocab] logit batch — the batched mirror of
+    sample_token, for the batched decode step. Rows that are plain greedy (temperature 0
+    and no repetition penalty — the default) are decided together with one vectorized
+    argmax over the whole batch, skipping the per-row vocab-sized copy sample_token makes;
+    numpy's argmax takes the first max along the axis, so each row is bit-identical to
+    sample_token's argmax. Rows that sample or carry a repetition penalty keep their own
+    per-sequence pipeline (their temperature / top-k / top-p / RNG / context don't share
+    across the batch), still via sample_token. Token-identical to calling sample_token on
+    every row, so interleaved output is unchanged (run_serve.py asserts it at every batch)."""
+    n = len(seqs)
+    greedy = np.fromiter(
+        (s.req.temperature == 0.0 and s.req.repetition_penalty == 1.0 for s in seqs),
+        dtype=bool, count=n)
+    if greedy.all():  # the common case: one argmax over the batch, no per-row copy
+        return np.argmax(logits, axis=1)
+    toks = np.empty(n, dtype=np.int64)
+    if greedy.any():  # mixed batch: still batch the greedy rows together...
+        toks[greedy] = np.argmax(logits[greedy], axis=1)
+    for i, s in enumerate(seqs):  # ...and run the genuinely-sampled rows one at a time
+        if not greedy[i]:
+            toks[i] = sample_token(logits[i], s.req, s.context, s._rng)
+    return toks
+
+
 class PrefixCache:
     """A radix-style cache of computed KV prefix blocks (the RadixAttention idea, on
     the F8b block table), keyed by the block-aligned token prefix. A new request can
@@ -229,16 +254,22 @@ class Scheduler:
             self.reserved -= seq.reserved_blocks
             seq.cache = None
 
-    def _emit(self, seq: Sequence, logits_row: np.ndarray) -> bool:
-        """Sample one token from the last-position logits and apply the stop rules,
-        exactly as generate() does: EOS is checked *before* the token is emitted (so
-        it's excluded), then max_tokens. Returns True if the sequence is now done."""
+    def _accept(self, seq: Sequence, tok: int) -> bool:
+        """Apply the stop rules to an already-selected token, exactly as generate() does:
+        EOS is checked *before* the token is emitted (so it's excluded), then max_tokens.
+        Returns True if the sequence is now done. Shared by the single-sequence prefill path
+        (_emit) and the batched decode path (which selects tokens together via sample_batch)."""
         eos = seq.req.eos_id if seq.req.eos_id >= 0 else self._eos_default
-        tok = sample_token(logits_row, seq.req, seq.context, seq._rng)
         if eos >= 0 and tok == eos:
             return True
         seq.output_ids.append(tok)
         return len(seq.output_ids) >= seq.req.max_tokens
+
+    def _emit(self, seq: Sequence, logits_row: np.ndarray) -> bool:
+        """Sample one token from a single logits row, then apply the stop rules. The prefill-
+        admission path uses this (one sequence at a time); the batched decode step selects the
+        whole running set at once via sample_batch, then calls _accept on each."""
+        return self._accept(seq, sample_token(logits_row, seq.req, seq.context, seq._rng))
 
     def step(self) -> None:
         # 1. Decode the running set by one token. Batched: one forward_batch over all
@@ -249,11 +280,12 @@ class Scheduler:
                 tokens = [s.last_token for s in self.running]
                 caches = [s.cache for s in self.running]
                 logits = self.model.forward_batch(tokens, caches)  # [N, vocab]
-                rows = [logits[i] for i in range(len(self.running))]
             else:
-                rows = [self.model.forward([s.last_token], s.cache)[-1] for s in self.running]
-            for seq, row in zip(self.running, rows):
-                if self._emit(seq, row):
+                logits = np.stack(
+                    [self.model.forward([s.last_token], s.cache)[-1] for s in self.running])
+            # Select the whole running set's next tokens together (greedy rows vectorized).
+            for seq, tok in zip(self.running, sample_batch(logits, self.running)):
+                if self._accept(seq, int(tok)):
                     self._finish(seq)
 
         # 2. Evict the finished, freeing their slots.

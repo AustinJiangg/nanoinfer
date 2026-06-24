@@ -441,7 +441,18 @@ the right moment:
   the biggest single weight, ~27% of decode traffic). Remaining follow-up: a W8A8 lm_head (the int8 COMPUTE
   win at prefill, where lm_head is compute- not memory-bound) once that prefill matmul matters — it feeds
   argmax, so it needs a token guard.
-- batched sampling — the token draw is still per-sequence in Python; fits the G4/G5 decode path.
+- batched sampling — **DONE**. forward_batch already returned [N, vocab] in one pass, but the token
+  draw was a Python loop calling sample_token per row — each copying the whole vocab row even for greedy.
+  `sample_batch` (scheduler.py) selects the running set's tokens together: rows that are plain greedy
+  (temperature 0, no repetition penalty — the default) are decided with one vectorized `argmax(axis=1)`
+  over the batch (no per-row copy; numpy's first-max == sample_token's argmax, so bit-identical), while
+  sampled / repetition-penalty rows keep their per-sequence pipeline (their temperature/top-k/top-p/RNG/
+  context don't vectorize). The stop logic factored into `_accept`, shared by the batched decode path and
+  the single-sequence prefill-admission `_emit`. Token-identical to standalone on both backends
+  (run_serve.py + run_cuda_serve.py MATCH at every batch size, incl. a rep-penalty request — the mixed
+  greedy+penalized batch); isolated sampling step ~1.6–2× (the saved per-row copies). Honest scope: a
+  scheduling/cleanliness win, not a headline number — sampling is <1% of the decode step (the forward
+  dominates), so the value is the architecture (batched forward → batched selection) + removed copies.
 - SIMD nibble-unpack for q4/q4g — helps compute-bound q4 prefill.
 - NEON `simd.hpp` `#elif` path — DONE (the Cross-platform NEON stage above: NEON
   dot_f32/dot_qf32/dot_qq, cross-compiled + qemu-parity-tested vs the scalar oracle).
