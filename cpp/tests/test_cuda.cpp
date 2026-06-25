@@ -226,6 +226,15 @@ int main() {
     ok &= check_linear(128, 8192, 896, 5e-3, false, rng);  // tiled-vec 128×128, large n (lm_head path)
     ok &= check_linear(100, 8192, 896, 5e-3, false, rng);  // tiled-vec 128×128, large n + ragged m
 
+    // Double-buffered projection GEMM (G5 micro-gain): bit-identical to the tiled-vec kernel (only the
+    // load timing changes), so it must meet the same oracle on the narrow-n projection shapes it routes
+    // — square, wide n, and the ragged-m + wide-k (down) case that exercises the prefetch's m-bound.
+    g_cuda_use_dbuf = true;
+    ok &= check_linear(128, 896, 896, 5e-3, false, rng);   // dbuf 64×64, square (q/o)
+    ok &= check_linear(128, 4864, 896, 5e-3, false, rng);  // dbuf 64×64, wide n (gate/up)
+    ok &= check_linear(100, 896, 4864, 5e-3, false, rng);  // dbuf 64×64, ragged m + wide k (down)
+    g_cuda_use_dbuf = false;
+
     // Tensor-core (fp32 weight, fp16 staged) — the max|diff| is the fp16 cost. n<8192 hits the 64²
     // kernel; n>=8192 the 128² warp-tiled kernel (the lm_head path).
     g_cuda_use_wmma = true;

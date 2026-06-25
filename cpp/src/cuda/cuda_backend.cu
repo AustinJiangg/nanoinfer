@@ -395,6 +395,155 @@ __global__ void linear_tiled_vec_kernel(const float* __restrict__ x, const WT* _
     }
 }
 
+// Prefill tiled GEMM, DOUBLE-BUFFERED (G5 micro-gain): software-pipelines linear_tiled_vec_kernel so
+// the next K-tile's global load overlaps the current tile's compute, hiding the ~400-cycle DRAM
+// latency that a single-buffered tile eats at each __syncthreads. Aimed at the LOW-OCCUPANCY
+// projections — down (n=896,k=4864) and q/o (n=896,k=896) launch only 28 blocks (m=128/64 × n=896/64)
+// on a 56-SM GPU, so ~half the SMs sit idle and there is no second resident block to hide the stall
+// behind (the lm_head's >1000 blocks and gate/up's 152 already hide it via cross-block occupancy —
+// which is why this is scoped to the narrow-n path, not lm_head). The textbook lever here is cp.async
+// (LDGSTS: async global→smem, bypassing registers); we deliberately use REGISTER-prefetch double-
+// buffering instead, because cp.async copies a CONTIGUOUS gmem chunk to a CONTIGUOUS smem chunk and
+// CANNOT do the transpose-scatter this kernel relies on — linear_tiled_vec_kernel stages As/Bs
+// TRANSPOSED ([BK][BM]/[BK][BN]) precisely so the inner-loop reads are conflict-free float4. A cp.async
+// version would need the natural [BM][BK] layout, whose inner reads stride by BK·TN ≡ 0 (mod 32 banks)
+// → a 16-way bank conflict, reintroducing exactly what G5c+'s transpose removed; reconciling the two
+// needs smem swizzling, out of scope for a micro-gain. Register-prefetch hits the SAME overlap while
+// keeping the transposed layout, so it is BIT-IDENTICAL to linear_tiled_vec_kernel: same smem
+// contents, same ascending-k accumulation, only the LOAD TIMING moves. Two smem stages ping-pong;
+// the loop prefetches tile kt+1 into registers (LDGs issued early), computes tile kt, then stores the
+// prefetched registers into the other stage. Preconditions as G5c+ (n%BN==0, k%BK==0; only m ragged).
+template <typename WT, int BM, int BN, int BK, int TM, int TN>
+__global__ void linear_tiled_db_kernel(const float* __restrict__ x, const WT* __restrict__ w,
+                                       const float* __restrict__ bias, float* __restrict__ y, int m,
+                                       int n, int k) {
+    constexpr int numThreads = (BM / TM) * (BN / TN);
+    __shared__ float As[2][BK * BM];  // x tile, TRANSPOSED, DOUBLE-BUFFERED: As[stage][kl * BM + ml]
+    __shared__ float Bs[2][BK * BN];  // w tile, TRANSPOSED, DOUBLE-BUFFERED: Bs[stage][kl * BN + nl]
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const int rowBase = static_cast<int>(blockIdx.y) * BM;
+    const int colBase = static_cast<int>(blockIdx.x) * BN;
+
+    // Same cooperative float4-load mapping as linear_tiled_vec_kernel (one float4 each at 64×64×16/256).
+    constexpr int f4PerRow = BK / 4;
+    const int loadRow = tid / f4PerRow, loadCol = (tid % f4PerRow) * 4;
+    constexpr int rowStrideA = numThreads / f4PerRow;
+    constexpr int rowStrideB = numThreads / f4PerRow;
+    constexpr int nA = BM / rowStrideA;  // float4s of x this thread stages per K-tile
+    constexpr int nB = BN / rowStrideB;  // float4s of w this thread stages per K-tile
+
+    const int threadRow = tid / (BN / TN), threadCol = tid % (BN / TN);  // this thread's micro-tile
+    float acc[TM * TN] = {0.0f};
+    float regM[TM], regN[TN];
+    float4 ra[nA], rb[nB];  // the double buffer's "next tile" prefetch registers
+
+    const int numKtiles = k / BK;  // k % BK == 0 (precondition)
+
+    // --- prologue: load K-tile 0 into registers, store it transposed into smem stage 0 ---
+#pragma unroll
+    for (int p = 0; p < nA; ++p) {
+        const int ml = loadRow + p * rowStrideA, gr = rowBase + ml;
+        ra[p] = (gr < m) ? *reinterpret_cast<const float4*>(&x[static_cast<size_t>(gr) * k + loadCol])
+                         : float4{0.0f, 0.0f, 0.0f, 0.0f};  // ragged m tail loads 0 (whole row OOB)
+    }
+#pragma unroll
+    for (int p = 0; p < nB; ++p) {
+        const int nl = loadRow + p * rowStrideB, go = colBase + nl;
+        rb[p] = load4(w, static_cast<size_t>(go) * k + loadCol);  // n%BN==0 → go always valid
+    }
+#pragma unroll
+    for (int p = 0; p < nA; ++p) {
+        const int ml = loadRow + p * rowStrideA;
+        As[0][(loadCol + 0) * BM + ml] = ra[p].x;
+        As[0][(loadCol + 1) * BM + ml] = ra[p].y;
+        As[0][(loadCol + 2) * BM + ml] = ra[p].z;
+        As[0][(loadCol + 3) * BM + ml] = ra[p].w;
+    }
+#pragma unroll
+    for (int p = 0; p < nB; ++p) {
+        const int nl = loadRow + p * rowStrideB;
+        Bs[0][(loadCol + 0) * BN + nl] = rb[p].x;
+        Bs[0][(loadCol + 1) * BN + nl] = rb[p].y;
+        Bs[0][(loadCol + 2) * BN + nl] = rb[p].z;
+        Bs[0][(loadCol + 3) * BN + nl] = rb[p].w;
+    }
+    __syncthreads();
+
+    for (int kt = 0; kt < numKtiles; ++kt) {
+        const int cur = kt & 1;
+        // Prefetch K-tile kt+1 into registers NOW — the LDGs are issued and their long DRAM latency
+        // overlaps the compute below (which reads only smem[cur], not ra/rb).
+        if (kt + 1 < numKtiles) {
+            const int kIdx = (kt + 1) * BK;
+#pragma unroll
+            for (int p = 0; p < nA; ++p) {
+                const int ml = loadRow + p * rowStrideA, gr = rowBase + ml, gc = kIdx + loadCol;
+                ra[p] = (gr < m)
+                            ? *reinterpret_cast<const float4*>(&x[static_cast<size_t>(gr) * k + gc])
+                            : float4{0.0f, 0.0f, 0.0f, 0.0f};
+            }
+#pragma unroll
+            for (int p = 0; p < nB; ++p) {
+                const int nl = loadRow + p * rowStrideB, go = colBase + nl, gk = kIdx + loadCol;
+                rb[p] = load4(w, static_cast<size_t>(go) * k + gk);
+            }
+        }
+        // Compute tile kt on smem[cur] — identical math/order to linear_tiled_vec_kernel.
+#pragma unroll
+        for (int dot = 0; dot < BK; ++dot) {
+#pragma unroll
+            for (int i = 0; i < TM; i += 4)
+                *reinterpret_cast<float4*>(&regM[i]) =
+                    *reinterpret_cast<const float4*>(&As[cur][dot * BM + threadRow * TM + i]);
+#pragma unroll
+            for (int j = 0; j < TN; j += 4)
+                *reinterpret_cast<float4*>(&regN[j]) =
+                    *reinterpret_cast<const float4*>(&Bs[cur][dot * BN + threadCol * TN + j]);
+#pragma unroll
+            for (int i = 0; i < TM; ++i)
+#pragma unroll
+                for (int j = 0; j < TN; ++j) acc[i * TN + j] += regM[i] * regN[j];
+        }
+        // Store the prefetched registers into the OTHER stage (it isn't read until kt+1 — the closing
+        // __syncthreads orders this write before that read; the WAR on smem[cur] is fenced too).
+        if (kt + 1 < numKtiles) {
+            const int nxt = cur ^ 1;
+#pragma unroll
+            for (int p = 0; p < nA; ++p) {
+                const int ml = loadRow + p * rowStrideA;
+                As[nxt][(loadCol + 0) * BM + ml] = ra[p].x;
+                As[nxt][(loadCol + 1) * BM + ml] = ra[p].y;
+                As[nxt][(loadCol + 2) * BM + ml] = ra[p].z;
+                As[nxt][(loadCol + 3) * BM + ml] = ra[p].w;
+            }
+#pragma unroll
+            for (int p = 0; p < nB; ++p) {
+                const int nl = loadRow + p * rowStrideB;
+                Bs[nxt][(loadCol + 0) * BN + nl] = rb[p].x;
+                Bs[nxt][(loadCol + 1) * BN + nl] = rb[p].y;
+                Bs[nxt][(loadCol + 2) * BN + nl] = rb[p].z;
+                Bs[nxt][(loadCol + 3) * BN + nl] = rb[p].w;
+            }
+        }
+        __syncthreads();
+    }
+
+    for (int i = 0; i < TM; ++i) {  // epilogue: identical to linear_tiled_vec_kernel
+        const int gr = rowBase + threadRow * TM + i;
+        if (gr >= m) continue;  // ragged m tail: skip the whole row (n is never ragged here)
+        for (int j = 0; j < TN; j += 4) {
+            const int gc = colBase + threadCol * TN + j;
+            float4 t;
+            t.x = acc[i * TN + j + 0] + (bias ? bias[gc + 0] : 0.0f);
+            t.y = acc[i * TN + j + 1] + (bias ? bias[gc + 1] : 0.0f);
+            t.z = acc[i * TN + j + 2] + (bias ? bias[gc + 2] : 0.0f);
+            t.w = acc[i * TN + j + 3] + (bias ? bias[gc + 3] : 0.0f);
+            *reinterpret_cast<float4*>(&y[static_cast<size_t>(gr) * n + gc]) = t;
+        }
+    }
+}
+
 // Prefill tiled GEMM, WARP-TILED (G5c+ second lever, Boehm "kernel 10"): inserts a WARP tile
 // between the block tile and the per-thread micro-tile. The block's BM×BN output splits into
 // (BM/WM)×(BN/WN) warp tiles, one per warp; each warp sweeps its WM×WN tile as a WMITER×WNITER
@@ -567,8 +716,9 @@ __global__ void linear_wmma_kernel(const float* __restrict__ x, const WT* __rest
 // block tile and gives each of 8 warps a 64×32 region = a 4×2 grid of 16×16×16 wmma fragments, so
 // each staged smem word feeds 8 tensor-core MMAs (the compute-to-smem ratio a TC GEMM lives on) and
 // each warp reloads only 4 A- + 2 B-fragments per K-step. Aimed at the huge lm_head (n=151936):
-// >1000 blocks, so cross-block occupancy hides the per-K-tile load-sync stall even without cp.async
-// (that's the next lever, for the lower-occupancy projection shapes). x (activations) is always fp32,
+// >1000 blocks, so cross-block occupancy hides the per-K-tile load-sync stall even without cp.async/
+// double-buffering (which IS that lever, for the lower-occupancy projections — explored in
+// linear_tiled_db_kernel, a tie on this model). x (activations) is always fp32,
 // staged to half; w is fp32 or fp16 (WT) read via ldh. fp16 inputs, fp32 accumulate — same mixed
 // precision as the 64² kernel, so the same ~fp16 accuracy cost. n%128==0 and k%16==0 (the dispatch
 // guarantees it); only m is ragged, bounds-checked at the store.
@@ -1561,6 +1711,8 @@ bool g_cuda_use_tiled_attn = false;
 // Opt-in knob (G5g): Flash-Decoding / split-KV attention at decode (see cuda_backend.hpp). Default
 // OFF; even when on, split_count() gates it to the shapes where it helps (small sq + long context).
 bool g_cuda_use_split_attn = false;
+// Opt-in knob (G5 micro-gain): double-buffered fp32 projection GEMM (see cuda_backend.hpp). Default OFF.
+bool g_cuda_use_dbuf = false;
 
 Tensor CudaBackend::linear(const Tensor& x, const Tensor& weight, const Tensor* bias) {
     const int64_t m = x.size(0), k = x.size(1), n = weight.size(0);
@@ -1585,7 +1737,8 @@ Tensor CudaBackend::linear(const Tensor& x, const Tensor& weight, const Tensor* 
             linear_gemv_kernel<half><<<blocks, threads>>>(xp, wh, bp, yp, mi, ni, ki);
         } else if (n >= 8192 && n % 128 == 0 && k % 16 == 0) {
             // lm_head: huge n, compute-bound — 128² warp-tiled tensor cores (8 frags/warp). >1000
-            // blocks, so cross-block occupancy hides the load-sync stall (cp.async is the next lever).
+            // blocks, so cross-block occupancy hides the load-sync stall (double-buffering — the cp.async
+            // lever — is in linear_tiled_db_kernel for the low-occupancy projections; a tie on this model).
             constexpr int BM = 128, BN = 128;
             const dim3 grid((static_cast<unsigned>(n) + BN - 1) / BN,
                             (static_cast<unsigned>(m) + BM - 1) / BM);
@@ -1649,8 +1802,14 @@ Tensor CudaBackend::linear(const Tensor& x, const Tensor& weight, const Tensor* 
             constexpr int threads = (BM / TM) * (BN / TN);  // 256
             const dim3 grid((static_cast<unsigned>(n) + BN - 1) / BN,
                             (static_cast<unsigned>(m) + BM - 1) / BM);
-            linear_tiled_vec_kernel<float, BM, BN, BK, TM, TN><<<grid, threads>>>(xp, wp, bp, yp, mi,
-                                                                                  ni, ki);
+            // G5 micro-gain: the low-occupancy projections (down/q/o, ~28 blocks) can hide the K-tile
+            // load latency with a double-buffered software pipeline; bit-identical, A/B'd via NI_DBUF.
+            if (g_cuda_use_dbuf)
+                linear_tiled_db_kernel<float, BM, BN, BK, TM, TN><<<grid, threads>>>(xp, wp, bp, yp,
+                                                                                     mi, ni, ki);
+            else
+                linear_tiled_vec_kernel<float, BM, BN, BK, TM, TN><<<grid, threads>>>(xp, wp, bp, yp,
+                                                                                      mi, ni, ki);
         }
     } else {
         // Fallback for shapes the vectorized kernel's divisibility preconditions don't cover

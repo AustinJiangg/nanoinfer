@@ -88,6 +88,7 @@ int main() {
     // the fp32 tiled GEMM, so the GFLOP/s and max|diff| columns then report wmma vs cuBLAS.
     if (const char* e = std::getenv("NI_WMMA")) g_cuda_use_wmma = (e[0] == '1');
     if (const char* e = std::getenv("NI_FP16W")) g_cuda_fp16_weights = (e[0] == '1');
+    if (const char* e = std::getenv("NI_DBUF")) g_cuda_use_dbuf = (e[0] == '1');
     std::printf("prefill (m>16) kernel: %s\n",
                 g_cuda_fp16_weights ? "wmma-h (fp16 weights)"
                                     : (g_cuda_use_wmma ? "wmma (fp32 weights, fp16 staged)"
@@ -165,6 +166,54 @@ int main() {
                         cublas_gflops, maxdiff);
         }
         std::printf("\n");
+    }
+
+    // --- double-buffered projection GEMM (G5 micro-gain) vs the default tiled, prefill m=128. The
+    // low-occupancy projections (down/q-o ~28 blocks, k/v 4) should gain most from hiding the K-tile
+    // global load behind compute; gate/up (152 blocks) already hides it via cross-block occupancy.
+    // Bit-identical (only the load TIMING moves, not the math), so the dbuf-tiled diff column must
+    // read 0 — the speedup is the whole story. ---
+    g_cuda_use_wmma = false;
+    g_cuda_fp16_weights = false;
+    std::printf("\ndouble-buffered projection GEMM vs default tiled, prefill m=128 (A/B, bit-identical):\n");
+    std::printf("%-9s %7s %5s | %10s | %10s | %8s | %10s\n", "shape", "n", "k", "tiled GF/s",
+                "dbuf GF/s", "speedup", "dbuf-tiled");
+    {
+        const int64_t m = 128;
+        for (const Shape& sh : shapes) {
+            const int64_t n = sh.n, k = sh.k;
+            if (n >= 8192 || n % 128 != 0 || k % 16 != 0) continue;  // only the narrow-n dbuf path
+            Tensor x({m, k}), w({n, k});
+            for (int64_t i = 0; i < x.numel(); ++i) x[i] = dist(rng);
+            for (int64_t i = 0; i < w.numel(); ++i) w[i] = dist(rng);
+            Tensor xd = to_device(x), wd = to_device(w);
+            auto run = [&] { Tensor y = gpu.linear(xd, wd, nullptr); };
+
+            g_cuda_use_dbuf = false;
+            Tensor y_tiled = to_host(gpu.linear(xd, wd, nullptr));
+            g_cuda_use_dbuf = true;
+            Tensor y_dbuf = to_host(gpu.linear(xd, wd, nullptr));
+            double diff = 0.0;
+            for (int64_t i = 0; i < y_tiled.numel(); ++i)
+                diff = std::max(diff, std::fabs((double)y_tiled[i] - y_dbuf[i]));
+
+            // These projection ops are microseconds at m=128, so GPU boost-clock drift between the two
+            // timing blocks swamps the signal at low iter counts — take the MIN over several interleaved
+            // rounds (min ≈ peak-clock, least-perturbed) to compare the kernels at the same clock.
+            double tiled_ms = 1e30, dbuf_ms = 1e30;
+            for (int r = 0; r < 8; ++r) {
+                g_cuda_use_dbuf = false;
+                tiled_ms = std::min(tiled_ms, time_ms(run, 100, 20));
+                g_cuda_use_dbuf = true;
+                dbuf_ms = std::min(dbuf_ms, time_ms(run, 100, 20));
+            }
+            g_cuda_use_dbuf = false;
+
+            const double flop = 2.0 * m * n * k;
+            std::printf("%-9s %7lld %5lld | %10.0f | %10.0f | %7.2fx | %10.1e\n", sh.label,
+                        (long long)n, (long long)k, flop / (tiled_ms * 1e-3) / 1e9,
+                        flop / (dbuf_ms * 1e-3) / 1e9, tiled_ms / dbuf_ms, diff);
+        }
     }
 
     // --- int8 W8A8 (DP4A) vs fp32 tiled, prefill m=128 — the COMPUTE win (fp16 only TIED here,

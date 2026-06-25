@@ -227,9 +227,10 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
         of matmul vs ~55ms total — the naive G2 attention (×24) + ~360 per-op launches dominate now
         (same Amdahl shape as G5b's decode). The narrow projections can't take warp-tiling (they're
         occupancy-bound at m=128, not reuse-bound) and gate/up is already ~89%, so lm_head is its
-        only home. Still ahead: cp.async double-buffering (another lm_head-local micro-gain); the
-        real end-to-end prefill lever is now attention (FlashAttention — G5's named "second" kernel)
-        and per-op launch overhead.
+        only home. Double-buffering (the "cp.async" micro-gain) was then explored in G5h below — a TIE on
+        this model (the projections already hide the load latency at m=128), confirming this call: the real
+        end-to-end prefill lever is now attention (FlashAttention — G5's named "second" kernel) and per-op
+        launch overhead, not the GEMM.
   - [x] **G5d** — low precision (fp16 + int8 W8A8; lm_head int8 deferred to backlog). **fp16 wmma landed** (linear_wmma_kernel, opt-in
         g_cuda_use_wmma): a 64×64 / 2×2-warp tensor-core kernel, correct (fp16 cost ~1-2% vs
         the oracle — test_cuda) but the naive version is SLOWER than the tuned fp32 tiled GEMM
@@ -377,6 +378,30 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
         has no cat_seq copy, so it's where the win lands undiluted — at ctx~2048 paged+split reaches ~81 tok/s
         (the fastest of contiguous/paged × split-off/on; split ~2.8× on paged vs ~2.4× on contiguous), and at
         ctx 4096 the contiguous cache OOMs (its non-reusing cat_seq buffers) while paged+split runs at ~74 tok/s.
+  - [x] **G5h** — double-buffered projection GEMM, the "cp.async double-buffering" micro-gain G5c+ named
+        "still ahead". `linear_tiled_db_kernel` software-pipelines `linear_tiled_vec_kernel`: two smem stages
+        ping-pong, the loop prefetches K-tile kt+1 into registers (LDGs issued early) while it computes tile
+        kt, hiding the ~400-cycle DRAM latency a single-buffered tile eats at each `__syncthreads`. Aimed at
+        the LOW-OCCUPANCY projections — down (n=896,k=4864) and q/o launch only 28 blocks on the 56-SM 4070S,
+        so there's no second resident block to hide the stall behind (the lm_head's >1000 blocks and gate/up's
+        152 already do, which is why it's scoped to the narrow-n path, not lm_head). **Deliberately NOT
+        cp.async**: cp.async (LDGSTS) copies a CONTIGUOUS gmem chunk to a CONTIGUOUS smem chunk, but this
+        kernel stages As/Bs TRANSPOSED ([BK][BM]) so the inner reads are conflict-free float4 (the G5c+ lever);
+        a cp.async version needs the natural [BM][BK] layout, whose inner reads stride by BK·TN ≡ 0 (mod 32
+        banks) → a 16-way bank conflict — reconciling the two needs smem swizzling, out of scope for a
+        micro-gain. Register-prefetch hits the SAME load/compute overlap while keeping the transpose, so it's
+        **BIT-IDENTICAL** to the tiled kernel (only the load TIMING moves): run_cuda_bench A/B `dbuf-tiled`
+        max|diff|=0 on every projection shape, and the full 24-layer forward gives logits identical to the last
+        printed digit with dbuf on vs off (run_cuda_parity NI_DBUF=1, 24-token prompt → m>16 fires it, golden
+        MATCH). **Honest result: a TIE.** With robust min-of-8 interleaved timing (peak-clock, killing the
+        boost-clock drift that made a naive 30-iter A/B swing 0.86×–1.19×), every projection shape is within
+        1–2% (q/o 1.01×, k/v 1.02×, gate/up 1.00×, down 1.02×) — at m=128 these microsecond ops already hide
+        the load latency via ILP + warp occupancy, so the explicit double-buffer's overlap buys nothing and its
+        2× smem just trades occupancy back. Same shape as G5f-tiled: the structurally-correct latency-hiding
+        lever, kept opt-in (`g_cuda_use_dbuf`, default OFF) for when the projections are big enough / occupancy-
+        starved enough that the global load is genuinely exposed. End-to-end it's Amdahl-nil (down is ~20% of
+        prefill matmul, matmul ~30% of the step), confirming G5c+'s call that this is a minor micro-gain and the
+        real prefill levers are attention + per-op launch overhead.
 
 ## Cross-platform (portability proof, after the GPU is learned)
 - [x] **NEON** — `simd.hpp`'s `#elif` path now carries the three inner products on aarch64

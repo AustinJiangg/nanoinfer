@@ -69,6 +69,13 @@ extern bool g_cuda_use_tiled_attn;
 // but within GPU tolerance of the CPU oracle. The long-context decode lever G5f left open.
 extern bool g_cuda_use_split_attn;
 
+// Opt-in knob (G5 micro-gain): route the fp32 prefill PROJECTION GEMM (m>16, narrow n) through the
+// double-buffered tiled kernel — it software-pipelines the global load with the compute to hide DRAM
+// latency on the low-occupancy projection shapes (down/q/o launch only ~28 blocks). BIT-IDENTICAL to
+// the default tiled kernel (only the load timing changes), so it's an A/B knob, not a correctness one;
+// the bench reports whether it wins (NI_DBUF=1). Default false; not thread-safe to flip mid-run.
+extern bool g_cuda_use_dbuf;
+
 class CudaBackend : public Backend {
 public:
     Device device() const override;
