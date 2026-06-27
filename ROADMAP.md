@@ -402,6 +402,46 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
         starved enough that the global load is genuinely exposed. End-to-end it's Amdahl-nil (down is ~20% of
         prefill matmul, matmul ~30% of the step), confirming G5c+'s call that this is a minor micro-gain and the
         real prefill levers are attention + per-op launch overhead.
+- [x] **G6** — CUDA graphs: fold a decode step's ~360 per-op kernel launches into ONE `cudaGraphLaunch`,
+      the per-op-launch lever G5 kept naming. **Measurement first (the G5a discipline), and it corrected a
+      wrong hypothesis** — the instructive part. nsys on a decode run showed `cudaMemcpy` at 77% of CPU API
+      time (the contiguous cache's `cat_seq` + `repeat_kv` per step) and `cudaLaunchKernel` at only 17%, so
+      "cat_seq dominates" looked obvious — but the wall-clock A/B (`NI_PAGED`) said paged ≈ contiguous decode
+      (84 vs 84 tok/s). The nsys "cudaMemcpy time" was SYNC-WAIT folded into the call, not bandwidth — the
+      bench is the oracle, not the profiler's CPU-API attribution. The real picture: 0.5B fp32 decode ~84
+      tok/s = ~12 ms/step is ~3.5× over its ~3.4 ms memory-bandwidth floor and cache-INDEPENDENT, i.e.
+      bounded by path-independent per-op overhead — exactly what graphs collapse. Built on the PAGED cache
+      (contiguous can't be captured: sync `cat_seq` memcpy + growing buffers), staged:
+  - [x] **per-thread default stream** (`--default-stream per-thread`) so the implicit `<<<>>>` launches land
+        on a CAPTURABLE stream (legacy stream 0 can't be); single-threaded, so ordering/golden unchanged.
+  - [x] **device-resident block table** — `CudaPagedKVCache` keeps its block table in a STABLE device buffer
+        refreshed incrementally (no-op, no CUDA call, when nothing grew → safe inside a capture), replacing
+        the per-call `cudaMalloc`+sync H2D+`cudaFree` every paged attend did. Parity-clean (run_cuda_paged
+        max|diff|=0) AND an independent eager win: **paged decode 1.15×** (ctx8 84→97, ctx256 68→78 tok/s) by
+        dropping those per-attend sync points.
+  - [x] **device-side decode inputs** — the per-step values a single captured graph must span are made
+        device-resident: the position/length (read by rope, paged_write, paged_attention via an optional
+        `d_pos` pointer) and the token id (the embedding gathers from `g_cuda_graph_token`, skipping the sync
+        H2D id-upload a capture can't record). Decode keeps sq=1, so every kernel GRID is fixed — only these
+        loop-bound/offset values move, now from device — so ONE graph replays at every length. Eager passes
+        nullptr → the host args, bit-identical (run_cuda_paged max|diff|=0, run_cuda_parity golden MATCH).
+  - [x] **`CudaGraphDecoder`** (capture/replay) — first decode step runs EAGER (warms the device pool so the
+        capture does no `cudaMalloc`); step 2 captures the forward (host bookkeeping runs, kernels only
+        record — so its `advance()` is rolled back via `set_length`, `keep_device_logits` leaves the logits on
+        device for the driver's own D2H), instantiates, and replays thereafter — each step just writes
+        d_pos/d_token, launches, and D2Hs the logits. The pool's capture-time addresses are baked into the
+        graph, so the invariant is "no pool alloc during the replay loop" (the driver's per-step work uses
+        dedicated buffers, not the pool). Opt-in `NI_GRAPH` in run_cuda_decode_bench.
+  - **Honest result: correct + a bounded win, biggest at short context.** Graph greedy tokens are
+        bit-identical to eager paged decode at every context (run_cuda_decode_bench `NI_GRAPH=1`, golden ==
+        over 256/200 tokens, across many block-boundary crossings), and decode is **1.06–1.07× @ctx≤72, 1.04×
+        @ctx≥128** — the launch overhead the graph recovers is the EXPOSED fraction (not already hidden behind
+        the async-pipelined GEMV execution), which shrinks as the memory-bound attention/lm_head grow with
+        context. Same shape as G5h/G5f-tiled: the structurally-correct lever (every production engine graphs
+        the decode step; it wins big in the launch-bound regimes — smaller models, larger batch, more/smaller
+        kernels), kept opt-in, honestly bounded on this 0.5B batch-1 model. Still ahead (backlog): batched /
+        paged-split graphs (the split grid grows with context — needs the max-split fixed-grid trick), and
+        the int8-embed (`NI_QEMBED`) decode under graph (the gather'd need the same device-token path).
 
 ## Cross-platform (portability proof, after the GPU is learned)
 - [x] **NEON** — `simd.hpp`'s `#elif` path now carries the three inner products on aarch64

@@ -25,6 +25,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "model.hpp"
 #include "quant.hpp"
 #include "tensor.hpp"
 
@@ -1054,12 +1055,15 @@ __global__ void repeat_kv_kernel(const float* __restrict__ x, float* __restrict_
 // One thread per output element. Mirrors ops.cpp apply_rope line-for-line.
 __global__ void rope_kernel(const float* __restrict__ x, const float* __restrict__ cosT,
                             const float* __restrict__ sinT, float* __restrict__ out,
-                            int64_t H, int64_t seq, int64_t D, int64_t pos_offset) {
+                            int64_t H, int64_t seq, int64_t D, int64_t pos_offset,
+                            const int64_t* __restrict__ d_pos) {
     const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= H * seq * D) return;
     const int64_t h = idx / (seq * D), rem = idx % (seq * D), p = rem / D, d = rem % D;
     const int64_t half = D / 2;
-    const int64_t pos = pos_offset + p;
+    // G6 graph mode: read the position from device (d_pos) so one captured graph spans all decode
+    // steps; eager passes nullptr → the host pos_offset, bit-identical to before.
+    const int64_t pos = (d_pos ? *d_pos : pos_offset) + p;
     const int64_t base = h * seq * D + p * D;
     const float rot = (d < half) ? -x[base + (d + half)] : x[base + (d - half)];
     out[idx] = x[idx] * cosT[pos * D + d] + rot * sinT[pos * D + d];
@@ -1365,11 +1369,12 @@ __global__ void attention_combine_kernel(const float* __restrict__ m_part,
 __global__ void paged_write_kernel(const float* __restrict__ k, const float* __restrict__ v,
                                    float* __restrict__ Kbase, float* __restrict__ Vbase,
                                    const int64_t* __restrict__ block_table, int64_t t, int64_t n_kv,
-                                   int64_t hd, int64_t block_size, int64_t start) {
+                                   int64_t hd, int64_t block_size, int64_t start,
+                                   const int64_t* __restrict__ d_pos) {
     const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= n_kv * t * hd) return;
     const int64_t d = idx % hd, i = (idx / hd) % t, h = idx / (hd * t);
-    const int64_t pos = start + i;
+    const int64_t pos = (d_pos ? *d_pos : start) + i;  // G6 graph mode: device-side write position
     const int64_t blk = block_table[pos / block_size], off = pos % block_size;
     const int64_t dst = ((blk * n_kv + h) * block_size + off) * hd + d;
     Kbase[dst] = k[idx];  // k/v are [n_kv, t, hd]: idx = (h*t+i)*hd + d
@@ -1430,7 +1435,7 @@ __global__ void paged_attention_warp_kernel(
     const float* __restrict__ q, const float* __restrict__ Kbase, const float* __restrict__ Vbase,
     const int64_t* __restrict__ block_table, float* __restrict__ out, int64_t n_heads, int64_t sq,
     int64_t hd, int64_t n_kv, int64_t n_rep, int64_t block_size, int causal, int64_t query_offset,
-    int64_t end, float scale) {
+    int64_t end, float scale, const int64_t* __restrict__ d_pos) {
     const int warpsPerBlock = static_cast<int>(blockDim.x) / 32;
     const int64_t hi = static_cast<int64_t>(blockIdx.x) * warpsPerBlock + threadIdx.x / 32;
     const int lane = static_cast<int>(threadIdx.x) & 31;
@@ -1438,7 +1443,12 @@ __global__ void paged_attention_warp_kernel(
     const int64_t h = hi / sq, i = hi % sq;
     const int64_t kvh = h / n_rep;  // GQA: this query head's KV head
     const float* qi = q + (h * sq + i) * hd;
-    const int64_t limit = causal ? (query_offset + i + 1) : end;
+    // G6 graph mode: read the KV length from device (d_pos) so one captured graph spans all decode
+    // steps; eager passes nullptr → the host query_offset/end, bit-identical. (end−query_offset = t,
+    // baked, so the device end stays *d_pos + t.)
+    const int64_t qoff = d_pos ? *d_pos : query_offset;
+    const int64_t kend = d_pos ? (*d_pos + (end - query_offset)) : end;
+    const int64_t limit = causal ? (qoff + i + 1) : kend;
 
     // ONE PASS online softmax — identical arithmetic/order to attention_warp_kernel (only the K/V
     // addresses come from the block table), so the paged path stays bit-identical to the contiguous
@@ -1714,6 +1724,18 @@ bool g_cuda_use_split_attn = false;
 // Opt-in knob (G5 micro-gain): double-buffered fp32 projection GEMM (see cuda_backend.hpp). Default OFF.
 bool g_cuda_use_dbuf = false;
 
+// G6 (CUDA graphs): the per-step DECODE inputs, made device-resident so ONE captured graph spans all
+// steps. The graph driver (CudaGraphDecoder) points these at its device int64 buffers before capture
+// and updates the buffers' CONTENTS each step (the graph reads them by pointer). nullptr = eager mode
+// (the kernels use their host-int args, bit-identical). g_cuda_graph_pos: the KV length / write
+// position (read by rope, paged_write, paged_attention). g_cuda_graph_token: the decode token id
+// (the embedding gathers from it instead of a host id-upload — the upload is a sync H2D, illegal in a
+// capture). Set/cleared only by the single-threaded driver around a capture; not otherwise thread-safe.
+const int64_t* g_cuda_graph_pos = nullptr;
+const int64_t* g_cuda_graph_token = nullptr;
+// G6: keep logits on device so a graph driver does its own D2H after replay (see cuda_backend.hpp).
+bool g_cuda_keep_device_logits = false;
+
 Tensor CudaBackend::linear(const Tensor& x, const Tensor& weight, const Tensor* bias) {
     const int64_t m = x.size(0), k = x.size(1), n = weight.size(0);
     Tensor y = device_alloc({m, n});
@@ -1827,10 +1849,17 @@ Tensor CudaBackend::linear(const Tensor& x, const Tensor& weight, const Tensor* 
 Tensor CudaBackend::embedding(const Tensor& table, const std::vector<int64_t>& ids) {
     const int64_t n = static_cast<int64_t>(ids.size()), hidden = table.size(1);
     Tensor out = device_alloc({n, hidden});  // fp32 activations, even from an fp16 table
-    int64_t* d_ids = nullptr;
-    cuda_check(cudaMalloc(&d_ids, n * sizeof(int64_t)), "embedding ids malloc");
-    cuda_check(cudaMemcpy(d_ids, ids.data(), n * sizeof(int64_t), cudaMemcpyHostToDevice),
-               "embedding ids H2D");
+    // G6 graph mode: gather straight from the device-resident decode token (the driver updates it
+    // each step), skipping the per-call sync H2D id-upload that a capture can't record. Eager
+    // (g_cuda_graph_token == nullptr): upload the host ids as before — bit-identical.
+    const int64_t* d_ids = g_cuda_graph_token;
+    int64_t* owned = nullptr;
+    if (d_ids == nullptr) {
+        cuda_check(cudaMalloc(&owned, n * sizeof(int64_t)), "embedding ids malloc");
+        cuda_check(cudaMemcpy(owned, ids.data(), n * sizeof(int64_t), cudaMemcpyHostToDevice),
+                   "embedding ids H2D");
+        d_ids = owned;
+    }
     const int blocks = grid1d(n * hidden, kBlock);
     if (table.dtype() == DType::F16)  // G5d: embed_tokens uploaded as half (the largest weight)
         embedding_kernel<half><<<blocks, kBlock>>>(static_cast<const half*>(table.device_ptr()),
@@ -1838,7 +1867,7 @@ Tensor CudaBackend::embedding(const Tensor& table, const std::vector<int64_t>& i
     else
         embedding_kernel<float><<<blocks, kBlock>>>(dptr(table), d_ids, dptr(out), n, hidden);
     launch_check("embedding_kernel");
-    cudaFree(d_ids);
+    if (owned) cudaFree(owned);
     return out;
 }
 
@@ -1902,7 +1931,7 @@ Tensor CudaBackend::apply_rope(const Tensor& x, const Tensor& cos, const Tensor&
     const int64_t H = x.size(0), seq = x.size(1), D = x.size(2);
     Tensor out = device_alloc({H, seq, D});
     rope_kernel<<<grid1d(H * seq * D, kBlock), kBlock>>>(dptr(x), dptr(cos), dptr(sin), dptr(out),
-                                                         H, seq, D, pos_offset);
+                                                         H, seq, D, pos_offset, g_cuda_graph_pos);
     launch_check("rope_kernel");
     return out;
 }
@@ -2119,8 +2148,8 @@ Tensor CudaPagedKVCache::attend(int64_t layer, const Tensor& q, const Tensor& k,
     float* Kbase = pool_->k_base() + layer * pool_->layer_stride();
     float* Vbase = pool_->v_base() + layer * pool_->layer_stride();
 
-    paged_write_kernel<<<grid1d(n_kv * t * hd, kBlock), kBlock>>>(dptr(k), dptr(v), Kbase, Vbase,
-                                                                 d_bt, t, n_kv, hd, bs, start);
+    paged_write_kernel<<<grid1d(n_kv * t * hd, kBlock), kBlock>>>(
+        dptr(k), dptr(v), Kbase, Vbase, d_bt, t, n_kv, hd, bs, start, g_cuda_graph_pos);
     launch_check("paged_write_kernel");
 
     const int64_t n_heads = q.size(0), sq = q.size(1), D = q.size(2);
@@ -2155,13 +2184,89 @@ Tensor CudaPagedKVCache::attend(int64_t layer, const Tensor& q, const Tensor& k,
     } else {
         const int threads = 256;  // 8 warps/block, one warp per (head,query)
         const int blocks = static_cast<int>((n_heads * sq + threads / 32 - 1) / (threads / 32));
-        paged_attention_warp_kernel<<<blocks, threads>>>(dptr(q), Kbase, Vbase, d_bt, dptr(out),
-                                                         n_heads, sq, D, n_kv, n_rep, bs,
-                                                         causal ? 1 : 0, query_offset, end, scale);
+        paged_attention_warp_kernel<<<blocks, threads>>>(
+            dptr(q), Kbase, Vbase, d_bt, dptr(out), n_heads, sq, D, n_kv, n_rep, bs, causal ? 1 : 0,
+            query_offset, end, scale, g_cuda_graph_pos);
         launch_check("paged_attention_warp_kernel");
     }
 
     return out;
+}
+
+// --- CUDA graph decode driver (G6) ---
+
+CudaGraphDecoder::CudaGraphDecoder(const Model& model, CudaPagedKVCache& cache, int64_t vocab)
+    : model_(model), cache_(cache), vocab_(vocab) {
+    cuda_check(cudaMalloc(&d_pos_, sizeof(int64_t)), "graph d_pos malloc");
+    cuda_check(cudaMalloc(&d_token_, sizeof(int64_t)), "graph d_token malloc");
+}
+
+CudaGraphDecoder::~CudaGraphDecoder() {
+    // Clear the graph-mode globals in case this decoder owned them (single-threaded; defensive).
+    g_cuda_graph_pos = nullptr;
+    g_cuda_graph_token = nullptr;
+    if (exec_) cudaGraphExecDestroy(static_cast<cudaGraphExec_t>(exec_));
+    if (graph_) cudaGraphDestroy(static_cast<cudaGraph_t>(graph_));
+    if (d_pos_) cudaFree(d_pos_);
+    if (d_token_) cudaFree(d_token_);
+}
+
+// Record the decode forward into a graph. Stream capture RECORDS the kernels (host code runs, kernels
+// do NOT execute), so: (1) the pool must already be warm (no cudaMalloc may run under capture — the
+// first decode step ran eager to warm it); (2) the forward's advance() bumps the cache length during
+// the capture pass with no real work done, so we roll it back; (3) the kernels read the step's
+// token/length from d_token_/d_pos_ (set as graph-mode globals), so the SAME graph replays at any
+// length. keep_device_logits leaves the logits on device for our own D2H (a sync D2H can't be captured).
+void CudaGraphDecoder::capture(int64_t token) {
+    const int64_t saved = cache_.length();
+    g_cuda_graph_pos = d_pos_;
+    g_cuda_graph_token = d_token_;
+    g_cuda_keep_device_logits = true;
+    // Values are read at LAUNCH time, but set them now so the capture pass is a valid forward.
+    cuda_check(cudaMemcpy(d_pos_, &saved, sizeof(int64_t), cudaMemcpyHostToDevice), "graph cap pos");
+    cuda_check(cudaMemcpy(d_token_, &token, sizeof(int64_t), cudaMemcpyHostToDevice), "graph cap tok");
+
+    cudaGraph_t g = nullptr;
+    cuda_check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal),
+               "graph begin capture");
+    Tensor dlog = model_.forward({token}, &cache_);  // records the ~360 kernels; none execute yet
+    cuda_check(cudaStreamEndCapture(cudaStreamPerThread, &g), "graph end capture");
+
+    cache_.set_length(saved);            // undo the capture pass's advance (no KV was written)
+    d_logits_ = dptr(dlog);              // the lm_head output address the graph writes every launch
+    captured_logits_ = std::move(dlog);  // keep that pool buffer alive so nothing reuses it
+
+    cudaGraphExec_t e = nullptr;
+    cuda_check(cudaGraphInstantiate(&e, g, 0), "graph instantiate");
+    graph_ = g;
+    exec_ = e;
+    captured_ = true;
+    g_cuda_keep_device_logits = false;  // forward() isn't called on replays; only the return needed it
+    // g_cuda_graph_pos / g_cuda_graph_token stay set — the captured kernels read them on every launch.
+}
+
+Tensor CudaGraphDecoder::decode(int64_t token) {
+    const int64_t pos = cache_.length();  // this token's write position
+    cache_.prepare(pos + 1);              // grow blocks + refresh the device block table (host-side)
+
+    if (!warmed_) {
+        // First decode step runs EAGER: it executes (writes KV, makes logits) and warms the device
+        // pool so the later capture allocates nothing. forward() D2Hs the logits and advances length.
+        warmed_ = true;
+        return model_.forward({token}, &cache_);
+    }
+    if (!captured_) capture(token);  // one-time: build the graph (cache length left unchanged)
+
+    cuda_check(cudaMemcpy(d_pos_, &pos, sizeof(int64_t), cudaMemcpyHostToDevice), "graph pos H2D");
+    cuda_check(cudaMemcpy(d_token_, &token, sizeof(int64_t), cudaMemcpyHostToDevice), "graph tok H2D");
+    cuda_check(cudaGraphLaunch(static_cast<cudaGraphExec_t>(exec_), cudaStreamPerThread), "graph launch");
+    cuda_check(cudaStreamSynchronize(cudaStreamPerThread), "graph sync");
+
+    Tensor h({1, vocab_});  // D2H the logits the replayed graph just wrote
+    cuda_check(cudaMemcpy(h.data(), d_logits_, static_cast<size_t>(vocab_) * sizeof(float),
+                          cudaMemcpyDeviceToHost), "graph logits D2H");
+    cache_.advance(1);  // the driver owns the length now (the captured advance was rolled back)
+    return h;
 }
 
 }  // namespace ni

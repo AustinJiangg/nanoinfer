@@ -274,7 +274,9 @@ Tensor Model::forward(const std::vector<int64_t>& ids, KVCacheBase* cache) const
     x = backend_->rmsnorm(x, W("norm.weight"), eps);
     Tensor logits = lm_head(x);  // [seq, vocab]
 #ifdef NI_CUDA
-    if (logits.device() == Device::CUDA) logits = to_host(logits);  // D2H only at the edge
+    // G6: a CUDA-graph driver keeps the logits ON DEVICE (it does its own D2H after the graph
+    // replay) — the sync to_host here is illegal inside a stream capture. Eager: D2H at the edge.
+    if (logits.device() == Device::CUDA && !g_cuda_keep_device_logits) logits = to_host(logits);
 #endif
     return logits;
 }

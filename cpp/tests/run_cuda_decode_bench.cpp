@@ -144,6 +144,46 @@ int main(int argc, char** argv) {
         std::printf("run_cuda_decode_bench: %s  prefill=%lld decode=%lld  (CUDA backend)\n",
                     dir.c_str(), (long long)prefill_len, (long long)decode_len);
 
+        // NI_GRAPH=1 (G6): A/B the CUDA-graph decode against eager paged decode. The graph folds a
+        // decode step's ~360 per-op launches into one cudaGraphLaunch. Greedy tokens MUST match (the
+        // graph is bit-identical to the eager paged forward); the headline is decode tok/s. Both use
+        // the paged cache (the graph needs its fixed block addresses + device-side length/token).
+        if (const char* e = std::getenv("NI_GRAPH"); e && e[0] == '1') {
+            const Config& c = model.config();
+            const int64_t block_size = 16, max_seq = prefill_len + decode_len + 8;
+            const int64_t num_blocks = (max_seq + block_size - 1) / block_size + 4;
+            auto greedy = [&](bool use_graph, std::vector<int64_t>& toks) -> double {
+                CudaBlockPool pool(c.num_layers, c.num_kv_heads, c.head_dim, block_size, num_blocks);
+                CudaPagedKVCache cache(&pool);
+                Tensor l = model.forward(prompt, &cache);  // prefill runs eager on both paths
+                int64_t next = argmax_row(l, l.size(0) - 1, vocab);
+                std::unique_ptr<CudaGraphDecoder> dec;
+                if (use_graph) dec = std::make_unique<CudaGraphDecoder>(model, cache, vocab);
+                Clock::time_point t0 = Clock::now();
+                for (int64_t d = 0; d < decode_len; ++d) {
+                    toks.push_back(next);
+                    Tensor ld = use_graph ? dec->decode(next) : model.forward({next}, &cache);
+                    next = argmax_row(ld, 0, vocab);
+                }
+                return secs(t0, Clock::now());
+            };
+            std::vector<int64_t> te, tg;
+            greedy(false, te);
+            greedy(true, tg);  // warm both (CUDA context + graph capture path)
+            te.clear();
+            tg.clear();
+            const double se = greedy(false, te), sg = greedy(true, tg);
+            const bool match = (te == tg);
+            std::printf("\nCUDA graph decode (G6) vs eager paged decode (decode=%lld):\n",
+                        (long long)decode_len);
+            std::printf("  eager: %6.1f tok/s   graph: %6.1f tok/s   (%.2fx)\n", decode_len / se,
+                        decode_len / sg, se / sg);
+            std::printf("  golden: graph greedy tokens %s eager (%zu tokens)\n", match ? "==" : "!=",
+                        te.size());
+            std::printf("run_cuda_decode_bench: %s\n", match ? "ok" : "FAIL");
+            return match ? 0 : 1;
+        }
+
         run_one(model, prompt, 4, vocab, false, use_paged);  // warm CUDA context / reach steady state
 
         const Timing slow = run_one(model, prompt, decode_len, vocab, true, use_paged);

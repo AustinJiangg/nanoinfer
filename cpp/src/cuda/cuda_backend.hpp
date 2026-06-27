@@ -69,6 +69,11 @@ extern bool g_cuda_use_tiled_attn;
 // but within GPU tolerance of the CPU oracle. The long-context decode lever G5f left open.
 extern bool g_cuda_use_split_attn;
 
+// G6 (CUDA graphs): when true, Model::forward leaves the logits ON DEVICE (skips the final D2H) so a
+// graph driver can capture the forward and do its own D2H after replay — a sync D2H can't be captured.
+// Set only by CudaGraphDecoder around a capture; default false (eager D2Hs at the edge as before).
+extern bool g_cuda_keep_device_logits;
+
 // Opt-in knob (G5 micro-gain): route the fp32 prefill PROJECTION GEMM (m>16, narrow n) through the
 // double-buffered tiled kernel — it software-pipelines the global load with the compute to hide DRAM
 // latency on the low-occupancy projection shapes (down/q/o launch only ~28 blocks). BIT-IDENTICAL to
@@ -189,6 +194,10 @@ public:
     // captured paged kernels read it by pointer while its contents update between replays.
     void prepare(int64_t end);
     const int64_t* device_block_table() const { return static_cast<const int64_t*>(d_block_table_.get()); }
+    // G6: undo the length advance the capture pass's forward() does — a graph capture RECORDS the
+    // decode forward (host bookkeeping runs, kernels don't), so its advance() must be rolled back
+    // before the real replays drive the length forward themselves.
+    void set_length(int64_t l) { length_ = l; }
 
 private:
     void ensure_capacity(int64_t positions);  // grow the block table to cover positions
@@ -198,6 +207,44 @@ private:
     std::shared_ptr<void> d_block_table_;  // device int64 copy of block_table_ (stable address)
     int64_t d_bt_count_ = 0;               // entries already uploaded to the device buffer
     int64_t length_ = 0;
+};
+
+class Model;  // full def in model.hpp; the .cu includes it, the host-compiled header only points
+
+// G6 (CUDA graphs): drive single-sequence DECODE through a captured CUDA graph — one cudaGraphLaunch
+// replaces a decode step's ~360 per-op kernel launches (the launch overhead that, on this small model,
+// keeps decode ~3.5x over its memory-bandwidth floor). Requires a PAGED cache: the contiguous cat_seq
+// cache can't be captured (sync memcpy + growing buffers), while paged blocks have fixed addresses and
+// the cache feeds the step's length/token through DEVICE buffers the graph reads by pointer — so ONE
+// capture spans every length (decode keeps sq=1, so all kernel grids are fixed; only the loop bounds /
+// positions move, and those are now device-side). Prefill and the first decode step run EAGER (warming
+// the device pool so the capture itself does no cudaMalloc); the step is captured once and replayed
+// thereafter. Output is bit-identical to eager paged decode — golden tokens hold. Handles are void* so
+// the header stays CUDA-type-free (it's compiled by the host compiler too).
+class CudaGraphDecoder {
+public:
+    CudaGraphDecoder(const Model& model, CudaPagedKVCache& cache, int64_t vocab);
+    ~CudaGraphDecoder();
+    CudaGraphDecoder(const CudaGraphDecoder&) = delete;
+    CudaGraphDecoder& operator=(const CudaGraphDecoder&) = delete;
+
+    // Decode `token` at the cache's current length; returns [1, vocab] host logits, identical to
+    // model.forward({token}, &cache). Warms on the 1st call, captures on the 2nd, replays after.
+    Tensor decode(int64_t token);
+
+private:
+    void capture(int64_t token);
+    const Model& model_;
+    CudaPagedKVCache& cache_;
+    int64_t vocab_;
+    int64_t* d_pos_ = nullptr;         // device int64: KV length for this step
+    int64_t* d_token_ = nullptr;       // device int64: decode token id
+    const float* d_logits_ = nullptr;  // device logits buffer baked into the captured graph
+    Tensor captured_logits_;           // keeps that pool buffer alive across replays
+    void* graph_ = nullptr;            // cudaGraph_t
+    void* exec_ = nullptr;             // cudaGraphExec_t
+    bool warmed_ = false;
+    bool captured_ = false;
 };
 
 }  // namespace ni
