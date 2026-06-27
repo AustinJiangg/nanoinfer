@@ -57,6 +57,11 @@ if(NI_CUDA)
   target_link_libraries(nicore PUBLIC CUDA::cudart)
   # sm_89 = Ada Lovelace (RTX 4070 Super); CUDA_STANDARD 17 matches the C++ side.
   set_target_properties(nicore PROPERTIES CUDA_STANDARD 17 CUDA_ARCHITECTURES 89)
+  # G6 (CUDA graphs): compile the .cu with the PER-THREAD default stream so the implicit
+  # <<<>>> launches land on a CAPTURABLE stream — the legacy stream 0 can't be graph-captured.
+  # The engine is single-threaded, so this doesn't change ordering (the one thread's default
+  # stream stays in-order); it only makes the decode forward recordable into a cudaGraph.
+  target_compile_options(nicore PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--default-stream per-thread>)
 endif()
 
 enable_testing()

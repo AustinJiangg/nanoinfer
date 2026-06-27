@@ -181,10 +181,22 @@ public:
     // (increfing each); the sequence then prefills only its suffix past `length`.
     void share_prefix(const std::vector<int64_t>& blocks, int64_t length);
 
+    // G6 (CUDA graphs): the host-side per-step bookkeeping a graph driver must run OUTSIDE a
+    // capture — allocate any block the next position needs and refresh the device block table.
+    // attend() also calls it (eager); it's idempotent across layers and a NO-OP (no CUDA call)
+    // when nothing grew, so it's safe to leave in the captured region. `end` = length after this
+    // step (length()+t). The device block table d_block_table_ keeps a STABLE address so the
+    // captured paged kernels read it by pointer while its contents update between replays.
+    void prepare(int64_t end);
+    const int64_t* device_block_table() const { return static_cast<const int64_t*>(d_block_table_.get()); }
+
 private:
     void ensure_capacity(int64_t positions);  // grow the block table to cover positions
+    void sync_device_block_table();           // upload appended entries to d_block_table_
     CudaBlockPool* pool_;
-    std::vector<int64_t> block_table_;  // logical block i -> physical block id
+    std::vector<int64_t> block_table_;     // logical block i -> physical block id
+    std::shared_ptr<void> d_block_table_;  // device int64 copy of block_table_ (stable address)
+    int64_t d_bt_count_ = 0;               // entries already uploaded to the device buffer
     int64_t length_ = 0;
 };
 

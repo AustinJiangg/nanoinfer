@@ -2062,6 +2062,36 @@ void CudaPagedKVCache::ensure_capacity(int64_t positions) {
         block_table_.push_back(pool_->allocate());
 }
 
+// Refresh the device block table from the host one. The table only GROWS (entries never change
+// once set), so upload just the appended tail. Returns early with NO CUDA call when nothing grew —
+// which is what lets it sit inside a graph-captured attend(): the driver pre-grows the table for
+// the step's length before BeginCapture / before each replay, so during capture/replay this is a
+// pure no-op and records nothing. The async copy (eager path) is ordered before the paged kernels
+// on the one per-thread stream, so they read the fresh table.
+void CudaPagedKVCache::sync_device_block_table() {
+    const int64_t n = static_cast<int64_t>(block_table_.size());
+    if (n == d_bt_count_) return;  // nothing appended — no CUDA work (safe under capture)
+    if (!d_block_table_) {
+        void* p = nullptr;  // sized to the pool's max blocks: a sequence never exceeds it
+        cuda_check(cudaMalloc(&p, static_cast<size_t>(pool_->num_blocks()) * sizeof(int64_t)),
+                   "paged d_block_table malloc");
+        d_block_table_ = std::shared_ptr<void>(p, [](void* q) { cudaFree(q); });
+    }
+    cuda_check(cudaMemcpyAsync(static_cast<int64_t*>(d_block_table_.get()) + d_bt_count_,
+                               block_table_.data() + d_bt_count_,
+                               static_cast<size_t>(n - d_bt_count_) * sizeof(int64_t),
+                               cudaMemcpyHostToDevice),
+               "paged d_block_table H2D");
+    d_bt_count_ = n;
+}
+
+// Host-side per-step prep (block allocation + device-table refresh) the graph driver runs OUTSIDE
+// a capture; attend() calls it too for the eager path. `end` = length after this step.
+void CudaPagedKVCache::prepare(int64_t end) {
+    ensure_capacity(end);
+    sync_device_block_table();
+}
+
 void CudaPagedKVCache::share_prefix(const std::vector<int64_t>& blocks, int64_t length) {
     if (!block_table_.empty() || length_ != 0)
         throw std::runtime_error("CudaPagedKVCache::share_prefix: must seed a fresh cache");
@@ -2080,14 +2110,11 @@ Tensor CudaPagedKVCache::attend(int64_t layer, const Tensor& q, const Tensor& k,
     const int64_t t = k.size(1);
     const int64_t n_kv = pool_->n_kv_heads(), hd = pool_->head_dim(), bs = pool_->block_size();
     const int64_t start = length_, end = start + t;
-    ensure_capacity(end);  // idempotent across layers (length_ advances once per forward)
+    prepare(end);  // grow blocks + refresh the device block table (idempotent across layers)
 
-    // Upload the (small) block table for the two kernels.
-    const int64_t nbt = static_cast<int64_t>(block_table_.size());
-    int64_t* d_bt = nullptr;
-    cuda_check(cudaMalloc(&d_bt, nbt * sizeof(int64_t)), "paged block_table malloc");
-    cuda_check(cudaMemcpy(d_bt, block_table_.data(), nbt * sizeof(int64_t), cudaMemcpyHostToDevice),
-               "paged block_table H2D");
+    // The block table lives in a STABLE device buffer (G6: so a captured graph reads it by
+    // pointer while prepare() updates its contents between replays) — no per-call malloc/H2D/free.
+    const int64_t* d_bt = device_block_table();
 
     float* Kbase = pool_->k_base() + layer * pool_->layer_stride();
     float* Vbase = pool_->v_base() + layer * pool_->layer_stride();
@@ -2134,7 +2161,6 @@ Tensor CudaPagedKVCache::attend(int64_t layer, const Tensor& q, const Tensor& k,
         launch_check("paged_attention_warp_kernel");
     }
 
-    cudaFree(d_bt);
     return out;
 }
 
