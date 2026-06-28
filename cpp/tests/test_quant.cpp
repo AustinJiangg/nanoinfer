@@ -356,6 +356,18 @@ int main() {
         CHECK(ni::make_quantized(w, ni::QuantMode::None) == nullptr);
     }
 
+    // R5: every factory-built Weight reports its storage Format — the one tag CPU and CUDA share, so
+    // a caller reads the representation without RTTI / knowing the subclass. (None builds no Weight.)
+    {
+        Tensor w({4, 16});
+        for (int64_t i = 0; i < w.numel(); ++i) w[i] = float(i) - 8.0f;
+        CHECK(ni::make_quantized(w, ni::QuantMode::Q8)->format() == ni::Format::Q8);
+        CHECK(ni::make_quantized(w, ni::QuantMode::Q4)->format() == ni::Format::Q4);
+        CHECK(ni::make_quantized(w, ni::QuantMode::Q4G)->format() == ni::Format::Q4G);
+        CHECK(ni::make_quantized(w, ni::QuantMode::W8A8)->format() == ni::Format::W8A8);
+        CHECK(ni::make_q8_embed(w)->format() == ni::Format::Q8);  // weight-only int8 embed/lm_head
+    }
+
     // --- embedding_q8 (weight-only int8 token embedding / tied lm_head) ---
 
     // Gathering rows of the int8 table (dequantized on the fly) equals gathering rows of

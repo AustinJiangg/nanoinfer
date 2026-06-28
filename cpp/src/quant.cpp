@@ -386,6 +386,7 @@ class Q8Weight : public Weight {
 public:
     explicit Q8Weight(QTensor t) : t_(std::move(t)) {}
     Tensor linear(const Tensor& x, const Tensor* bias) const override { return linear_q8(x, t_, bias); }
+    Format format() const override { return Format::Q8; }
     int64_t bytes() const override {
         return int64_t(t_.q.size()) + int64_t(t_.scale.size()) * 4;
     }
@@ -396,6 +397,7 @@ class Q4Weight : public Weight {
 public:
     explicit Q4Weight(Q4Tensor t) : t_(std::move(t)) {}
     Tensor linear(const Tensor& x, const Tensor* bias) const override { return linear_q4(x, t_, bias); }
+    Format format() const override { return Format::Q4; }
     int64_t bytes() const override {
         return int64_t(t_.q.size()) + int64_t(t_.scale.size()) * 4;
     }
@@ -406,6 +408,7 @@ class Q4GWeight : public Weight {
 public:
     explicit Q4GWeight(Q4GTensor t) : t_(std::move(t)) {}
     Tensor linear(const Tensor& x, const Tensor* bias) const override { return linear_q4g(x, t_, bias); }
+    Format format() const override { return Format::Q4G; }
     int64_t bytes() const override {
         return int64_t(t_.q.size()) + int64_t(t_.scale.size()) * 4;
     }
@@ -418,6 +421,7 @@ class W8A8Weight : public Weight {
 public:
     explicit W8A8Weight(QTensor t) : t_(std::move(t)) {}
     Tensor linear(const Tensor& x, const Tensor* bias) const override { return linear_w8a8(x, t_, bias); }
+    Format format() const override { return Format::W8A8; }
     int64_t bytes() const override {
         return int64_t(t_.q.size()) + int64_t(t_.scale.size()) * 4;
     }
@@ -432,6 +436,7 @@ public:
     explicit EmbedQ8Weight(QTensor t) : t_(std::move(t)) {}
     Tensor linear(const Tensor& x, const Tensor* bias) const override { return linear_q8(x, t_, bias); }
     Tensor gather(const std::vector<int64_t>& ids) const override { return embedding_q8(t_, ids); }
+    Format format() const override { return Format::Q8; }  // weight-only int8 (tied embed + lm_head)
     int64_t bytes() const override { return int64_t(t_.q.size()) + int64_t(t_.scale.size()) * 4; }
     int64_t fp32_bytes() const override { return t_.out * t_.in * 4; }
 };

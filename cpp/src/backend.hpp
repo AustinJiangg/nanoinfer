@@ -126,6 +126,8 @@ public:
     Tensor gather(const std::vector<int64_t>& ids) const override {  // R3b: the embed table case
         return backend_->embedding(w_, ids);
     }
+    // R5: F16 vs F32 is the only thing a dense weight's format depends on (the device is orthogonal).
+    Format format() const override { return w_.dtype() == DType::F16 ? Format::F16 : Format::F32; }
     int64_t bytes() const override { return w_.numel() * (w_.dtype() == DType::F16 ? 2 : 4); }
     int64_t fp32_bytes() const override { return w_.numel() * 4; }
 

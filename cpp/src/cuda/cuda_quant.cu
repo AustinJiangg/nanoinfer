@@ -281,6 +281,7 @@ public:
     Tensor linear(const Tensor& x, const Tensor* bias) const override {
         return cuda_linear_w8a8(x, wq_, w_scale_, bias);
     }
+    Format format() const override { return Format::W8A8; }  // same Format as the CPU W8A8Weight
     int64_t bytes() const override { return out_ * in_ + out_ * 4; }  // int8 codes + fp32 scales
     int64_t fp32_bytes() const override { return out_ * in_ * 4; }
 };
@@ -309,6 +310,7 @@ public:
     Tensor gather(const std::vector<int64_t>& ids) const override {
         return cuda_embedding_q8(codes_, scale_, ids);
     }
+    Format format() const override { return Format::Q8; }  // same Format as the CPU EmbedQ8Weight
     int64_t bytes() const override { return codes_.numel() + scale_.numel() * 4; }
     int64_t fp32_bytes() const override { return codes_.numel() * 4; }
 };

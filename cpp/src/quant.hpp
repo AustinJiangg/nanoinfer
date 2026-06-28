@@ -31,6 +31,15 @@ namespace ni {
 // form a GPU DP4A / CPU VNNI runs at int8 throughput: the compute win, not just memory.
 enum class QuantMode { None, Q8, Q4, Q4G, W8A8 };
 
+// R5: the single weight-REPRESENTATION tag, shared by every backend (CPU/CUDA, and Metal ahead).
+// Every Weight reports format() so storage diagnostics and a backend's weight dispatch reason about
+// the representation uniformly — the symmetric counterpart to the Backend's op dispatch (R3's lesson:
+// the weight format is what varies most across devices). QuantMode is the construction-time *selector*
+// (what to build); Format is the constructed weight's runtime *tag* (what it turned out to be). They
+// are NOT the same set: None builds no Weight (so it has no Format), and F32/F16 are real weights
+// (DenseWeight, distinguished by Tensor dtype) that no QuantMode names. Q8/Q4/Q4G/W8A8 line up.
+enum class Format { F32, F16, Q8, Q4, Q4G, W8A8 };
+
 // An int8-quantized [out, in] weight: codes row-major, one scale per output row.
 struct QTensor {
     std::vector<int8_t> q;     // [out * in]
@@ -111,6 +120,9 @@ public:
     // the default (quant.cpp) throws so a projection weight gathered by mistake fails loudly.
     // DenseWeight (backend.hpp) and the int8-embed weights override it.
     virtual Tensor gather(const std::vector<int64_t>& ids) const;
+    // R5: this weight's storage representation, so a caller reads the format without RTTI or knowing
+    // the concrete subclass — the one Format enum every backend shares. Pure: every weight declares it.
+    virtual Format format() const = 0;
     virtual int64_t bytes() const = 0;       // actual storage
     virtual int64_t fp32_bytes() const = 0;  // out*in*4 (the unquantized size)
 };
