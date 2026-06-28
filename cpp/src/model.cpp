@@ -39,19 +39,10 @@ bool is_fp16_weight(const std::string& name) {
 bool g_quantize_embed = false;
 
 Model::Model(const std::string& weights_dir, QuantMode mode, Device device) {
-    // The Backend is the device-dispatch seam (G0): forward() below is written once
-    // against it. CPU is the only backend wired in G0; CUDA/Metal throw here until
-    // their backends land (G1+), so callers fail loudly rather than silently on CPU.
-    if (device == Device::CPU) {
-        backend_ = std::make_unique<CpuBackend>();
-#ifdef NI_CUDA
-    } else if (device == Device::CUDA) {
-        backend_ = std::make_unique<CudaBackend>();
-#endif
-    } else {
-        throw std::runtime_error(
-            "Model: backend for this device is not built — rebuild with -DNI_CUDA=ON");
-    }
+    // The Backend is the device-dispatch seam (G0): forward() below is written once against it.
+    // make_backend (R1) is the one place that maps a Device to its concrete backend — it throws
+    // for a device whose backend wasn't compiled in, so callers fail loudly rather than silently.
+    backend_ = make_backend(device);
 
     cfg_ = load_config(weights_dir + "/config.txt");
     for (const auto& entry : fs::directory_iterator(weights_dir)) {
@@ -135,12 +126,9 @@ KVCache Model::make_cache(int64_t max_seq) const {
 }
 
 std::unique_ptr<KVCacheBase> Model::make_kv_cache(int64_t max_seq) const {
-#ifdef NI_CUDA
-    if (backend_->device() == Device::CUDA)
-        return std::make_unique<CudaKVCache>(backend_.get(), cfg_.num_layers, cfg_.num_kv_heads,
-                                             cfg_.head_dim);
-#endif
-    return std::make_unique<KVCache>(cfg_.num_layers, cfg_.num_kv_heads, cfg_.head_dim, max_seq);
+    // The backend returns its native cache (CPU KVCache / device CudaKVCache) through the base
+    // pointer the forward already drives — the #ifdef moved into the backend (R1).
+    return backend_->make_kv_cache(cfg_.num_layers, cfg_.num_kv_heads, cfg_.head_dim, max_seq);
 }
 
 Tensor Model::project(const Tensor& x, const std::string& name, const Tensor* bias) const {
@@ -273,12 +261,9 @@ Tensor Model::forward(const std::vector<int64_t>& ids, KVCacheBase* cache) const
 
     x = backend_->rmsnorm(x, W("norm.weight"), eps);
     Tensor logits = lm_head(x);  // [seq, vocab]
-#ifdef NI_CUDA
-    // G6: a CUDA-graph driver keeps the logits ON DEVICE (it does its own D2H after the graph
-    // replay) — the sync to_host here is illegal inside a stream capture. Eager: D2H at the edge.
-    if (logits.device() == Device::CUDA && !g_cuda_keep_device_logits) logits = to_host(logits);
-#endif
-    return logits;
+    // Land the result on the host for return (CUDA D2H, unless a graph driver kept it on device;
+    // CPU is identity) — the device edge-copy lives behind the Backend now (R1).
+    return backend_->finalize_logits(std::move(logits));
 }
 
 Tensor Model::forward_batch(const std::vector<int64_t>& tokens,
@@ -347,10 +332,7 @@ Tensor Model::forward_batch(const std::vector<int64_t>& tokens,
 
     x = backend_->rmsnorm(x, W("norm.weight"), eps);
     Tensor logits = lm_head(x);  // [n, vocab]
-#ifdef NI_CUDA
-    if (logits.device() == Device::CUDA) logits = to_host(logits);
-#endif
-    return logits;
+    return backend_->finalize_logits(std::move(logits));
 }
 
 }  // namespace ni

@@ -1,6 +1,13 @@
 #include "backend.hpp"
 
+#include <memory>
+#include <stdexcept>
+
+#include "cache.hpp"
 #include "ops.hpp"
+#ifdef NI_CUDA
+#include "cuda/cuda_backend.hpp"
+#endif
 
 namespace ni {
 
@@ -49,6 +56,22 @@ Tensor CpuBackend::extract_row(const Tensor& x, int64_t s, int64_t heads, int64_
 void CpuBackend::place_row(Tensor& dst, int64_t s, const Tensor& row) {
     const int64_t width = dst.size(1);
     for (int64_t c = 0; c < width; ++c) dst.at(s, c) = row.at(0, c);
+}
+
+std::unique_ptr<KVCacheBase> CpuBackend::make_kv_cache(int64_t num_layers, int64_t n_kv_heads,
+                                                       int64_t head_dim, int64_t max_seq) {
+    return std::make_unique<KVCache>(num_layers, n_kv_heads, head_dim, max_seq);
+}
+
+// The former #ifdef ladder in Model's constructor, isolated to one spot so the model is
+// device-agnostic. CUDA is only reachable in an -DNI_CUDA build; otherwise this throws for it.
+std::unique_ptr<Backend> make_backend(Device device, const BackendConfig&) {
+    if (device == Device::CPU) return std::make_unique<CpuBackend>();
+#ifdef NI_CUDA
+    if (device == Device::CUDA) return std::make_unique<CudaBackend>();
+#endif
+    throw std::runtime_error(
+        "make_backend: backend for this device is not built — rebuild with -DNI_CUDA=ON");
 }
 
 }  // namespace ni

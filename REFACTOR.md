@@ -48,14 +48,17 @@ them (except where a stage explicitly re-verifies the same value before/after).
 Ordered by dependency. Semantic changes (where the risk is) first, each isolated and
 parity-gated; mechanical moves (zero parity risk) last, landing on stabilized code.
 
-### R0 — freeze the oracle as one command  ⬜
+### R0 — freeze the oracle as one command  ✅
 - **Change:** make every parity/golden test runnable as a single `ctest` gate. Record
   the current baseline numbers — logits `max|diff|` vs the CPU oracle, each golden
   token sequence, `weight_bytes` per quant mode — as the refactor's invariant.
 - **Done when:** `ctest` is one green command; the baseline is on disk and is the diff
   target for every stage below.
+- **Landed:** baseline captured in `cpp/tests/BASELINE.md` (CPU oracle, CPU quant
+  none/q8/q4/q4g/embed8, full CUDA path). The "one `ctest`" collapse was folded into R1
+  (the `weights` suite), as this doc predicted.
 
-### R1 — backend factory + kill the cache/logits `#ifdef`s  ⬜
+### R1 — backend factory + kill the cache/logits `#ifdef`s  ✅
 - **Change:** `make_backend(Device, const BackendConfig&)` replaces the constructor's
   `if(CPU)…#ifdef…else if(CUDA)`. KV-cache creation moves onto the backend
   (`backend_->make_kv_cache(...)` / `make_paged_cache(...)`), killing the `#ifdef` in
@@ -64,6 +67,20 @@ parity-gated; mechanical moves (zero parity risk) last, landing on stabilized co
   `#ifdef` at the end of `forward`/`forward_batch`.
 - **Done when:** `model.cpp`'s `#ifdef` count roughly halves; every parity number
   unchanged vs R0. Pure plumbing, no math.
+- **Landed:** `make_backend` factory (in `backend.cpp`) + a `BackendConfig` placeholder
+  (R2 grows it); `make_kv_cache` and `finalize_logits` added to the `Backend` interface
+  (CPU + CUDA impls). `model.cpp` `#ifdef NI_CUDA` sites **11 → 7** (the 4 R1 targeted;
+  the remaining 7 are all R3 weight-seam territory). The `weights` ctest suite landed —
+  the gate is now one `ctest` (**23/23**, the 13 weight-dependent binaries labelled
+  `weights`; `run_quant` pinned via `PASS_REGULAR_EXPRESSION`). Every BASELINE number
+  digit-identical (CPU `4.24385e-05`, CUDA fp32 `3.76701e-05`, all bit-identical gates
+  `=0`, weights 991/907/1571/499 MB). CPU-only build (`-DNI_CUDA=OFF`) verified — golden
+  MATCH, 9 CPU-only `weights` tests. (Pre-existing CPU-only `-Wunused` on
+  `is_fp16_weight`, used only under `#ifdef NI_CUDA`; R3 resolves it with the weight seam.)
+- **Did NOT do (deferred to R3, by design):** `make_paged_cache` on the backend — the
+  paged cache isn't constructed through `Model` today (tests/bindings build
+  `CudaPagedKVCache` directly), so there's no `Model` `#ifdef` to remove yet; it joins
+  the weight-seam pass.
 
 ### R2 — policy object: de-globalize the flags  ⬜
 - **Change:** replace the 11 globals with a **construction-time, immutable** config:

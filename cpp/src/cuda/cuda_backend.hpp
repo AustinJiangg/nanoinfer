@@ -103,6 +103,12 @@ public:
     Tensor alloc(const std::vector<int64_t>& shape) override;
     Tensor extract_row(const Tensor& x, int64_t s, int64_t heads, int64_t dim) override;
     void place_row(Tensor& dst, int64_t s, const Tensor& row) override;
+    // R1: the device-resident KV cache (grows by concat, so max_seq is unused) and the result
+    // D2H (respecting the graph driver's keep-on-device flag), behind the Backend so the model
+    // needs no #ifdef for either. Bodies in cuda_backend.cu.
+    std::unique_ptr<KVCacheBase> make_kv_cache(int64_t num_layers, int64_t n_kv_heads,
+                                               int64_t head_dim, int64_t max_seq) override;
+    Tensor finalize_logits(Tensor logits) override;
 };
 
 // Device-resident KV cache (G3). Each layer's K/V is a contiguous [n_kv, len, head_dim]

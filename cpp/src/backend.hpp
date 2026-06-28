@@ -14,11 +14,14 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "tensor.hpp"
 
 namespace ni {
+
+class KVCacheBase;  // cache.hpp — make_kv_cache returns one (forward-declared to avoid an include cycle)
 
 class Backend {
 public:
@@ -48,6 +51,17 @@ public:
     virtual Tensor extract_row(const Tensor& x, int64_t s, int64_t heads, int64_t dim) = 0;
     // Write a merged-head [1, width] row back into row s of dst [n, width], in place.
     virtual void place_row(Tensor& dst, int64_t s, const Tensor& row) = 0;
+
+    // --- R1: device objects the factory owns, so Model stays #ifdef-free ---
+    // The KV cache native to this backend (CPU KVCache / device CudaKVCache), returned through
+    // the base so the model drives either via one pointer. max_seq sizes the preallocated CPU
+    // cache; the device cache grows on demand and ignores it.
+    virtual std::unique_ptr<KVCacheBase> make_kv_cache(int64_t num_layers, int64_t n_kv_heads,
+                                                       int64_t head_dim, int64_t max_seq) = 0;
+    // Bring a forward()'s logits to the host for return. CPU: identity (already host). CUDA: D2H,
+    // unless a graph driver kept them on device for its own post-replay copy. The result-landing
+    // #ifdef that used to sit at the end of Model::forward now lives here.
+    virtual Tensor finalize_logits(Tensor logits) { return logits; }
 };
 
 // The CPU backend: every method forwards to the corresponding free function in
@@ -73,6 +87,18 @@ public:
     Tensor alloc(const std::vector<int64_t>& shape) override;
     Tensor extract_row(const Tensor& x, int64_t s, int64_t heads, int64_t dim) override;
     void place_row(Tensor& dst, int64_t s, const Tensor& row) override;
+    std::unique_ptr<KVCacheBase> make_kv_cache(int64_t num_layers, int64_t n_kv_heads,
+                                               int64_t head_dim, int64_t max_seq) override;
 };
+
+// R1: construction-time backend configuration. Empty today; R2 grows it (GemmVariant,
+// AttnVariant, fp16_weights, quantize_embed) so the ~11 mutable g_cuda_* globals become
+// typed, per-instance policy instead of process-global A/B switches.
+struct BackendConfig {};
+
+// The single place that maps a Device to its concrete backend — the former #ifdef ladder in
+// Model's constructor, now isolated here. Throws if that device's backend wasn't compiled in
+// (e.g. Device::CUDA without -DNI_CUDA).
+std::unique_ptr<Backend> make_backend(Device device, const BackendConfig& cfg = {});
 
 }  // namespace ni

@@ -2007,6 +2007,20 @@ void CudaBackend::place_row(Tensor& dst, int64_t s, const Tensor& row) {
                "place_row");
 }
 
+// R1: the model's make_kv_cache / forward-tail D2H, now behind the Backend (no #ifdef in model.cpp).
+std::unique_ptr<KVCacheBase> CudaBackend::make_kv_cache(int64_t num_layers, int64_t n_kv_heads,
+                                                        int64_t head_dim, int64_t /*max_seq*/) {
+    // The device cache grows by concatenation, so it ignores max_seq (unlike the CPU cache).
+    return std::make_unique<CudaKVCache>(this, num_layers, n_kv_heads, head_dim);
+}
+
+Tensor CudaBackend::finalize_logits(Tensor logits) {
+    // D2H at the edge, unless a graph driver (CudaGraphDecoder) asked to keep the logits on the
+    // device for its own post-replay copy — a sync D2H can't run inside a stream capture.
+    if (logits.device() == Device::CUDA && !g_cuda_keep_device_logits) return to_host(logits);
+    return logits;
+}
+
 // --- Device-resident KV cache (G3) ---
 
 CudaKVCache::CudaKVCache(Backend* backend, int64_t num_layers, int64_t n_kv_heads,

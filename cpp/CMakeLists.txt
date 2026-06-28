@@ -200,6 +200,47 @@ if(NI_CUDA)
   target_include_directories(run_cuda_attn_bench PRIVATE tests)
 endif()
 
+# R0/R1: the weight-dependent parity/golden binaries as a labelled `weights` ctest suite, so the
+# whole gate is one `ctest` (the other tests need only the in-tree fixtures). Gated on the weight
+# export + reference dump being present — skip-clean when absent, the same graceful degrade as the
+# GPU tests. The parity binaries return nonzero on regression; run_quant is informational (always
+# exits 0), so its baseline match-count is pinned via PASS_REGULAR_EXPRESSION. Numbers in
+# tests/BASELINE.md. Run just this suite with `ctest -L weights` (or exclude it with `ctest -LE weights`).
+set(NI_WEIGHTS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/weights/qwen2.5-0.5b)
+if(EXISTS ${NI_WEIGHTS_DIR}/ref_ids.txt)
+  add_test(NAME run_parity   COMMAND run_parity   ${NI_WEIGHTS_DIR})
+  add_test(NAME run_generate COMMAND run_generate ${NI_WEIGHTS_DIR})
+  add_test(NAME run_cache    COMMAND run_cache    ${NI_WEIGHTS_DIR})
+  add_test(NAME run_batch    COMMAND run_batch    ${NI_WEIGHTS_DIR})
+  add_test(NAME run_paged    COMMAND run_paged    ${NI_WEIGHTS_DIR})
+  set(NI_WEIGHTS_TESTS run_parity run_generate run_cache run_batch run_paged)
+
+  # run_quant reports but doesn't gate (always exits 0) — pin its printed match-count so a quant
+  # regression fails ctest, including q4's expected-lossy 0/12 (locks even the lossy baseline).
+  add_test(NAME run_quant_none COMMAND run_quant ${NI_WEIGHTS_DIR} none)
+  add_test(NAME run_quant_q8   COMMAND run_quant ${NI_WEIGHTS_DIR} q8)
+  add_test(NAME run_quant_q4   COMMAND run_quant ${NI_WEIGHTS_DIR} q4)
+  add_test(NAME run_quant_q4g  COMMAND run_quant ${NI_WEIGHTS_DIR} q4g)
+  set_tests_properties(run_quant_none PROPERTIES PASS_REGULAR_EXPRESSION "matching fp32: 12/12")
+  set_tests_properties(run_quant_q8   PROPERTIES PASS_REGULAR_EXPRESSION "matching fp32: 11/12")
+  set_tests_properties(run_quant_q4   PROPERTIES PASS_REGULAR_EXPRESSION "matching fp32: 0/12")
+  set_tests_properties(run_quant_q4g  PROPERTIES PASS_REGULAR_EXPRESSION "matching fp32: 5/12")
+  list(APPEND NI_WEIGHTS_TESTS run_quant_none run_quant_q8 run_quant_q4 run_quant_q4g)
+
+  if(NI_CUDA)
+    add_test(NAME run_cuda_parity COMMAND run_cuda_parity ${NI_WEIGHTS_DIR})
+    add_test(NAME run_cuda_cache  COMMAND run_cuda_cache  ${NI_WEIGHTS_DIR})
+    add_test(NAME run_cuda_paged  COMMAND run_cuda_paged  ${NI_WEIGHTS_DIR})
+    add_test(NAME run_cuda_batch  COMMAND run_cuda_batch  ${NI_WEIGHTS_DIR})
+    list(APPEND NI_WEIGHTS_TESTS run_cuda_parity run_cuda_cache run_cuda_paged run_cuda_batch)
+  endif()
+
+  set_tests_properties(${NI_WEIGHTS_TESTS} PROPERTIES LABELS weights)
+else()
+  message(STATUS "weights/qwen2.5-0.5b/ref_ids.txt absent: skipping the `weights` ctest suite "
+                 "(run tools/export_weights.py + tools/dump_reference.py to enable)")
+endif()
+
 # F6: pybind11 module exposing the C++ core to Python — the vLLM-shape pivot
 # (Python orchestration over our own kernels). Optional and auto-located via the
 # already-found Python3 (`pip install pybind11`); skipped cleanly when pybind11 is
