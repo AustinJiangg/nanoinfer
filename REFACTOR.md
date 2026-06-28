@@ -128,7 +128,7 @@ parity-gated; mechanical moves (zero parity risk) last, landing on stabilized co
     kernel-selection policy** — they fold into R3 (the weight seam / a per-call context),
     and remain documented externs for now.
 
-### R3 — the weight seam (keystone; highest value, highest risk)  ⬜
+### R3 — the weight seam (keystone; highest value, highest risk)  ✅
 - **Change:** unify fp32 / fp16 / Q8 / Q4 / W8A8 / int8-embed behind ONE call. Make the
   **weight** polymorphic, not the call site:
   ```cpp
@@ -171,10 +171,19 @@ parity-gated; mechanical moves (zero parity risk) last, landing on stabilized co
   construction remain). Every BASELINE number digit-identical — int8-embed `weight_bytes` (CPU
   `EmbedQ8Weight` 1571 MB; CUDA `CudaEmbedQ8Weight` 1571/499 MB), fp16 embed 991 MB, all golden
   tokens, bit-identical gates `=0`; 23/23 ctest; CPU-only build clean.
-- **Remaining — R3c:** `backend_->make_weight()` factory so the quant construction (the W8A8
-  `#ifdef`) + the int8-embed construction + the cuda includes leave `model.cpp` → **zero
-  `#ifdef NI_CUDA`**; fold in the deferred R2 load-config (`fp16_weights` / `quantize_embed` into
-  `BackendConfig`) + the per-instance policy threading the weight seam now makes reachable.
+- **Progress — R3c landed  ✅ (zero `#ifdef` — the keystone done):** `backend_->make_quant_weight()`
+  + `make_embed_weight()` factories (CPU defaults = `make_quantized` / `make_q8_embed`; CUDA overrides
+  build the device W8A8 / int8-embed) moved the last construction `#ifdef`s out of `model.cpp`, and
+  the cuda `#include`s went with them. **`model.cpp` now carries ZERO `#ifdef NI_CUDA`** — pure
+  device-agnostic source, every device action routed through the `Backend` interface; the abstraction
+  is complete (it abstracts the weight representation, the thing that varied most). `model.cpp`
+  `#ifdef NI_CUDA` over the whole keystone: **11 (pre-R1) → 7 (R1) → 6 (R3a) → 3 (R3b) → 0 (R3c)**.
+  Every BASELINE number digit-identical (W8A8 907, emb8 1571, full-int8 499 MB, fp16 991, all golden,
+  bit-identical gates `=0`); 23/23 ctest; CPU-only build clean.
+- **R3 done.** Deferred (a distinct goal — *global elimination*, not `#ifdef` removal): fold
+  `fp16_weights` / `quantize_embed` into `BackendConfig` and thread the kernel `CudaPolicy`
+  per-instance (the weight seam now makes both reachable). This changes the `Model` constructor
+  signature + the binding + the few tests that set those globals, so it is its own follow-up.
 
 ### R4 — split the monolith (mechanical, zero parity risk)  ⬜
 - **Change:** carve `cuda_backend.cu` into translation units by concern:

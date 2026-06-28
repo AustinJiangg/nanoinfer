@@ -7,10 +7,10 @@
 
 #include "serialize.hpp"
 
-#ifdef NI_CUDA
-#include "cuda/cuda.hpp"
-#include "cuda/cuda_backend.hpp"
-#endif
+// R3c: no cuda headers here — the model is device-agnostic source. Every device-specific action
+// (op dispatch, KV cache, logits D2H, weight residency, quant/embed weight construction) goes through
+// the Backend interface; make_backend picks the concrete backend. model.cpp carries no CUDA
+// preprocessor conditionals — the Backend abstraction is complete.
 
 namespace fs = std::filesystem;
 
@@ -63,44 +63,25 @@ Model::Model(const std::string& weights_dir, QuantMode mode, Device device) {
         for (const auto& kv : w_)
             if (is_layer_proj(kv.first)) names.push_back(kv.first);
         for (const std::string& n : names) {
-#ifdef NI_CUDA
-            // CUDA + W8A8: a device-resident int8 weight, so the projection runs int8×int8 DP4A on
-            // the GPU (the compute win). W8A8 is the GPU quant path; the other modes on CUDA aren't
-            // GPU-wired (their CPU linear can't take a device tensor). CPU uses make_quantized.
-            if (device == Device::CUDA && mode == QuantMode::W8A8)
-                weights_.emplace(n, make_cuda_w8a8(w_.at(n)));
-            else
-#endif
-                weights_.emplace(n, make_quantized(w_.at(n), mode));
+            // R3c: the backend builds the quantized weight — CPU keeps it host (make_quantized); the
+            // CUDA backend uploads W8A8 as a device int8 weight (int8×int8 DP4A, the compute win) and
+            // falls back to the CPU quant for the other modes. No device/mode #ifdef in the model.
+            weights_.emplace(n, backend_->make_quant_weight(w_.at(n), mode));
             w_.erase(n);  // free the fp32 copy — the quantized weight is live now
         }
     }
 
     // G5d: weight-only int8 for the tied token-embedding / output-projection (the biggest single
-    // weight). The gather dequantizes a row; the lm_head runs linear_q8 — fp32 activations into
-    // argmax, so only the weight rounds. On CPU the int8 lives in embed_q8_ (a host QTensor); on CUDA
-    // the codes+scale go to device buffers driving cuda_embedding_q8/cuda_linear_q8. Runs BEFORE the
-    // CUDA upload loop so the fp32 embed is erased here and not uploaded again below.
+    // weight). The backend builds it — EmbedQ8Weight (host int8) on CPU, the device int8 mirror on
+    // CUDA — so the gather dequantizes a looked-up row and the tied lm_head runs the weight-only int8
+    // linear, fp32 activations into argmax (only the weight rounds). Runs BEFORE to_resident so the
+    // fp32 embed is consumed here, not uploaded again. R3c: no device #ifdef — the backend decides.
     if (g_quantize_embed) {
-        // Build the tied embed/lm_head as a weight-only int8 Weight (the biggest single weight): the
-        // gather dequantizes a row, the lm_head runs linear_q8 — fp32 activations into argmax, so only
-        // the weight rounds. The CPU/CUDA int8-embed BUILDERS are the only #ifdef left here (R3c moves
-        // it behind a backend factory); the gather/linear DISPATCH below is already #ifdef-free. Runs
-        // before to_resident so the fp32 embed is consumed here, not uploaded again.
-#ifdef NI_CUDA
-        if (device == Device::CUDA) {
-            embed_ = make_cuda_q8_embed(W("embed_tokens.weight"));
-            w_.erase("embed_tokens.weight");
-            // Untied lm_head on CUDA isn't wired (Qwen2.5 is tied); the CPU branch handles untied.
-        } else
-#endif
-        {
-            embed_ = make_q8_embed(W("embed_tokens.weight"));
-            w_.erase("embed_tokens.weight");
-            if (!cfg_.tie_word_embeddings && w_.count("lm_head.weight")) {
-                lm_head_ = make_q8_embed(W("lm_head.weight"));
-                w_.erase("lm_head.weight");
-            }
+        embed_ = backend_->make_embed_weight(W("embed_tokens.weight"));
+        w_.erase("embed_tokens.weight");
+        if (!cfg_.tie_word_embeddings && w_.count("lm_head.weight")) {
+            lm_head_ = backend_->make_embed_weight(W("lm_head.weight"));
+            w_.erase("lm_head.weight");
         }
     }
 

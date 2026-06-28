@@ -111,6 +111,9 @@ public:
     Tensor finalize_logits(Tensor logits) override;
     // R3: H2D upload at load (fp16 for the big eligible weights under g_cuda_fp16_weights, else fp32).
     Tensor to_resident(Tensor weight, bool fp16_eligible) override;
+    // R3c: device weight construction (the model's quant-build #ifdefs, now behind the Backend).
+    std::unique_ptr<Weight> make_quant_weight(const Tensor& host, QuantMode mode) override;
+    std::unique_ptr<Weight> make_embed_weight(const Tensor& host) override;
 };
 
 // Device-resident KV cache (G3). Each layer's K/V is a contiguous [n_kv, len, head_dim]

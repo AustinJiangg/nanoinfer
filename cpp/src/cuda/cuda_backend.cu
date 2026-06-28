@@ -2047,6 +2047,17 @@ Tensor CudaBackend::to_resident(Tensor weight, bool fp16_eligible) {
     return (fp16_eligible && g_cuda_fp16_weights) ? to_device_f16(weight) : to_device(weight);
 }
 
+std::unique_ptr<Weight> CudaBackend::make_quant_weight(const Tensor& host, QuantMode mode) {
+    // W8A8 is the GPU quant path — a device-resident int8 weight whose linear() runs int8×int8 DP4A
+    // (the compute win). The other modes fall back to the CPU quant (their linear can't take a device
+    // tensor) — unchanged from the pre-seam behavior, just routed through the factory now.
+    return mode == QuantMode::W8A8 ? make_cuda_w8a8(host) : make_quantized(host, mode);
+}
+
+std::unique_ptr<Weight> CudaBackend::make_embed_weight(const Tensor& host) {
+    return make_cuda_q8_embed(host);  // device int8 embed/lm_head (codes+scale resident)
+}
+
 // --- Device-resident KV cache (G3) ---
 
 CudaKVCache::CudaKVCache(Backend* backend, int64_t num_layers, int64_t n_kv_heads,

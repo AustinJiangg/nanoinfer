@@ -71,6 +71,18 @@ public:
     // plain loop over its norms/biases/embed, with no #ifdef and no device global in sight — the
     // fp16 decision (g_cuda_fp16_weights) lives inside the CUDA override.
     virtual Tensor to_resident(Tensor weight, bool /*fp16_eligible*/) { return weight; }
+
+    // R3c: the backend as weight factory, so the model builds quantized weights with no #ifdef.
+    // make_quant_weight: a quantized projection (Q8/Q4/Q4G/W8A8) from a host fp32 tensor — CPU keeps
+    // it host (make_quantized); the CUDA override uploads W8A8 as a device int8 weight (make_cuda_w8a8).
+    // make_embed_weight: the tied embed/lm_head as weight-only int8 — CPU EmbedQ8Weight, CUDA device.
+    // The defaults are the CPU construction; CudaBackend overrides both. The model names no cuda symbol.
+    virtual std::unique_ptr<Weight> make_quant_weight(const Tensor& host, QuantMode mode) {
+        return make_quantized(host, mode);
+    }
+    virtual std::unique_ptr<Weight> make_embed_weight(const Tensor& host) {
+        return make_q8_embed(host);
+    }
 };
 
 // The CPU backend: every method forwards to the corresponding free function in
