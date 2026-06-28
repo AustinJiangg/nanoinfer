@@ -163,15 +163,18 @@ parity-gated; mechanical moves (zero parity risk) last, landing on stabilized co
   1979/907/728/771 MB CPU + 991/907/1571/499 MB CUDA, all golden tokens, bit-identical gates
   `=0`); 23/23 ctest; CPU-only build clean — the R1 `is_fp16_weight` `-Wunused` is fixed (it's
   now called in the unconditional `to_resident` loop).
-- **Remaining — R3b / R3c:**
-  - **R3b** — embed/lm_head through the seam: add `Weight::gather` (default-throw; `DenseWeight`
-    + an int8-embed `Weight` override it), build `embed_` / `lm_head_` Weights, so
-    `Model::embed_tokens` / `lm_head` lose their `#ifdef`s (the embed-q8 construct + the gather +
-    the lm_head dispatch + the `weight_bytes` embed accounting — 4 of the remaining 6).
-  - **R3c** — `backend_->make_weight()` factory so the quant construction (the W8A8 `#ifdef`) and
-    the cuda includes leave `model.cpp` → **zero `#ifdef NI_CUDA`**; fold in the deferred R2
-    load-config (`fp16_weights` / `quantize_embed` into `BackendConfig`) and the per-instance
-    policy threading the weight seam now makes reachable.
+- **Progress — R3b landed  ✅ (embed/lm_head through the seam):** added `Weight::gather`
+  (default-throw; `DenseWeight`, `EmbedQ8Weight` (CPU), and `CudaEmbedQ8Weight` override it),
+  built `embed_` / `lm_head_` Weights (a tied model leaves `lm_head_` null and reuses `embed_`),
+  so `Model::embed_tokens` / `lm_head` / `weight_bytes` are now `#ifdef`-free, one Weight call each.
+  `model.cpp` `#ifdef NI_CUDA` **6 → 3** (only the cuda includes + the W8A8 / int8-embed
+  construction remain). Every BASELINE number digit-identical — int8-embed `weight_bytes` (CPU
+  `EmbedQ8Weight` 1571 MB; CUDA `CudaEmbedQ8Weight` 1571/499 MB), fp16 embed 991 MB, all golden
+  tokens, bit-identical gates `=0`; 23/23 ctest; CPU-only build clean.
+- **Remaining — R3c:** `backend_->make_weight()` factory so the quant construction (the W8A8
+  `#ifdef`) + the int8-embed construction + the cuda includes leave `model.cpp` → **zero
+  `#ifdef NI_CUDA`**; fold in the deferred R2 load-config (`fp16_weights` / `quantize_embed` into
+  `BackendConfig`) + the per-instance policy threading the weight seam now makes reachable.
 
 ### R4 — split the monolith (mechanical, zero parity risk)  ⬜
 - **Change:** carve `cuda_backend.cu` into translation units by concern:

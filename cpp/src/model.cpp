@@ -82,21 +82,23 @@ Model::Model(const std::string& weights_dir, QuantMode mode, Device device) {
     // the codes+scale go to device buffers driving cuda_embedding_q8/cuda_linear_q8. Runs BEFORE the
     // CUDA upload loop so the fp32 embed is erased here and not uploaded again below.
     if (g_quantize_embed) {
-        QTensor q = quantize_q8(W("embed_tokens.weight"));
-        w_.erase("embed_tokens.weight");
+        // Build the tied embed/lm_head as a weight-only int8 Weight (the biggest single weight): the
+        // gather dequantizes a row, the lm_head runs linear_q8 — fp32 activations into argmax, so only
+        // the weight rounds. The CPU/CUDA int8-embed BUILDERS are the only #ifdef left here (R3c moves
+        // it behind a backend factory); the gather/linear DISPATCH below is already #ifdef-free. Runs
+        // before to_resident so the fp32 embed is consumed here, not uploaded again.
 #ifdef NI_CUDA
         if (device == Device::CUDA) {
-            embed_q8_codes_ = std::make_unique<Tensor>(to_device_i8(q.q.data(), {q.out, q.in}));
-            Tensor sc({q.out});
-            for (int64_t o = 0; o < q.out; ++o) sc[o] = q.scale[static_cast<size_t>(o)];
-            embed_q8_scale_ = std::make_unique<Tensor>(to_device(sc));
+            embed_ = make_cuda_q8_embed(W("embed_tokens.weight"));
+            w_.erase("embed_tokens.weight");
             // Untied lm_head on CUDA isn't wired (Qwen2.5 is tied); the CPU branch handles untied.
         } else
 #endif
         {
-            embed_q8_ = std::make_unique<QTensor>(std::move(q));
+            embed_ = make_q8_embed(W("embed_tokens.weight"));
+            w_.erase("embed_tokens.weight");
             if (!cfg_.tie_word_embeddings && w_.count("lm_head.weight")) {
-                lmhead_q8_ = std::make_unique<QTensor>(quantize_q8(W("lm_head.weight")));
+                lm_head_ = make_q8_embed(W("lm_head.weight"));
                 w_.erase("lm_head.weight");
             }
         }
@@ -124,6 +126,21 @@ Model::Model(const std::string& weights_dir, QuantMode mode, Device device) {
             w_.erase(n);
         }
     }
+
+    // R3b: wrap the dense (non-int8) embedding / output projection — now device-resident — as a
+    // DenseWeight, so embed_tokens()/lm_head() dispatch through the Weight seam with no #ifdef. A
+    // tied model has only embed_tokens.weight (the exporter drops the duplicate lm_head): lm_head_
+    // stays null and lm_head() reuses embed_. An untied checkpoint gets its own lm_head_. (When
+    // g_quantize_embed already built an int8 embed_/lm_head_ above, these are skipped.)
+    if (!embed_) {
+        embed_ = std::make_unique<DenseWeight>(backend_.get(),
+                                               std::move(w_.at("embed_tokens.weight")));
+        w_.erase("embed_tokens.weight");
+    }
+    if (!lm_head_ && !cfg_.tie_word_embeddings && w_.count("lm_head.weight")) {
+        lm_head_ = std::make_unique<DenseWeight>(backend_.get(), std::move(w_.at("lm_head.weight")));
+        w_.erase("lm_head.weight");
+    }
 }
 
 KVCache Model::make_cache(int64_t max_seq) const {
@@ -145,28 +162,17 @@ Tensor Model::project(const Tensor& x, const std::string& name, const Tensor* bi
 }
 
 Tensor Model::embed_tokens(const std::vector<int64_t>& ids) const {
-    // Weight-only int8 gather when the embed weight is quantized (g_quantize_embed), else the
-    // backend's fp32/device gather (which also reads the fp16 table under g_cuda_fp16_weights).
-#ifdef NI_CUDA
-    if (embed_q8_codes_) return cuda_embedding_q8(*embed_q8_codes_, *embed_q8_scale_, ids);
-#endif
-    if (embed_q8_) return embedding_q8(*embed_q8_, ids);
-    return backend_->embedding(W("embed_tokens.weight"), ids);
+    // R3b: one Weight::gather — DenseWeight (backend gather, fp32/fp16) or an int8-embed Weight
+    // (embedding_q8 / cuda_embedding_q8). No device or quant branch here.
+    return embed_->gather(ids);
 }
 
 Tensor Model::lm_head(const Tensor& x) const {
-#ifdef NI_CUDA
-    // Tied int8 on CUDA: the lm_head reads the same device codes+scale as the gather (cuda_linear_q8).
-    if (embed_q8_codes_) return cuda_linear_q8(x, *embed_q8_codes_, *embed_q8_scale_, nullptr);
-#endif
-    // Tied models reuse embed_q8_ as the output projection; an untied checkpoint has its own
-    // lmhead_q8_. Either way linear_q8 is weight-only int8 (fp32 activations × int8 weight).
-    const QTensor* lmq = lmhead_q8_ ? lmhead_q8_.get() : embed_q8_.get();
-    if (lmq) return linear_q8(x, *lmq, nullptr);
-    // fp32/device path: tied models share the embedding (the exporter skips the duplicate
-    // lm_head.weight), so fall back to embed_tokens here.
-    const std::string lm = cfg_.tie_word_embeddings ? "embed_tokens.weight" : "lm_head.weight";
-    return backend_->linear(x, W(lm), nullptr);
+    // R3b: a tied model reuses the embedding weight as the output projection (the exporter drops the
+    // duplicate lm_head.weight); an untied checkpoint has its own lm_head_. Either way one
+    // Weight::linear — dense (fp32/fp16) or weight-only int8 — with no device/format branch.
+    const Weight& lm = lm_head_ ? *lm_head_ : *embed_;
+    return lm.linear(x, nullptr);
 }
 
 std::pair<int64_t, int64_t> Model::weight_bytes() const {
@@ -182,21 +188,15 @@ std::pair<int64_t, int64_t> Model::weight_bytes() const {
         actual += kv.second->bytes();
         fp32 += kv.second->fp32_bytes();
     }
-    // The int8 embed/lm_head (G5d): int8 codes + fp32 row scales, vs out*in*4 fp32.
-    if (embed_q8_) {
-        actual += int64_t(embed_q8_->q.size()) + int64_t(embed_q8_->scale.size()) * 4;
-        fp32 += embed_q8_->out * embed_q8_->in * 4;
+    // R3b: the embedding + (untied) output projection report their own bytes through the Weight seam
+    // — DenseWeight (fp16/fp32) or an int8-embed Weight — so the old #ifdef'd device-int8 accounting
+    // is gone. A tied model has lm_head_ == null (embed_ doubles as the lm_head, counted once).
+    actual += embed_->bytes();
+    fp32 += embed_->fp32_bytes();
+    if (lm_head_) {
+        actual += lm_head_->bytes();
+        fp32 += lm_head_->fp32_bytes();
     }
-    if (lmhead_q8_) {
-        actual += int64_t(lmhead_q8_->q.size()) + int64_t(lmhead_q8_->scale.size()) * 4;
-        fp32 += lmhead_q8_->out * lmhead_q8_->in * 4;
-    }
-#ifdef NI_CUDA
-    if (embed_q8_codes_) {  // device int8 embed: codes 1 byte/elem + fp32 scales, vs out*in*4 fp32
-        actual += embed_q8_codes_->numel() + embed_q8_scale_->numel() * 4;
-        fp32 += embed_q8_codes_->numel() * 4;
-    }
-#endif
     return {actual, fp32};
 }
 

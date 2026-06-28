@@ -28,6 +28,11 @@ namespace ni {
 // int8 compute through the same Weight interface as the CPU quant modes (no forward change).
 std::unique_ptr<Weight> make_cuda_w8a8(const Tensor& w);
 
+// R3b: the CUDA mirror of make_q8_embed — quantize the tied embed/lm_head to per-channel int8,
+// upload the codes + per-row scale to the device, and wrap them as a Weight whose gather() runs
+// cuda_embedding_q8 and linear() runs cuda_linear_q8. The device int8-embed Weight.
+std::unique_ptr<Weight> make_cuda_q8_embed(const Tensor& host);
+
 // R2: the kernel-selection policy — the bench/diagnostic and opt-in knobs that pick WHICH CUDA
 // kernel a dispatch launches, consolidated from seven scattered g_cuda_* globals into one cohesive,
 // typed object. Reached via cuda_policy() (still a file-scope instance: the readers include the

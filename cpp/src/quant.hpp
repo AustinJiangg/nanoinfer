@@ -107,11 +107,20 @@ class Weight {
 public:
     virtual ~Weight() = default;
     virtual Tensor linear(const Tensor& x, const Tensor* bias) const = 0;
+    // Embedding gather (R3b): out[r,:] = weight[ids[r],:]. Only the embedding weight implements it;
+    // the default (quant.cpp) throws so a projection weight gathered by mistake fails loudly.
+    // DenseWeight (backend.hpp) and the int8-embed weights override it.
+    virtual Tensor gather(const std::vector<int64_t>& ids) const;
     virtual int64_t bytes() const = 0;       // actual storage
     virtual int64_t fp32_bytes() const = 0;  // out*in*4 (the unquantized size)
 };
 
 // Quantize `w` into a Weight of the given mode (nullptr for None).
 std::unique_ptr<Weight> make_quantized(const Tensor& w, QuantMode mode);
+
+// R3b: the tied token-embedding / lm_head as a weight-only int8 Weight (the biggest single weight).
+// gather() dequantizes a looked-up row (embedding_q8); linear() runs linear_q8 — fp32 activations
+// into argmax. The CPU int8-embed Weight; the CUDA mirror is make_cuda_q8_embed (cuda_backend.hpp).
+std::unique_ptr<Weight> make_q8_embed(const Tensor& w);
 
 }  // namespace ni

@@ -1693,6 +1693,34 @@ std::unique_ptr<Weight> make_cuda_w8a8(const Tensor& w) {
     return std::make_unique<CudaW8A8Weight>(std::move(wq), to_device(ws), q.out, q.in);
 }
 
+// R3b: the device int8-embed Weight (the CUDA mirror of EmbedQ8Weight). Holds the codes + per-row
+// scale on the GPU; gather() runs cuda_embedding_q8 (dequant a looked-up row), linear() runs the
+// weight-only int8 cuda_linear_q8 (the tied lm_head) — fp32 activations into argmax.
+namespace {
+class CudaEmbedQ8Weight : public Weight {
+    Tensor codes_;  // device int8 [vocab, hidden]
+    Tensor scale_;  // device fp32 [vocab]
+public:
+    CudaEmbedQ8Weight(Tensor codes, Tensor scale) : codes_(std::move(codes)), scale_(std::move(scale)) {}
+    Tensor linear(const Tensor& x, const Tensor* bias) const override {
+        return cuda_linear_q8(x, codes_, scale_, bias);
+    }
+    Tensor gather(const std::vector<int64_t>& ids) const override {
+        return cuda_embedding_q8(codes_, scale_, ids);
+    }
+    int64_t bytes() const override { return codes_.numel() + scale_.numel() * 4; }
+    int64_t fp32_bytes() const override { return codes_.numel() * 4; }
+};
+}  // namespace
+
+std::unique_ptr<Weight> make_cuda_q8_embed(const Tensor& host) {
+    QTensor q = quantize_q8(host);  // per-channel int8, then upload codes + per-row scale once
+    Tensor codes = to_device_i8(q.q.data(), {q.out, q.in});
+    Tensor sc({q.out});
+    for (int64_t o = 0; o < q.out; ++o) sc[o] = q.scale[static_cast<size_t>(o)];
+    return std::make_unique<CudaEmbedQ8Weight>(std::move(codes), to_device(sc));
+}
+
 Device CudaBackend::device() const { return Device::CUDA; }
 
 // After a launch, check the launch config (cheap, immediate). The device sync that used to

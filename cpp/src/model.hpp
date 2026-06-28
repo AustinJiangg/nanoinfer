@@ -91,18 +91,13 @@ private:
     // for fp32/fp16, a quant weight for Q8/Q4/Q4G/W8A8 — so Model::project dispatches through one
     // pointer with no device/format branch (the seam that makes the Backend abstraction complete).
     std::unordered_map<std::string, std::unique_ptr<Weight>> weights_;
-    // Weight-only int8 (Q8) for the tied token-embedding / output-projection — the biggest single
-    // weight. Built when g_quantize_embed is set (CPU; CUDA next). The gather dequantizes a row
-    // (embedding_q8); the tied lm_head runs linear_q8. lmhead_q8_ is non-null only for an untied
-    // checkpoint (otherwise the lm_head reuses embed_q8_).
-    std::unique_ptr<QTensor> embed_q8_;
-    std::unique_ptr<QTensor> lmhead_q8_;
-#ifdef NI_CUDA
-    // The CUDA mirror of embed_q8_ (G5d): int8 codes [vocab, hidden] + fp32 per-row scale, resident on
-    // the device. The gather (cuda_embedding_q8) and the tied lm_head (cuda_linear_q8) read these.
-    // unique_ptr so "unset" is just null (no Tensor default ctor needed). Untied-on-CUDA isn't wired.
-    std::unique_ptr<Tensor> embed_q8_codes_, embed_q8_scale_;
-#endif
+    // R3b: the token-embedding and output-projection as Weights, so embed_tokens()/lm_head() dispatch
+    // through one pointer with no #ifdef. embed_ does BOTH gather() (the embedding) and linear() (the
+    // tied lm_head); it is a DenseWeight (fp32/fp16) normally, or an int8-embed Weight under
+    // g_quantize_embed (EmbedQ8Weight on CPU, the device mirror on CUDA — the biggest single weight).
+    // lm_head_ is non-null only for an UNTIED checkpoint; a tied model leaves it null and reuses embed_.
+    std::unique_ptr<Weight> embed_;
+    std::unique_ptr<Weight> lm_head_;
     RopeCache rope_;  // built once for max_position_embeddings, sliced per forward
 };
 

@@ -111,6 +111,9 @@ public:
     Tensor linear(const Tensor& x, const Tensor* bias) const override {
         return backend_->linear(x, w_, bias);
     }
+    Tensor gather(const std::vector<int64_t>& ids) const override {  // R3b: the embed table case
+        return backend_->embedding(w_, ids);
+    }
     int64_t bytes() const override { return w_.numel() * (w_.dtype() == DType::F16 ? 2 : 4); }
     int64_t fp32_bytes() const override { return w_.numel() * 4; }
 

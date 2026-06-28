@@ -423,6 +423,18 @@ public:
     }
     int64_t fp32_bytes() const override { return t_.out * t_.in * 4; }
 };
+// R3b: the tied embedding / lm_head as weight-only int8 — a QTensor that BOTH gathers (embedding_q8,
+// for embed_tokens) and projects (linear_q8, for the tied lm_head). The one quant weight that
+// overrides gather(); the projection weights above keep the throwing default.
+class EmbedQ8Weight : public Weight {
+    QTensor t_;
+public:
+    explicit EmbedQ8Weight(QTensor t) : t_(std::move(t)) {}
+    Tensor linear(const Tensor& x, const Tensor* bias) const override { return linear_q8(x, t_, bias); }
+    Tensor gather(const std::vector<int64_t>& ids) const override { return embedding_q8(t_, ids); }
+    int64_t bytes() const override { return int64_t(t_.q.size()) + int64_t(t_.scale.size()) * 4; }
+    int64_t fp32_bytes() const override { return t_.out * t_.in * 4; }
+};
 }  // namespace
 
 std::unique_ptr<Weight> make_quantized(const Tensor& w, QuantMode mode) {
@@ -434,6 +446,16 @@ std::unique_ptr<Weight> make_quantized(const Tensor& w, QuantMode mode) {
         case QuantMode::None: return nullptr;
     }
     return nullptr;
+}
+
+// R3b: gather() is meaningful only for the embedding weight; a projection weight gathered by mistake
+// fails loudly rather than silently. DenseWeight and EmbedQ8Weight (+ the CUDA mirror) override it.
+Tensor Weight::gather(const std::vector<int64_t>&) const {
+    throw std::runtime_error("Weight::gather: this weight is not an embedding table");
+}
+
+std::unique_ptr<Weight> make_q8_embed(const Tensor& w) {
+    return std::make_unique<EmbedQ8Weight>(quantize_q8(w));
 }
 
 }  // namespace ni
