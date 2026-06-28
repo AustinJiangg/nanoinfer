@@ -36,6 +36,19 @@ int sm_count();
 // How many KV splits Flash-Decoding should use for nq = H*sq query pairs over key length sk (1 = none).
 int split_count(int64_t nq, int64_t sk);
 
+// Post-launch error check (cheap, immediate). The per-op device sync was dropped in G5 — kernels run
+// ordered on the one default stream, so correctness needs no per-op sync (results are read only through
+// to_host's synchronizing D2H). Header-inline so every kernel TU shares it; `what` labels the launch.
+inline void launch_check(const char* what) { cuda_check(cudaGetLastError(), what); }
+
+// G6 (CUDA graphs): the per-step DECODE inputs, made device-resident so ONE captured graph spans all
+// steps (nullptr = eager, the kernels use their host-int args — bit-identical). Defined in
+// cuda_backend.cu; read by rope/embedding (cuda_elementwise.cu) and the paged attention kernels.
+// g_cuda_graph_pos: the KV length / write position; g_cuda_graph_token: the decode token id the
+// embedding gathers from instead of a host id-upload (a sync H2D, illegal inside a capture).
+extern const int64_t* g_cuda_graph_pos;
+extern const int64_t* g_cuda_graph_token;
+
 constexpr int kBlock = 256;
 // The m at/below which linear() is memory-bound and runs the warp-per-output GEMV (decode) instead of
 // the compute-bound tiled GEMM (prefill). Shared by the fp32/fp16 linear() and the int8 cuda_linear_q8.
