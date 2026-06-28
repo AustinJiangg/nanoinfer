@@ -185,7 +185,7 @@ parity-gated; mechanical moves (zero parity risk) last, landing on stabilized co
   per-instance (the weight seam now makes both reachable). This changes the `Model` constructor
   signature + the binding + the few tests that set those globals, so it is its own follow-up.
 
-### R4 — split the monolith (mechanical, zero parity risk)  ⬜
+### R4 — split the monolith (mechanical, zero parity risk)  ✅
 - **Change:** carve `cuda_backend.cu` into translation units by concern:
   `cuda_runtime.cu` (alloc/pool/H2D/D2H/probe/sm_count), `cuda_gemm.cu`,
   `cuda_quant.cu`, `cuda_attention.cu` (incl. split/combine), `cuda_elementwise.cu`,
@@ -210,11 +210,19 @@ parity-gated; mechanical moves (zero parity risk) last, landing on stabilized co
   movement: 23/23 ctest, parity digit-identical (CUDA fp32 `3.76701e-05`, paged/batch `=0`), and the
   **graph-decode golden tokens still match** — the single-shared-pool invariant (capture-time pool
   addresses) survives the TU split, the one real risk here.
-- **Remaining — R4b:** extract `cuda_gemm.cu` (the GEMM kernels + `CudaBackend::linear`),
-  `cuda_quant.cu` (int8 kernels + `cuda_linear_*` + the W8A8/int8-embed weights + factories), and
-  `cuda_elementwise.cu` (embedding/rmsnorm/silu/mul/add/split/merge/repeat/rope + their methods), each
-  including `cuda_internal.cuh`. `cuda_backend.cu` then keeps attention + paged + cache + graph + the
-  globals (the coupled core). A `metal/` skeleton can mirror the same layout.
+- **Progress — R4b landed  ✅ (gemm / quant / elementwise extracted):** `cuda_gemm.cu` (722 — the 8
+  matmul kernels + `CudaBackend::linear`), `cuda_quant.cu` (335 — the int8 W8A8/Q8 kernels +
+  `cuda_linear_*` + the device weight wrappers/factories + the quant-weight factory methods), and
+  `cuda_elementwise.cu` (222 — embedding/rmsnorm/silu/mul/add/split/merge/repeat/rope + their methods),
+  each including `cuda_internal.cuh` and launching only its own kernels (whole-program-safe).
+  `launch_check` became header-inline; the graph-decode globals got extern decls (read by the
+  elementwise TU's captured embedding/rope). `cuda_backend.cu` keeps the coupled core — transfers +
+  `f32_to_f16` + attention + paged + cache + graph + globals. **`cuda_backend.cu` 2323 → 938 lines
+  (−60%)**, now five focused CUDA TUs + a shared header. Pure code movement: 23/23 ctest, parity
+  digit-identical (CUDA fp32 `3.76701e-05`, W8A8/emb8/full-int8 bytes + golden, cache/paged/batch
+  `=0`), and the **graph-decode golden tokens still match** (the single-shared-pool + the device graph
+  globals survive the split). A `metal/` skeleton can now mirror this layout.
+- **R4 done.**
 
 ### R5 — (optional) tighten the CPU side symmetrically  ⬜
 - **Change:** push the same weight-seam / format-enum down into `ops.cpp` / `quant.cpp`
