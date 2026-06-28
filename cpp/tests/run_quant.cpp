@@ -37,10 +37,11 @@ int main(int argc, char** argv) {
     // int8 (G5d) — the biggest single weight, and it feeds argmax, so this run IS the token guard.
     // Pair with `none` to isolate the embed/lm_head, or with a layer mode for the full int8 model.
     const bool embed_q8 = argc > 3 && std::string(argv[3]) == "embed";
-    ni::g_quantize_embed = embed_q8;
     const std::string label = mode_str + (embed_q8 ? "+embed8" : "");
     try {
-        ni::Model model(dir, mode);
+        ni::BackendConfig cfg;
+        cfg.quantize_embed = embed_q8;
+        ni::Model model(dir, mode, ni::Device::CPU, cfg);
         std::printf("quant mode: %s\n", label.c_str());
         std::vector<int64_t> ids = read_ids(dir + "/ref_ids.txt");
 

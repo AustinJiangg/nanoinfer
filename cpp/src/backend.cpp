@@ -65,10 +65,10 @@ std::unique_ptr<KVCacheBase> CpuBackend::make_kv_cache(int64_t num_layers, int64
 
 // The former #ifdef ladder in Model's constructor, isolated to one spot so the model is
 // device-agnostic. CUDA is only reachable in an -DNI_CUDA build; otherwise this throws for it.
-std::unique_ptr<Backend> make_backend(Device device, const BackendConfig&) {
+std::unique_ptr<Backend> make_backend(Device device, [[maybe_unused]] const BackendConfig& cfg) {
     if (device == Device::CPU) return std::make_unique<CpuBackend>();
 #ifdef NI_CUDA
-    if (device == Device::CUDA) return std::make_unique<CudaBackend>();
+    if (device == Device::CUDA) return std::make_unique<CudaBackend>(cfg);
 #endif
     throw std::runtime_error(
         "make_backend: backend for this device is not built — rebuild with -DNI_CUDA=ON");

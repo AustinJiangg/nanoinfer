@@ -69,7 +69,7 @@ public:
     // weight stays a host tensor). CUDA: H2D upload — as fp16 when fp16_eligible AND the backend's
     // fp16-weights mode is on (the big projections/embed), else fp32. The model calls this in a
     // plain loop over its norms/biases/embed, with no #ifdef and no device global in sight — the
-    // fp16 decision (g_cuda_fp16_weights) lives inside the CUDA override.
+    // fp16 decision (the backend's fp16_weights config) lives inside the CUDA override.
     virtual Tensor to_resident(Tensor weight, bool /*fp16_eligible*/) { return weight; }
 
     // R3c: the backend as weight factory, so the model builds quantized weights with no #ifdef.
@@ -136,10 +136,17 @@ private:
     Tensor w_;
 };
 
-// R1: construction-time backend configuration. Empty today; R2 grows it (GemmVariant,
-// AttnVariant, fp16_weights, quantize_embed) so the ~11 mutable g_cuda_* globals become
-// typed, per-instance policy instead of process-global A/B switches.
-struct BackendConfig {};
+// Construction-time backend/model configuration — the typed, per-instance home for what were
+// load-time globals (the de-globalization the R1/R2 comments anticipated). fp16_weights: the CUDA
+// backend uploads the big eligible weights (layer projections + the tied embed/lm_head) as fp16, half
+// the DRAM bytes (G5d) — read in CudaBackend::to_resident. quantize_embed: weight-only int8 for the
+// tied token-embedding / lm_head (G5d), read in the Model ctor (CPU + CUDA). Threaded Model ctor ->
+// make_backend -> CudaBackend. (The kernel-selection CudaPolicy folds in next; CUDA-graph state stays
+// per-call.)
+struct BackendConfig {
+    bool fp16_weights = false;
+    bool quantize_embed = false;
+};
 
 // The single place that maps a Device to its concrete backend — the former #ifdef ladder in
 // Model's constructor, now isolated here. Throws if that device's backend wasn't compiled in

@@ -66,15 +66,6 @@ struct CudaPolicy {
 // cuda_policy().use_dbuf = true etc. instead of the former loose g_cuda_* globals.
 CudaPolicy& cuda_policy();
 
-// Opt-in (G5d): upload the big weights as fp16 (half the DRAM bytes) — the layer projections
-// plus the token embedding / tied lm_head (embed_tokens, the single largest weight). Set it
-// BEFORE constructing a CUDA Model — the conversion happens at the once-per-load upload; the
-// linear dispatch then routes fp16 weights through the GEMV/wmma fp16 paths (so fp16 weights
-// force the tensor-core kernel for prefill), and the embedding gather reads the fp16 table
-// directly. Default off; not thread-safe. (Load-config, not kernel selection — folds into the
-// R3 weight seam alongside g_quantize_embed.)
-extern bool g_cuda_fp16_weights;
-
 // G6 (CUDA graphs): when true, Model::forward leaves the logits ON DEVICE (skips the final D2H) so a
 // graph driver can capture the forward and do its own D2H after replay — a sync D2H can't be captured.
 // Set only by CudaGraphDecoder around a capture; default false (eager D2Hs at the edge as before).
@@ -83,6 +74,10 @@ extern bool g_cuda_keep_device_logits;
 
 class CudaBackend : public Backend {
 public:
+    // R-track de-globalization: the fp16-weights decision (was the g_cuda_fp16_weights global) is now a
+    // per-instance config field, read in to_resident. make_backend(device, cfg) constructs it with cfg.
+    explicit CudaBackend(BackendConfig config = {}) : config_(config) {}
+
     Device device() const override;
 
     Tensor linear(const Tensor& x, const Tensor& weight, const Tensor* bias) override;
@@ -109,11 +104,14 @@ public:
     std::unique_ptr<KVCacheBase> make_kv_cache(int64_t num_layers, int64_t n_kv_heads,
                                                int64_t head_dim, int64_t max_seq) override;
     Tensor finalize_logits(Tensor logits) override;
-    // R3: H2D upload at load (fp16 for the big eligible weights under g_cuda_fp16_weights, else fp32).
+    // R3: H2D upload at load (fp16 for the big eligible weights under config_.fp16_weights, else fp32).
     Tensor to_resident(Tensor weight, bool fp16_eligible) override;
     // R3c: device weight construction (the model's quant-build #ifdefs, now behind the Backend).
     std::unique_ptr<Weight> make_quant_weight(const Tensor& host, QuantMode mode) override;
     std::unique_ptr<Weight> make_embed_weight(const Tensor& host) override;
+
+private:
+    BackendConfig config_;  // fp16_weights (read in to_resident); grows with the kernel CudaPolicy next
 };
 
 // Device-resident KV cache (G3). Each layer's K/V is a contiguous [n_kv, len, head_dim]

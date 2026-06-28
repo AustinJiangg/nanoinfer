@@ -102,7 +102,8 @@ int main(int argc, char** argv) {
         }
         // NI_FP16W=1 uploads the layer weights as fp16 (G5d) — must be set before the Model
         // is built, since the conversion happens at the once-per-load upload.
-        if (const char* e = std::getenv("NI_FP16W")) g_cuda_fp16_weights = (e[0] == '1');
+        BackendConfig cfg;
+        if (const char* e = std::getenv("NI_FP16W")) cfg.fp16_weights = (e[0] == '1');
         // NI_NAIVE_ATTN=1 forces the naive one-thread-per-query attention (G5e A/B): hold the GEMM
         // path fixed and toggle only attention to isolate its prefill/decode contribution.
         if (const char* e = std::getenv("NI_NAIVE_ATTN")) cuda_policy().force_naive_attn = (e[0] == '1');
@@ -121,12 +122,12 @@ int main(int argc, char** argv) {
         // GEMV in both runs). Must be set before the Model is built (the quantize happens at load).
         if (const char* e = std::getenv("NI_QEMBED")) {
             g_ab_int8_lmhead = (e[0] == '1');
-            g_quantize_embed = g_ab_int8_lmhead;
+            cfg.quantize_embed = g_ab_int8_lmhead;
         }
-        Model model(dir, QuantMode::None, Device::CUDA);
+        Model model(dir, QuantMode::None, Device::CUDA, cfg);
         const int64_t vocab = model.config().vocab_size;
         std::printf("layer weights: %s; KV cache: %s; A/B: %s\n",
-                    g_cuda_fp16_weights ? "fp16 (G5d)" : "fp32",
+                    cfg.fp16_weights ? "fp16 (G5d)" : "fp32",
                     use_paged ? "paged (G4b)" : "contiguous (G3)",
                     g_ab_int8_lmhead ? "int8 lm_head tiled vs GEMV" : "layer GEMM naive vs GEMV");
 

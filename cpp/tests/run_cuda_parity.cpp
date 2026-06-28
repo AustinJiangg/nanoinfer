@@ -102,9 +102,9 @@ int main(int argc, char** argv) {
         // single largest weight). Does the whole model at fp16 still match the golden tokens? Not
         // gated — fp16 may flip a close argmax (esp. now the lm_head logits are fp16); the measured
         // cost is the logit max|diff| and whether the tokens hold. Also reports the storage win. ---
-        g_cuda_fp16_weights = true;
-        Model model16(dir, QuantMode::None, Device::CUDA);
-        g_cuda_fp16_weights = false;
+        BackendConfig cfg16;
+        cfg16.fp16_weights = true;
+        Model model16(dir, QuantMode::None, Device::CUDA, cfg16);
         double maxd16 = 0.0;
         {
             Tensor lg = model16.forward(ids);
@@ -156,10 +156,10 @@ int main(int argc, char** argv) {
         // the CPU oracle. Like W8A8 it feeds argmax, so this is the token guard (informational, not
         // gated). First the embed/lm_head int8 ALONE (layers fp32), then the full int8 GPU model
         // (W8A8 layers + int8 embed) for the memory headline. ---
-        g_quantize_embed = true;
-        Model modele(dir, QuantMode::None, Device::CUDA);     // int8 embed/lm_head, fp32 layers
-        Model modelfull(dir, QuantMode::W8A8, Device::CUDA);  // int8 layers (DP4A) + int8 embed
-        g_quantize_embed = false;
+        BackendConfig cfge;
+        cfge.quantize_embed = true;
+        Model modele(dir, QuantMode::None, Device::CUDA, cfge);     // int8 embed/lm_head, fp32 layers
+        Model modelfull(dir, QuantMode::W8A8, Device::CUDA, cfge);  // int8 layers (DP4A) + int8 embed
         auto greedy = [&](Model& mdl) {
             std::vector<int64_t> ctx = ids, out;
             for (size_t t = 0; t < ref_gen.size(); ++t) {

@@ -18,7 +18,7 @@ bool cuda_available();
 Tensor to_device(const Tensor& host);
 
 // Copy a CPU tensor to the GPU AND convert it to fp16 (a half device buffer). Used once at
-// load for the layer weights when g_cuda_fp16_weights is set — halves their DRAM bytes (G5d).
+// load for the layer weights when the backend's fp16_weights config is set — halves their DRAM bytes (G5d).
 // The returned tensor has device()==CUDA and dtype()==F16.
 Tensor to_device_f16(const Tensor& host);
 

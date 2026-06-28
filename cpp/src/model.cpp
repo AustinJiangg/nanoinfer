@@ -25,7 +25,7 @@ bool is_layer_proj(const std::string& name) {
            name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
-// Weights uploaded as fp16 when g_cuda_fp16_weights is on (G5d): the layer projections PLUS the
+// Weights uploaded as fp16 when the backend's fp16_weights config is on (G5d): the layer projections PLUS the
 // big token embedding / output projection. embed_tokens (vocab×hidden) is the single largest
 // weight — ~136M params, ~544 MB in fp32, and tied as the lm_head — so storing it as half is the
 // biggest single memory win; fp32-accumulated, it keeps the golden tokens. "lm_head.weight"
@@ -35,14 +35,11 @@ bool is_fp16_weight(const std::string& name) {
 }
 }  // namespace
 
-// Default off; a caller (test/bench) sets it before constructing a Model. See model.hpp.
-bool g_quantize_embed = false;
-
-Model::Model(const std::string& weights_dir, QuantMode mode, Device device) {
+Model::Model(const std::string& weights_dir, QuantMode mode, Device device, BackendConfig cfg) {
     // The Backend is the device-dispatch seam (G0): forward() below is written once against it.
     // make_backend (R1) is the one place that maps a Device to its concrete backend — it throws
     // for a device whose backend wasn't compiled in, so callers fail loudly rather than silently.
-    backend_ = make_backend(device);
+    backend_ = make_backend(device, cfg);
 
     cfg_ = load_config(weights_dir + "/config.txt");
     for (const auto& entry : fs::directory_iterator(weights_dir)) {
@@ -76,7 +73,7 @@ Model::Model(const std::string& weights_dir, QuantMode mode, Device device) {
     // CUDA — so the gather dequantizes a looked-up row and the tied lm_head runs the weight-only int8
     // linear, fp32 activations into argmax (only the weight rounds). Runs BEFORE to_resident so the
     // fp32 embed is consumed here, not uploaded again. R3c: no device #ifdef — the backend decides.
-    if (g_quantize_embed) {
+    if (cfg.quantize_embed) {
         embed_ = backend_->make_embed_weight(W("embed_tokens.weight"));
         w_.erase("embed_tokens.weight");
         if (!cfg_.tie_word_embeddings && w_.count("lm_head.weight")) {
@@ -87,7 +84,7 @@ Model::Model(const std::string& weights_dir, QuantMode mode, Device device) {
 
     // R3: make every remaining weight + the RoPE tables resident on the compute device, once at
     // load (CPU: identity; CUDA: H2D, fp16 for the big eligible weights — the GPU analogue of C5's
-    // "stream each weight once"). The device knowledge and the g_cuda_fp16_weights read moved into
+    // "stream each weight once"). The device knowledge and the fp16_weights decision live in
     // CudaBackend::to_resident, so this loop carries no #ifdef and names no device global.
     for (auto& kv : w_)
         kv.second = backend_->to_resident(std::move(kv.second), is_fp16_weight(kv.first));
@@ -112,7 +109,7 @@ Model::Model(const std::string& weights_dir, QuantMode mode, Device device) {
     // DenseWeight, so embed_tokens()/lm_head() dispatch through the Weight seam with no #ifdef. A
     // tied model has only embed_tokens.weight (the exporter drops the duplicate lm_head): lm_head_
     // stays null and lm_head() reuses embed_. An untied checkpoint gets its own lm_head_. (When
-    // g_quantize_embed already built an int8 embed_/lm_head_ above, these are skipped.)
+    // cfg.quantize_embed already built an int8 embed_/lm_head_ above, these are skipped.)
     if (!embed_) {
         embed_ = std::make_unique<DenseWeight>(backend_.get(),
                                                std::move(w_.at("embed_tokens.weight")));

@@ -583,10 +583,6 @@ Device CudaBackend::device() const { return Device::CUDA; }
 CudaPolicy g_cuda_policy;
 CudaPolicy& cuda_policy() { return g_cuda_policy; }
 
-// Opt-in switch (see cuda_backend.hpp) to upload the layer weights as fp16 (G5d). Load-config, not
-// kernel selection — folds into the R3 weight seam alongside g_quantize_embed.
-bool g_cuda_fp16_weights = false;
-
 // G6 (CUDA graphs): the per-step DECODE inputs, made device-resident so ONE captured graph spans all
 // steps. The graph driver (CudaGraphDecoder) points these at its device int64 buffers before capture
 // and updates the buffers' CONTENTS each step (the graph reads them by pointer). nullptr = eager mode
@@ -667,10 +663,10 @@ Tensor CudaBackend::finalize_logits(Tensor logits) {
 
 Tensor CudaBackend::to_resident(Tensor weight, bool fp16_eligible) {
     // Upload a host weight to the GPU once, at load. The big eligible weights (layer projections /
-    // embedding) go up as fp16 when g_cuda_fp16_weights is set — half the DRAM bytes — and the
+    // embedding) go up as fp16 when config_.fp16_weights is set — half the DRAM bytes — and the
     // linear/embedding dispatch reads the F16 dtype directly; everything else (norms, biases, the
-    // RoPE tables) stays fp32. The g_cuda_fp16_weights read lives here, not in the model (R3).
-    return (fp16_eligible && g_cuda_fp16_weights) ? to_device_f16(weight) : to_device(weight);
+    // RoPE tables) stays fp32. The fp16 decision is a per-instance config field now, not a global.
+    return (fp16_eligible && config_.fp16_weights) ? to_device_f16(weight) : to_device(weight);
 }
 
 // --- Device-resident KV cache (G3) ---

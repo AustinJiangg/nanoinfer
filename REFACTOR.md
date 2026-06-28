@@ -180,10 +180,22 @@ parity-gated; mechanical moves (zero parity risk) last, landing on stabilized co
   `#ifdef NI_CUDA` over the whole keystone: **11 (pre-R1) → 7 (R1) → 6 (R3a) → 3 (R3b) → 0 (R3c)**.
   Every BASELINE number digit-identical (W8A8 907, emb8 1571, full-int8 499 MB, fp16 991, all golden,
   bit-identical gates `=0`); 23/23 ctest; CPU-only build clean.
-- **R3 done.** Deferred (a distinct goal — *global elimination*, not `#ifdef` removal): fold
-  `fp16_weights` / `quantize_embed` into `BackendConfig` and thread the kernel `CudaPolicy`
-  per-instance (the weight seam now makes both reachable). This changes the `Model` constructor
-  signature + the binding + the few tests that set those globals, so it is its own follow-up.
+- **R3 done.** Deferred follow-up (a distinct goal — *global elimination*, not `#ifdef` removal),
+  **partly landed**:
+  - ✅ **load-config globals** — `g_cuda_fp16_weights` + `g_quantize_embed` folded into a typed,
+    per-instance `BackendConfig` (`fp16_weights` / `quantize_embed`), threaded `Model` ctor →
+    `make_backend` → `CudaBackend` (stored as `config_`, read in `to_resident`); the `Model` ctor reads
+    `cfg.quantize_embed`. The 4 tests that set them migrated to `BackendConfig` (or a local bool for the
+    standalone `run_cuda_bench` microbench — the A/B retyped, not removed). 23/23 ctest, every BASELINE
+    number byte-identical, CPU-only build clean. **This is the de-globalization that affected *what model
+    you build*** — the part that mattered.
+  - ⬜ **kernel `CudaPolicy` per-instance** — deferred by design: it is bench/diagnostic scaffolding
+    (`force_naive`, `use_dbuf`, …), read by a free function (`cuda_linear_q8`) and
+    `CudaPagedKVCache::attend` that hold no backend pointer (R2's documented entanglement), so making it
+    per-instance means threading it through weight/cache construction — wide, risky, and lower value than
+    the load-config half. The 3 CUDA-graph globals are likewise per-call state on a single driver. Both
+    stay documented file-scope state until/unless reentrancy is actually needed (e.g. two policies in one
+    process for a parallel A/B).
 
 ### R4 — split the monolith (mechanical, zero parity risk)  ✅
 - **Change:** carve `cuda_backend.cu` into translation units by concern:

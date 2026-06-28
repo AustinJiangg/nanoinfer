@@ -87,12 +87,13 @@ int main() {
     // NI_WMMA=1 routes the prefill (m>16) rows through the tensor-core kernel (G5d) instead of
     // the fp32 tiled GEMM, so the GFLOP/s and max|diff| columns then report wmma vs cuBLAS.
     if (const char* e = std::getenv("NI_WMMA")) cuda_policy().use_wmma = (e[0] == '1');
-    if (const char* e = std::getenv("NI_FP16W")) g_cuda_fp16_weights = (e[0] == '1');
+    bool fp16w = false;
+    if (const char* e = std::getenv("NI_FP16W")) fp16w = (e[0] == '1');
     if (const char* e = std::getenv("NI_DBUF")) cuda_policy().use_dbuf = (e[0] == '1');
     std::printf("prefill (m>16) kernel: %s\n",
-                g_cuda_fp16_weights ? "wmma-h (fp16 weights)"
-                                    : (cuda_policy().use_wmma ? "wmma (fp32 weights, fp16 staged)"
-                                                       : "tiled (fp32)"));
+                fp16w ? "wmma-h (fp16 weights)"
+                      : (cuda_policy().use_wmma ? "wmma (fp32 weights, fp16 staged)"
+                                                : "tiled (fp32)"));
 
     // Qwen2.5-0.5B linears (hidden=896, intermediate=4864, kv=128, vocab=151936).
     const std::vector<Shape> shapes = {
@@ -122,7 +123,7 @@ int main() {
             Tensor xd = to_device(x), wf32 = to_device(w), yd = to_device(Tensor({m, n}));
             // ours uses fp16 weights when opted in; cuBLAS always reads the fp32 copy, so the
             // max|diff| column then reports the fp16-weight cost vs the fp32 baseline.
-            Tensor wd = g_cuda_fp16_weights ? to_device_f16(w) : wf32;
+            Tensor wd = fp16w ? to_device_f16(w) : wf32;
             float* xp = static_cast<float*>(xd.device_ptr());
             float* wp = static_cast<float*>(wf32.device_ptr());
             float* yp = static_cast<float*>(yd.device_ptr());
@@ -174,7 +175,7 @@ int main() {
     // Bit-identical (only the load TIMING moves, not the math), so the dbuf-tiled diff column must
     // read 0 — the speedup is the whole story. ---
     cuda_policy().use_wmma = false;
-    g_cuda_fp16_weights = false;
+    fp16w = false;
     std::printf("\ndouble-buffered projection GEMM vs default tiled, prefill m=128 (A/B, bit-identical):\n");
     std::printf("%-9s %7s %5s | %10s | %10s | %8s | %10s\n", "shape", "n", "k", "tiled GF/s",
                 "dbuf GF/s", "speedup", "dbuf-tiled");
@@ -221,7 +222,7 @@ int main() {
     // The int8 time INCLUDES the per-call activation quant (realistic — the model quantizes the
     // activations every forward). "vs fp32" is the W8A8 quantization error, not a kernel check
     // (parity is test_cuda vs the CPU oracle). ---
-    g_cuda_fp16_weights = false;
+    fp16w = false;
     cuda_policy().use_wmma = false;
     std::printf("\nint8 W8A8 (DP4A) vs fp32 tiled, prefill m=128 (int8 time incl. activation quant):\n");
     std::printf("%-9s %10s %10s %8s | %10s\n", "shape", "int8 GF/s", "fp32 GF/s", "speedup",
