@@ -53,7 +53,7 @@ if(NI_CUDA)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
   target_compile_definitions(nicore PUBLIC NI_CUDA)
-  target_sources(nicore PRIVATE src/cuda/cuda_backend.cu)
+  target_sources(nicore PRIVATE src/cuda/cuda_backend.cu src/cuda/cuda_runtime.cu)
   target_link_libraries(nicore PUBLIC CUDA::cudart)
   # sm_89 = Ada Lovelace (RTX 4070 Super); CUDA_STANDARD 17 matches the C++ side.
   set_target_properties(nicore PROPERTIES CUDA_STANDARD 17 CUDA_ARCHITECTURES 89)

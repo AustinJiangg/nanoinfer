@@ -195,6 +195,26 @@ parity-gated; mechanical moves (zero parity risk) last, landing on stabilized co
   stabilized them. Stand up an empty `metal/` skeleton mirroring the layout to prove it
   is reproducible.
 - **Done when:** pure code movement, parity by construction.
+- **Constraint found (the split is more constrained than this sketch assumed):** a `.cu` is not
+  a `.cpp`. Without separable compilation (`-rdc=true` / `CUDA_SEPARABLE_COMPILATION`, which costs
+  the whole-program kernel inlining this perf-focused project relies on — so it's off), **every
+  kernel must be launched in the same TU it's defined in**, and the shared `attention_combine_kernel`
+  is launched by BOTH `CudaBackend::attention` and `CudaPagedKVCache::attend`. So attention + paged +
+  cache + graph are coupled and stay in one TU. The cleanly separable units are the ones whose kernels
+  are launched only by their own methods: **runtime, gemm, quant, elementwise**. (Same honest-result
+  shape as G5h/G6 — the structurally-clean ideal meets a real constraint; do the part that's clean.)
+- **Progress — R4a landed  ✅ (shared header + runtime TU):** `cuda_internal.cuh` (extern decls of the
+  device-pool / grid / split helpers + the header-inline `__device__` dtype loaders) and
+  `cuda_runtime.cu` (the ONE `DevicePool` + `device_alloc` / `cat_seq` / `grid1d` / `sm_count` /
+  `split_count`, shared across every CUDA TU). `cuda_backend.cu` **2323 → 2164** lines. Pure code
+  movement: 23/23 ctest, parity digit-identical (CUDA fp32 `3.76701e-05`, paged/batch `=0`), and the
+  **graph-decode golden tokens still match** — the single-shared-pool invariant (capture-time pool
+  addresses) survives the TU split, the one real risk here.
+- **Remaining — R4b:** extract `cuda_gemm.cu` (the GEMM kernels + `CudaBackend::linear`),
+  `cuda_quant.cu` (int8 kernels + `cuda_linear_*` + the W8A8/int8-embed weights + factories), and
+  `cuda_elementwise.cu` (embedding/rmsnorm/silu/mul/add/split/merge/repeat/rope + their methods), each
+  including `cuda_internal.cuh`. `cuda_backend.cu` then keeps attention + paged + cache + graph + the
+  globals (the coupled core). A `metal/` skeleton can mirror the same layout.
 
 ### R5 — (optional) tighten the CPU side symmetrically  ⬜
 - **Change:** push the same weight-seam / format-enum down into `ops.cpp` / `quant.cpp`
