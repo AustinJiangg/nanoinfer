@@ -464,6 +464,14 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
 - [ ] **Metal** — a `MetalBackend` on the M4 GPU; unified memory removes most H2D. The
       same Python serving layer on a third backend = the Backend boundary proven real.
 
+## Refactor track (R-track)
+The feature roadmap is ~90% done; the GPU optimization arc left exploration-debt (a
+quant-dispatch hole in the Backend abstraction, ~11 global dispatch flags, `#ifdef
+NI_CUDA` scattered through `model.cpp`, a 2272-line `cuda_backend.cu`). **[REFACTOR.md](REFACTOR.md)**
+stages the paydown (R0–R5) — parity-locked, the same `max|diff|=0` + golden-token
+discipline as the feature stages — *before* Metal, since Metal on today's structure
+would replicate the debt a third time. The refactor is Metal's prerequisite.
+
 ## Backlog (pull in when the moment fits)
 Open candidates, not a closed/deferred-forever list — fold one into a stage when it's
 the right moment:

@@ -106,9 +106,12 @@ Stages 0–2 are complete and verified against Hugging Face. See
 
 ## Development
 
-Reading the code or contributing? Two companion docs split the work:
+Reading the code or contributing? Three companion docs split the work:
 
 - **[CLAUDE.md](CLAUDE.md)** — how we develop here: the golden rule, conventions,
   and known sharp edges (RoPE, GQA, masking, dtype, config gotchas).
 - **[ROADMAP.md](ROADMAP.md)** — the staged plan, with the "done when" bar for each
   stage and reference reading.
+- **[REFACTOR.md](REFACTOR.md)** — the R-track: paying down the GPU optimization
+  arc's exploration-debt (the quant hole, global flags, `#ifdef` scatter) before
+  Metal, parity-locked at every step.
