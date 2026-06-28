@@ -103,15 +103,15 @@ Tensor linear_q4g(const Tensor& x, const Q4GTensor& w, const Tensor* bias = null
 
 // Polymorphic wrapper so the model can hold any quant mode in one map and add a
 // new mode as one subclass + one factory branch (no N-map / N-way-if growth).
-class QuantizedWeight {
+class Weight {
 public:
-    virtual ~QuantizedWeight() = default;
+    virtual ~Weight() = default;
     virtual Tensor linear(const Tensor& x, const Tensor* bias) const = 0;
     virtual int64_t bytes() const = 0;       // actual storage
     virtual int64_t fp32_bytes() const = 0;  // out*in*4 (the unquantized size)
 };
 
-// Quantize `w` into a QuantizedWeight of the given mode (nullptr for None).
-std::unique_ptr<QuantizedWeight> make_quantized(const Tensor& w, QuantMode mode);
+// Quantize `w` into a Weight of the given mode (nullptr for None).
+std::unique_ptr<Weight> make_quantized(const Tensor& w, QuantMode mode);
 
 }  // namespace ni

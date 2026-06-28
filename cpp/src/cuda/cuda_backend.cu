@@ -1667,9 +1667,9 @@ Tensor cuda_linear_q8(const Tensor& x, const Tensor& codes, const Tensor& scale,
 
 // Device-resident W8A8 weight (G5d): int8 codes + per-row scales on the GPU; linear() runs the DP4A
 // kernel via cuda_linear_w8a8. Lives in the model's qweights_ for the CUDA + W8A8 path, so
-// Model::project drives int8 compute through the QuantizedWeight interface (no forward change).
+// Model::project drives int8 compute through the Weight interface (no forward change).
 namespace {
-class CudaW8A8Weight : public QuantizedWeight {
+class CudaW8A8Weight : public Weight {
     Tensor wq_;       // device int8 [out, in]
     Tensor w_scale_;  // device fp32 [out]
     int64_t out_, in_;
@@ -1685,7 +1685,7 @@ public:
 };
 }  // namespace
 
-std::unique_ptr<QuantizedWeight> make_cuda_w8a8(const Tensor& w) {
+std::unique_ptr<Weight> make_cuda_w8a8(const Tensor& w) {
     QTensor q = quantize_q8(w);  // per-channel int8 (same as Q8), then upload codes + scales once
     Tensor wq = to_device_i8(q.q.data(), {q.out, q.in});
     Tensor ws({q.out});
@@ -2009,6 +2009,14 @@ Tensor CudaBackend::finalize_logits(Tensor logits) {
     // device for its own post-replay copy — a sync D2H can't run inside a stream capture.
     if (logits.device() == Device::CUDA && !g_cuda_keep_device_logits) return to_host(logits);
     return logits;
+}
+
+Tensor CudaBackend::to_resident(Tensor weight, bool fp16_eligible) {
+    // Upload a host weight to the GPU once, at load. The big eligible weights (layer projections /
+    // embedding) go up as fp16 when g_cuda_fp16_weights is set — half the DRAM bytes — and the
+    // linear/embedding dispatch reads the F16 dtype directly; everything else (norms, biases, the
+    // RoPE tables) stays fp32. The g_cuda_fp16_weights read lives here, not in the model (R3).
+    return (fp16_eligible && g_cuda_fp16_weights) ? to_device_f16(weight) : to_device(weight);
 }
 
 // --- Device-resident KV cache (G3) ---

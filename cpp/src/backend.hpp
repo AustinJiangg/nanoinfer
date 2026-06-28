@@ -15,8 +15,10 @@
 
 #include <cstdint>
 #include <memory>
+#include <utility>
 #include <vector>
 
+#include "quant.hpp"  // Weight — the base DenseWeight (below) and the quant weights share
 #include "tensor.hpp"
 
 namespace ni {
@@ -62,6 +64,13 @@ public:
     // unless a graph driver kept them on device for its own post-replay copy. The result-landing
     // #ifdef that used to sit at the end of Model::forward now lives here.
     virtual Tensor finalize_logits(Tensor logits) { return logits; }
+
+    // R3: make a host weight resident on this backend's device, once at load. CPU: identity (the
+    // weight stays a host tensor). CUDA: H2D upload — as fp16 when fp16_eligible AND the backend's
+    // fp16-weights mode is on (the big projections/embed), else fp32. The model calls this in a
+    // plain loop over its norms/biases/embed, with no #ifdef and no device global in sight — the
+    // fp16 decision (g_cuda_fp16_weights) lives inside the CUDA override.
+    virtual Tensor to_resident(Tensor weight, bool /*fp16_eligible*/) { return weight; }
 };
 
 // The CPU backend: every method forwards to the corresponding free function in
@@ -89,6 +98,25 @@ public:
     void place_row(Tensor& dst, int64_t s, const Tensor& row) override;
     std::unique_ptr<KVCacheBase> make_kv_cache(int64_t num_layers, int64_t n_kv_heads,
                                                int64_t head_dim, int64_t max_seq) override;
+};
+
+// R3: a plain fp32/fp16 weight exposed as a Weight, so Model::project drives dense and quantized
+// projections through one pointer with no branch. It forwards to the backend's GEMM over its
+// (already device-resident) tensor; the fp16 case is handled inside the backend's linear dispatch
+// (dtype()==F16), so DenseWeight is device- and precision-agnostic. The quant weights (quant.cpp,
+// cuda W8A8) are the other Weight impls. (gather() for the embedding lands with R3b.)
+class DenseWeight : public Weight {
+public:
+    DenseWeight(Backend* backend, Tensor w) : backend_(backend), w_(std::move(w)) {}
+    Tensor linear(const Tensor& x, const Tensor* bias) const override {
+        return backend_->linear(x, w_, bias);
+    }
+    int64_t bytes() const override { return w_.numel() * (w_.dtype() == DType::F16 ? 2 : 4); }
+    int64_t fp32_bytes() const override { return w_.numel() * 4; }
+
+private:
+    Backend* backend_;
+    Tensor w_;
 };
 
 // R1: construction-time backend configuration. Empty today; R2 grows it (GemmVariant,

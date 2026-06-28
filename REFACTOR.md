@@ -153,6 +153,25 @@ parity-gated; mechanical moves (zero parity risk) last, landing on stabilized co
   abstracts the weight representation, the thing that varied most).
 - **Done when:** int8 / W8A8 / fp16 / int8-embed golden tokens AND `weight_bytes` are
   byte-identical before/after (this stage is gated hardest); CPU `max|diff|=0`.
+- **Progress — R3a landed  ✅ (foundation + projections):** `QuantizedWeight` generalized
+  to `Weight` (the model-weight interface: `linear`/`bytes`/`fp32_bytes`); `DenseWeight`
+  (fp32/fp16, forwards to the backend GEMM) added so dense and quantized projections share
+  one `weights_` map — `Model::project` is now branch-free, one pointer. `backend_->to_resident()`
+  replaced the `#ifdef` device-upload loop (CPU identity / CUDA H2D + fp16), moving the
+  `g_cuda_fp16_weights` read out of `model.cpp` into `CudaBackend::to_resident`. `model.cpp`
+  `#ifdef NI_CUDA` **7 → 6**; every BASELINE number digit-identical (weight_bytes
+  1979/907/728/771 MB CPU + 991/907/1571/499 MB CUDA, all golden tokens, bit-identical gates
+  `=0`); 23/23 ctest; CPU-only build clean — the R1 `is_fp16_weight` `-Wunused` is fixed (it's
+  now called in the unconditional `to_resident` loop).
+- **Remaining — R3b / R3c:**
+  - **R3b** — embed/lm_head through the seam: add `Weight::gather` (default-throw; `DenseWeight`
+    + an int8-embed `Weight` override it), build `embed_` / `lm_head_` Weights, so
+    `Model::embed_tokens` / `lm_head` lose their `#ifdef`s (the embed-q8 construct + the gather +
+    the lm_head dispatch + the `weight_bytes` embed accounting — 4 of the remaining 6).
+  - **R3c** — `backend_->make_weight()` factory so the quant construction (the W8A8 `#ifdef`) and
+    the cuda includes leave `model.cpp` → **zero `#ifdef NI_CUDA`**; fold in the deferred R2
+    load-config (`fp16_weights` / `quantize_embed` into `BackendConfig`) and the per-instance
+    policy threading the weight seam now makes reachable.
 
 ### R4 — split the monolith (mechanical, zero parity risk)  ⬜
 - **Change:** carve `cuda_backend.cu` into translation units by concern:

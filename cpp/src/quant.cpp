@@ -381,7 +381,7 @@ Tensor linear_q4g(const Tensor& x, const Q4GTensor& w, const Tensor* bias) {
 namespace {
 // Thin polymorphic wrappers — each holds one quantized tensor and routes linear()
 // to the matching free function. Adding a mode is one subclass + one factory case.
-class Q8Weight : public QuantizedWeight {
+class Q8Weight : public Weight {
     QTensor t_;
 public:
     explicit Q8Weight(QTensor t) : t_(std::move(t)) {}
@@ -391,7 +391,7 @@ public:
     }
     int64_t fp32_bytes() const override { return t_.out * t_.in * 4; }
 };
-class Q4Weight : public QuantizedWeight {
+class Q4Weight : public Weight {
     Q4Tensor t_;
 public:
     explicit Q4Weight(Q4Tensor t) : t_(std::move(t)) {}
@@ -401,7 +401,7 @@ public:
     }
     int64_t fp32_bytes() const override { return t_.out * t_.in * 4; }
 };
-class Q4GWeight : public QuantizedWeight {
+class Q4GWeight : public Weight {
     Q4GTensor t_;
 public:
     explicit Q4GWeight(Q4GTensor t) : t_(std::move(t)) {}
@@ -413,7 +413,7 @@ public:
 };
 // W8A8 stores the same int8 weight as Q8 (a QTensor) — the difference is the LINEAR (int8×int8,
 // activations quantized at call time), so storage bytes match Q8; the win is compute, not memory.
-class W8A8Weight : public QuantizedWeight {
+class W8A8Weight : public Weight {
     QTensor t_;
 public:
     explicit W8A8Weight(QTensor t) : t_(std::move(t)) {}
@@ -425,7 +425,7 @@ public:
 };
 }  // namespace
 
-std::unique_ptr<QuantizedWeight> make_quantized(const Tensor& w, QuantMode mode) {
+std::unique_ptr<Weight> make_quantized(const Tensor& w, QuantMode mode) {
     switch (mode) {
         case QuantMode::Q8: return std::make_unique<Q8Weight>(quantize_q8(w));
         case QuantMode::Q4: return std::make_unique<Q4Weight>(quantize_q4(w));

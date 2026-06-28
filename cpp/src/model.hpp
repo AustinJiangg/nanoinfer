@@ -84,9 +84,13 @@ private:
     // wraps the free ops in ops.cpp; CUDA/Metal backends override them (G1+).
     std::unique_ptr<Backend> backend_;
     Config cfg_;
-    std::unordered_map<std::string, Tensor> w_;  // fp32 weights
-    // Quantized layer-projection weights (any mode), via the polymorphic wrapper.
-    std::unordered_map<std::string, std::unique_ptr<QuantizedWeight>> qweights_;
+    // Raw tensors that aren't projected/gathered through a Weight: the norms and the q/k/v biases
+    // (and, until R3b, the embed/lm_head). Device-resident on a CUDA model (R3 to_resident).
+    std::unordered_map<std::string, Tensor> w_;
+    // R3: every layer-projection weight (q/k/v/o/gate/up/down) as a polymorphic Weight — DenseWeight
+    // for fp32/fp16, a quant weight for Q8/Q4/Q4G/W8A8 — so Model::project dispatches through one
+    // pointer with no device/format branch (the seam that makes the Backend abstraction complete).
+    std::unordered_map<std::string, std::unique_ptr<Weight>> weights_;
     // Weight-only int8 (Q8) for the tied token-embedding / output-projection — the biggest single
     // weight. Built when g_quantize_embed is set (CPU; CUDA next). The gather dequantizes a row
     // (embedding_q8); the tied lm_head runs linear_q8. lmhead_q8_ is non-null only for an untied

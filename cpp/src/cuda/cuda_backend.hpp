@@ -25,8 +25,8 @@ namespace ni {
 // G5d: build a device-resident W8A8 weight — quantize `w` to int8 (per-channel, like Q8) and upload
 // the codes + per-row scales to the GPU once. Its linear() runs cuda_linear_w8a8 (int8×int8 DP4A on
 // device). The model holds these in qweights_ for the CUDA + W8A8 path, so Model::project drives the
-// int8 compute through the same QuantizedWeight interface as the CPU quant modes (no forward change).
-std::unique_ptr<QuantizedWeight> make_cuda_w8a8(const Tensor& w);
+// int8 compute through the same Weight interface as the CPU quant modes (no forward change).
+std::unique_ptr<Weight> make_cuda_w8a8(const Tensor& w);
 
 // R2: the kernel-selection policy — the bench/diagnostic and opt-in knobs that pick WHICH CUDA
 // kernel a dispatch launches, consolidated from seven scattered g_cuda_* globals into one cohesive,
@@ -104,6 +104,8 @@ public:
     std::unique_ptr<KVCacheBase> make_kv_cache(int64_t num_layers, int64_t n_kv_heads,
                                                int64_t head_dim, int64_t max_seq) override;
     Tensor finalize_logits(Tensor logits) override;
+    // R3: H2D upload at load (fp16 for the big eligible weights under g_cuda_fp16_weights, else fp32).
+    Tensor to_resident(Tensor weight, bool fp16_eligible) override;
 };
 
 // Device-resident KV cache (G3). Each layer's K/V is a contiguous [n_kv, len, head_dim]

@@ -68,10 +68,10 @@ Model::Model(const std::string& weights_dir, QuantMode mode, Device device) {
             // the GPU (the compute win). W8A8 is the GPU quant path; the other modes on CUDA aren't
             // GPU-wired (their CPU linear can't take a device tensor). CPU uses make_quantized.
             if (device == Device::CUDA && mode == QuantMode::W8A8)
-                qweights_.emplace(n, make_cuda_w8a8(w_.at(n)));
+                weights_.emplace(n, make_cuda_w8a8(w_.at(n)));
             else
 #endif
-                qweights_.emplace(n, make_quantized(w_.at(n), mode));
+                weights_.emplace(n, make_quantized(w_.at(n), mode));
             w_.erase(n);  // free the fp32 copy — the quantized weight is live now
         }
     }
@@ -102,23 +102,28 @@ Model::Model(const std::string& weights_dir, QuantMode mode, Device device) {
         }
     }
 
-#ifdef NI_CUDA
-    // CUDA path: upload every resident weight + the RoPE tables to the GPU once, here,
-    // so the forward never copies a weight again — H2D only at load, the GPU analogue of
-    // C5's "stream each weight once". After this W() returns device tensors and every op
-    // in forward() runs on the GPU. (Quant stays on CPU, so this path uses fp32 weights.)
-    if (device == Device::CUDA) {
-        // The big weights go up as fp16 when opted in (G5d) — half the DRAM bytes. The linear
-        // dispatch routes fp16 weights through the tensor-core / fp16-GEMV path, and the embedding
-        // gather + tied lm_head read the fp16 table directly (embedding/linear both handle F16).
-        // Norms/biases stay fp32 (tiny, precision-sensitive). See is_fp16_weight.
-        for (auto& kv : w_)
-            kv.second = (g_cuda_fp16_weights && is_fp16_weight(kv.first)) ? to_device_f16(kv.second)
-                                                                          : to_device(kv.second);
-        rope_.cos = to_device(rope_.cos);
-        rope_.sin = to_device(rope_.sin);
+    // R3: make every remaining weight + the RoPE tables resident on the compute device, once at
+    // load (CPU: identity; CUDA: H2D, fp16 for the big eligible weights — the GPU analogue of C5's
+    // "stream each weight once"). The device knowledge and the g_cuda_fp16_weights read moved into
+    // CudaBackend::to_resident, so this loop carries no #ifdef and names no device global.
+    for (auto& kv : w_)
+        kv.second = backend_->to_resident(std::move(kv.second), is_fp16_weight(kv.first));
+    rope_.cos = backend_->to_resident(std::move(rope_.cos), /*fp16_eligible=*/false);
+    rope_.sin = backend_->to_resident(std::move(rope_.sin), /*fp16_eligible=*/false);
+
+    // R3: wrap the dense (non-quant) projection weights — now device-resident — as DenseWeight in
+    // the same weights_ map a quant mode already filled above, so Model::project drives every
+    // projection (dense or quantized) through one Weight pointer with no branch. (For a quant mode
+    // the projections were placed above and are gone from w_, so this finds none.)
+    {
+        std::vector<std::string> proj;
+        for (const auto& kv : w_)
+            if (is_layer_proj(kv.first)) proj.push_back(kv.first);
+        for (const std::string& n : proj) {
+            weights_.emplace(n, std::make_unique<DenseWeight>(backend_.get(), std::move(w_.at(n))));
+            w_.erase(n);
+        }
     }
-#endif
 }
 
 KVCache Model::make_cache(int64_t max_seq) const {
@@ -132,11 +137,11 @@ std::unique_ptr<KVCacheBase> Model::make_kv_cache(int64_t max_seq) const {
 }
 
 Tensor Model::project(const Tensor& x, const std::string& name, const Tensor* bias) const {
-    // Quantized projections keep their own (CPU) path for now — GPU quant is post-G5.
-    // The fp32 path goes through the backend, so it runs on whatever device backend_ is.
-    auto it = qweights_.find(name);
-    if (it != qweights_.end()) return it->second->linear(x, bias);
-    return backend_->linear(x, W(name), bias);
+    // R3: every projection is a Weight (DenseWeight for fp32/fp16, a quant weight otherwise) in one
+    // map — no device or format branch here; the Weight owns its own kernel.
+    auto it = weights_.find(name);
+    if (it == weights_.end()) throw std::runtime_error("Model: missing projection weight " + name);
+    return it->second->linear(x, bias);
 }
 
 Tensor Model::embed_tokens(const std::vector<int64_t>& ids) const {
@@ -173,7 +178,7 @@ std::pair<int64_t, int64_t> Model::weight_bytes() const {
         actual += n * (kv.second.dtype() == DType::F16 ? 2 : 4);
         fp32 += n * 4;
     }
-    for (const auto& kv : qweights_) {
+    for (const auto& kv : weights_) {  // dense (DenseWeight) + quant projection weights (R3)
         actual += kv.second->bytes();
         fp32 += kv.second->fp32_bytes();
     }

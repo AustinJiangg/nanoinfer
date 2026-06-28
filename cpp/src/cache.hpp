@@ -25,7 +25,7 @@ namespace ni {
 
 // The cache interface forward()/forward_batch() drive — so the same forward pass
 // runs over either the contiguous cache (C3) or the paged cache (F8b) through one
-// pointer, the same polymorphism the QuantizedWeight interface uses for quant modes.
+// pointer, the same polymorphism the Weight interface uses for quant modes.
 // An implementation must return, from update(), a CONTIGUOUS [n_kv, length+t,
 // head_dim] view of the filled prefix, so the attention kernel stays cache-agnostic.
 class KVCacheBase {
