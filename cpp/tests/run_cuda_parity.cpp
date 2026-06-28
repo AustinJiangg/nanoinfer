@@ -42,7 +42,7 @@ int main(int argc, char** argv) {
         }
         // NI_DBUF=1 routes the fp32 prefill projections through the double-buffered GEMM (G5 micro-gain)
         // — only fires when the prompt is >16 tokens (m>16); bit-identical, so golden tokens must hold.
-        if (const char* e = std::getenv("NI_DBUF")) g_cuda_use_dbuf = (e[0] == '1');
+        if (const char* e = std::getenv("NI_DBUF")) cuda_policy().use_dbuf = (e[0] == '1');
         Model model(dir, QuantMode::None, Device::CUDA);
         std::vector<int64_t> ids = read_ids(dir + "/ref_ids.txt");
         std::vector<int64_t> ref_gen = read_ids(dir + "/ref_gen_ids.txt");

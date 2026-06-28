@@ -28,58 +28,53 @@ namespace ni {
 // int8 compute through the same QuantizedWeight interface as the CPU quant modes (no forward change).
 std::unique_ptr<QuantizedWeight> make_cuda_w8a8(const Tensor& w);
 
-// Bench/diagnostic knob (G5b): force the naive one-thread-per-output GEMM even for small
-// m, so run_cuda_decode_bench can A/B the warp-GEMV's decode win in one process with
-// everything else held constant. Left false in all normal use; not thread-safe to flip.
-extern bool g_cuda_force_naive_gemm;
+// R2: the kernel-selection policy — the bench/diagnostic and opt-in knobs that pick WHICH CUDA
+// kernel a dispatch launches, consolidated from seven scattered g_cuda_* globals into one cohesive,
+// typed object. Reached via cuda_policy() (still a file-scope instance: the readers include the
+// cuda_linear_q8 free function and CudaPagedKVCache::attend, which a per-instance backend member
+// can't reach until R3 threads the policy through the weight seam). Mutable on purpose — the A/B
+// harness flips a field mid-run on a shared model (run_cuda_bench toggles use_dbuf to measure it);
+// R2 retypes that capability, it does not remove it. Not thread-safe to flip during a launch.
+struct CudaPolicy {
+    // GEMM (CudaBackend::linear). force_naive_gemm: the naive one-thread-per-output kernel, the A/B
+    // baseline (G5b). use_wmma: the tensor-core prefill kernel (fp16 in, fp32 accumulate; G5d, lossy,
+    // opt-in). use_dbuf: the double-buffered tiled projection kernel — bit-identical to the default
+    // tiled kernel (only load timing moves), an A/B knob not a correctness one (G5 micro-gain).
+    bool force_naive_gemm = false;
+    bool use_wmma = false;
+    bool use_dbuf = false;
+    // int8 lm_head (cuda_linear_q8): force the prefill-tuned tiled kernel even at decode m, so a bench
+    // can A/B the int8 decode GEMV's win on the quantized lm_head (G5d). Left false in normal use.
+    bool force_tiled_q8 = false;
+    // Attention (CudaBackend::attention + CudaPagedKVCache::attend). force_naive_attn: the naive
+    // one-thread-per-query kernel, the A/B baseline (G5e). use_tiled_attn: the shared-mem K/V tiled
+    // kernel at prefill (sq>1) — bit-identical, only ties on this model (KV fits in L2), the
+    // FlashAttention structure for when K/V outgrow L2 (G5f). use_split_attn: Flash-Decoding split-KV
+    // when the shape warrants it (small sq, long context) — reorders the reduction (not bit-identical
+    // to non-split, within GPU tolerance), degrades to the warp kernel otherwise (G5g).
+    bool force_naive_attn = false;
+    bool use_tiled_attn = false;
+    bool use_split_attn = false;
+};
 
-// Bench/diagnostic knob (G5d follow-up): force the prefill-tuned tiled kernel for weight-only int8
-// (cuda_linear_q8) even at small m, so a bench can A/B the int8 decode GEMV's win on the quantized
-// lm_head. Left false in all normal use (decode then uses the GEMV); not thread-safe to flip.
-extern bool g_cuda_force_tiled_q8;
-
-// Opt-in (G5d): run the prefill GEMM on the tensor cores (fp16 inputs, fp32 accumulate).
-// Default off — fp16 is lossy, so it stays opt-in until the accuracy/speed tradeoff is
-// accepted; flip it to measure (test_cuda, run_cuda_bench NI_WMMA=1). Not thread-safe.
-extern bool g_cuda_use_wmma;
+// The process-wide kernel-selection policy (R2). Returns a mutable reference: A/B harnesses set
+// cuda_policy().use_dbuf = true etc. instead of the former loose g_cuda_* globals.
+CudaPolicy& cuda_policy();
 
 // Opt-in (G5d): upload the big weights as fp16 (half the DRAM bytes) — the layer projections
 // plus the token embedding / tied lm_head (embed_tokens, the single largest weight). Set it
 // BEFORE constructing a CUDA Model — the conversion happens at the once-per-load upload; the
 // linear dispatch then routes fp16 weights through the GEMV/wmma fp16 paths (so fp16 weights
 // force the tensor-core kernel for prefill), and the embedding gather reads the fp16 table
-// directly. Default off; not thread-safe.
+// directly. Default off; not thread-safe. (Load-config, not kernel selection — folds into the
+// R3 weight seam alongside g_quantize_embed.)
 extern bool g_cuda_fp16_weights;
-
-// Bench/diagnostic knob (G5e): force the naive one-thread-per-query attention kernel instead of
-// the warp-per-query kernel, so a bench can A/B the attention speedup. Default false; not thread-safe.
-extern bool g_cuda_force_naive_attn;
-
-// Opt-in knob (G5f): use the shared-memory K/V tiled attention kernel at prefill (sq>1) instead of
-// the non-tiled online kernel. Default false — tiling only ties on this model (KV fits in L2); it's
-// the FlashAttention structure for when K/V outgrow L2. Bit-identical output either way.
-extern bool g_cuda_use_tiled_attn;
-
-// Opt-in knob (G5g — Flash-Decoding): split the KV across multiple blocks per (head,query), so decode
-// attention fills the GPU instead of launching only H*sq warps (~3% of it at sq=1, each then walking
-// the whole KV serially). Each split runs the one-pass online softmax over its key chunk and writes a
-// partial (m,l,acc); a combine kernel merges the partials. Default false; engages only when the shape
-// warrants it (small sq, long context — see split_count in the .cu) and otherwise degrades to the
-// non-split warp kernel. Reorders the per-key reduction, so NOT bit-identical to the non-split kernel,
-// but within GPU tolerance of the CPU oracle. The long-context decode lever G5f left open.
-extern bool g_cuda_use_split_attn;
 
 // G6 (CUDA graphs): when true, Model::forward leaves the logits ON DEVICE (skips the final D2H) so a
 // graph driver can capture the forward and do its own D2H after replay — a sync D2H can't be captured.
 // Set only by CudaGraphDecoder around a capture; default false (eager D2Hs at the edge as before).
+// (Per-call graph state, not policy — folds into R3's per-call context with g_cuda_graph_pos/token.)
 extern bool g_cuda_keep_device_logits;
-
-// Opt-in knob (G5 micro-gain): route the fp32 prefill PROJECTION GEMM (m>16, narrow n) through the
-// double-buffered tiled kernel — it software-pipelines the global load with the compute to hide DRAM
-// latency on the low-occupancy projection shapes (down/q/o launch only ~28 blocks). BIT-IDENTICAL to
-// the default tiled kernel (only the load timing changes), so it's an A/B knob, not a correctness one;
-// the bench reports whether it wins (NI_DBUF=1). Default false; not thread-safe to flip mid-run.
-extern bool g_cuda_use_dbuf;
 
 class CudaBackend : public Backend {
 public:

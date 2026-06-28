@@ -648,7 +648,7 @@ __global__ void linear_warptiled_kernel(const float* __restrict__ x, const float
 // BM×BK / BK×BN tile is converted to half as it is staged into shared memory, and the matmul
 // accumulates in fp32 (wmma half×half→float). Mixed precision: fp16 inputs, fp32 accumulate —
 // far faster compute than the fp32 CUDA-core kernel, but lossy (fp16 rounds inputs to ~3
-// decimal digits). Opt-in via g_cuda_use_wmma; the accuracy cost is measured (test_cuda /
+// decimal digits). Opt-in via cuda_policy().use_wmma; the accuracy cost is measured (test_cuda /
 // run_cuda_bench). Block = 2×2 warps over a 64×64 tile (each warp a 2×2 grid of 16×16 frags);
 // n is a multiple of 64 for every Qwen linear, m is bounds-checked at the store.
 template <typename WT>
@@ -1649,7 +1649,7 @@ Tensor cuda_linear_q8(const Tensor& x, const Tensor& codes, const Tensor& scale,
     const int mi = static_cast<int>(m), ni = static_cast<int>(n), ki = static_cast<int>(k);
     // Decode (small m): memory-bound, so the warp-per-output GEMV (¼ the fp32 bytes for the huge
     // lm_head); prefill (large m): compute-bound, the tiled GEMM. Same m split as CudaBackend::linear.
-    if (m <= kGemvMaxM && !g_cuda_force_tiled_q8) {
+    if (m <= kGemvMaxM && !cuda_policy().force_tiled_q8) {
         const int threads = 128;  // 4 warps/block, one output channel per warp
         const int blocks = static_cast<int>((n + threads / 32 - 1) / (threads / 32));
         linear_q8_gemv_kernel<<<blocks, threads>>>(dptr(x), cp, dptr(scale), bp, dptr(y), mi, ni, ki);
@@ -1703,26 +1703,16 @@ static void launch_check(const char* what) {
     cuda_check(cudaGetLastError(), what);
 }
 
-// Bench-only switch (see cuda_backend.hpp) to force the naive GEMM path for A/B timing.
-bool g_cuda_force_naive_gemm = false;
-// Bench-only switch (see cuda_backend.hpp) to force the tiled int8 kernel for A/B timing the GEMV.
-bool g_cuda_force_tiled_q8 = false;
-// Opt-in switch (see cuda_backend.hpp) to run the prefill GEMM on the tensor cores (G5d).
-bool g_cuda_use_wmma = false;
-// Opt-in switch (see cuda_backend.hpp) to upload the layer weights as fp16 (G5d).
+// R2: the kernel-selection knobs, consolidated from seven scattered g_cuda_* globals into one
+// CudaPolicy (see cuda_backend.hpp). Still a file-scope instance — the readers include the
+// cuda_linear_q8 free function and CudaPagedKVCache::attend, which a per-instance backend member
+// can't reach until R3 threads it through the weight seam. The A/B harness sets cuda_policy().<field>.
+CudaPolicy g_cuda_policy;
+CudaPolicy& cuda_policy() { return g_cuda_policy; }
+
+// Opt-in switch (see cuda_backend.hpp) to upload the layer weights as fp16 (G5d). Load-config, not
+// kernel selection — folds into the R3 weight seam alongside g_quantize_embed.
 bool g_cuda_fp16_weights = false;
-// Bench/diagnostic knob (G5e): force the naive one-thread-per-query attention for A/B timing.
-bool g_cuda_force_naive_attn = false;
-// Opt-in knob (G5f): use the shared-memory K/V tiled kernel at prefill (sq>1). Default OFF — on
-// Qwen2.5-0.5B the per-layer KV fits in L2, so tiling only TIES the non-tiled online kernel (and
-// slightly regresses small prefill from the smem staging); it's the correct FlashAttention structure
-// that wins once K/V outgrow L2 (bigger model/batch, smaller-L2 GPU). Bit-identical either way.
-bool g_cuda_use_tiled_attn = false;
-// Opt-in knob (G5g): Flash-Decoding / split-KV attention at decode (see cuda_backend.hpp). Default
-// OFF; even when on, split_count() gates it to the shapes where it helps (small sq + long context).
-bool g_cuda_use_split_attn = false;
-// Opt-in knob (G5 micro-gain): double-buffered fp32 projection GEMM (see cuda_backend.hpp). Default OFF.
-bool g_cuda_use_dbuf = false;
 
 // G6 (CUDA graphs): the per-step DECODE inputs, made device-resident so ONE captured graph spans all
 // steps. The graph driver (CudaGraphDecoder) points these at its device int64 buffers before capture
@@ -1782,7 +1772,7 @@ Tensor CudaBackend::linear(const Tensor& x, const Tensor& weight, const Tensor* 
                             (static_cast<unsigned>(m) + BM - 1) / BM);
             linear_wmma_kernel<half><<<grid, 128>>>(xp, wh, bp, yp, mi, ni, ki);
         }
-    } else if (g_cuda_force_naive_gemm) {
+    } else if (cuda_policy().force_naive_gemm) {
         const dim3 block(16, 16);
         const dim3 grid((static_cast<unsigned>(n) + block.x - 1) / block.x,
                         (static_cast<unsigned>(m) + block.y - 1) / block.y);
@@ -1791,7 +1781,7 @@ Tensor CudaBackend::linear(const Tensor& x, const Tensor& weight, const Tensor* 
         const int threads = 128;  // 4 warps/block, one output channel per warp
         const int blocks = static_cast<int>((n + threads / 32 - 1) / (threads / 32));
         linear_gemv_kernel<float><<<blocks, threads>>>(xp, wp, bp, yp, mi, ni, ki);
-    } else if (g_cuda_use_wmma) {
+    } else if (cuda_policy().use_wmma) {
         if (n >= 8192 && n % 128 == 0 && k % 16 == 0) {  // large n: 128² warp-tiled tensor cores
             constexpr int BM = 128, BN = 128;
             const dim3 grid((static_cast<unsigned>(n) + BN - 1) / BN,
@@ -1826,7 +1816,7 @@ Tensor CudaBackend::linear(const Tensor& x, const Tensor& weight, const Tensor* 
                             (static_cast<unsigned>(m) + BM - 1) / BM);
             // G5 micro-gain: the low-occupancy projections (down/q/o, ~28 blocks) can hide the K-tile
             // load latency with a double-buffered software pipeline; bit-identical, A/B'd via NI_DBUF.
-            if (g_cuda_use_dbuf)
+            if (cuda_policy().use_dbuf)
                 linear_tiled_db_kernel<float, BM, BN, BK, TM, TN><<<grid, threads>>>(xp, wp, bp, yp,
                                                                                      mi, ni, ki);
             else
@@ -1944,13 +1934,13 @@ Tensor CudaBackend::attention(const Tensor& q, const Tensor& k, const Tensor& v,
     Tensor out = device_alloc({H, sq, D});
     const float scale = 1.0f / sqrtf(static_cast<float>(D));
     constexpr int kBc = 32;  // tile width = warp width, so lane l ↔ key (base+l) preserves the order
-    if (g_cuda_force_naive_attn) {
+    if (cuda_policy().force_naive_attn) {
         attention_kernel<<<grid1d(H * sq, kBlock), kBlock>>>(
             dptr(q), dptr(k), dptr(v), dptr(out), H, sq, sk, D, causal ? 1 : 0, query_offset, scale);
         launch_check("attention_kernel");
-    } else if (sq > 1 && g_cuda_use_tiled_attn) {
+    } else if (sq > 1 && cuda_policy().use_tiled_attn) {
         // Opt-in: shared-memory K/V tiling (G5f-tiled). A block of 8 warps shares each K/V tile, so
-        // grid is (query-tiles per head, H). Default off — see g_cuda_use_tiled_attn. Decode (sq=1)
+        // grid is (query-tiles per head, H). Default off — see cuda_policy().use_tiled_attn. Decode (sq=1)
         // has no query reuse anyway, so it always takes the non-tiled path below.
         const int threads = 256, warpsPerBlock = threads / 32;  // 8 queries/block
         const dim3 grid(static_cast<unsigned>((sq + warpsPerBlock - 1) / warpsPerBlock),
@@ -1959,7 +1949,7 @@ Tensor CudaBackend::attention(const Tensor& q, const Tensor& k, const Tensor& v,
         attention_warp_tiled_kernel<kBc><<<grid, threads, smemBytes>>>(
             dptr(q), dptr(k), dptr(v), dptr(out), H, sq, sk, D, causal ? 1 : 0, query_offset, scale);
         launch_check("attention_warp_tiled_kernel");
-    } else if (g_cuda_use_split_attn && split_count(H * sq, sk) >= 2) {
+    } else if (cuda_policy().use_split_attn && split_count(H * sq, sk) >= 2) {
         // Flash-Decoding (G5g): split the KV so nq*num_splits warps fill the GPU. Pass 1 writes each
         // split's partial (m,l,acc) to pooled scratch; pass 2 combines them. split_count returns >=2
         // only when worth it (small sq + long context); otherwise the warp kernel below runs instead.
@@ -2171,12 +2161,12 @@ Tensor CudaPagedKVCache::attend(int64_t layer, const Tensor& q, const Tensor& k,
         throw std::runtime_error("CudaPagedKVCache::attend: head_dim > 128 not supported (G4b)");
     Tensor out = device_alloc({n_heads, sq, D});
     const float scale = 1.0f / sqrtf(static_cast<float>(D));
-    if (g_cuda_force_naive_attn) {
+    if (cuda_policy().force_naive_attn) {
         paged_attention_kernel<<<grid1d(n_heads * sq, kBlock), kBlock>>>(
             dptr(q), Kbase, Vbase, d_bt, dptr(out), n_heads, sq, D, n_kv, n_rep, bs, causal ? 1 : 0,
             query_offset, end, scale);
         launch_check("paged_attention_kernel");
-    } else if (g_cuda_use_split_attn && split_count(n_heads * sq, end) >= 2) {
+    } else if (cuda_policy().use_split_attn && split_count(n_heads * sq, end) >= 2) {
         // Flash-Decoding (G5g) on the paged path — the split-KV analogue, sharing attention_combine_kernel
         // with the contiguous path. The paged cache has no O(ctx) cat_seq copy, so this is where the split
         // win shows up end-to-end (the contiguous cache's growing per-step copy diluted it).

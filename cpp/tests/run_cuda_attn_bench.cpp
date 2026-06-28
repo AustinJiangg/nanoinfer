@@ -99,25 +99,25 @@ int main() {
 
         auto run = [&] { Tensor o = gpu.attention(qd, kd, vd, /*causal=*/true, qoff); };
 
-        g_cuda_force_naive_attn = true;
-        g_cuda_use_tiled_attn = false;
+        cuda_policy().force_naive_attn = true;
+        cuda_policy().use_tiled_attn = false;
         Tensor o_naive = to_host(gpu.attention(qd, kd, vd, true, qoff));
         const double ms_naive = time_ms(run, 30, 5);
 
-        g_cuda_force_naive_attn = false;
-        g_cuda_use_tiled_attn = false;  // non-tiled online (the default for all sq)
+        cuda_policy().force_naive_attn = false;
+        cuda_policy().use_tiled_attn = false;  // non-tiled online (the default for all sq)
         Tensor o_notile = to_host(gpu.attention(qd, kd, vd, true, qoff));
         const double ms_notile = time_ms(run, 30, 5);
 
-        g_cuda_use_tiled_attn = true;  // opt-in shared-memory tiling (sq>1)
+        cuda_policy().use_tiled_attn = true;  // opt-in shared-memory tiling (sq>1)
         Tensor o_tiled = to_host(gpu.attention(qd, kd, vd, true, qoff));
         const double ms_tiled = time_ms(run, 30, 5);
 
-        g_cuda_use_tiled_attn = false;
-        g_cuda_use_split_attn = true;  // Flash-Decoding / split-KV (engages for small sq + long sk)
+        cuda_policy().use_tiled_attn = false;
+        cuda_policy().use_split_attn = true;  // Flash-Decoding / split-KV (engages for small sq + long sk)
         Tensor o_split = to_host(gpu.attention(qd, kd, vd, true, qoff));
         const double ms_split = time_ms(run, 30, 5);
-        g_cuda_use_split_attn = false;
+        cuda_policy().use_split_attn = false;
 
         const double d_tn = maxdiff(o_tiled, o_notile);   // must be 0 (same key order)
         const double d_na = maxdiff(o_notile, o_naive);   // ~1e-6 (reduction reorder)
@@ -127,9 +127,9 @@ int main() {
                     (long long)sq, (long long)sk, ms_naive, ms_notile, ms_tiled, ms_split,
                     ms_notile / ms_split, ms_notile / ms_tiled, d_tn, d_sn);
     }
-    g_cuda_force_naive_attn = false;
-    g_cuda_use_tiled_attn = false;
-    g_cuda_use_split_attn = false;
+    cuda_policy().force_naive_attn = false;
+    cuda_policy().use_tiled_attn = false;
+    cuda_policy().use_split_attn = false;
     std::printf("run_cuda_attn_bench: %s\n", ok ? "ok" : "FAIL (parity)");
     return ok ? 0 : 1;
 }

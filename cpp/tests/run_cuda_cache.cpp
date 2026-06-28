@@ -19,7 +19,7 @@
 #include <vector>
 
 #include "cuda/cuda.hpp"
-#include "cuda/cuda_backend.hpp"  // g_cuda_use_split_attn (Flash-Decoding check, G5g)
+#include "cuda/cuda_backend.hpp"  // cuda_policy().use_split_attn (Flash-Decoding check, G5g)
 #include "model.hpp"
 #include "parity_util.hpp"
 
@@ -114,7 +114,7 @@ int main(int argc, char** argv) {
         while (static_cast<int64_t>(longctx.size()) < 512)
             longctx.insert(longctx.end(), ids.begin(), ids.end());
         auto decode_split = [&](bool use_split) {
-            g_cuda_use_split_attn = use_split;
+            cuda_policy().use_split_attn = use_split;
             const int steps = 16;
             std::unique_ptr<KVCacheBase> c =
                 model.make_kv_cache(static_cast<int64_t>(longctx.size()) + steps + 8);
@@ -126,7 +126,7 @@ int main(int argc, char** argv) {
                 t = argmax_row(ld, 0, vocab);
                 out.push_back(t);
             }
-            g_cuda_use_split_attn = false;
+            cuda_policy().use_split_attn = false;
             return out;
         };
         std::vector<int64_t> tok_off = decode_split(false);  // warp kernel (default)

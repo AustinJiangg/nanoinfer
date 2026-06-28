@@ -103,6 +103,30 @@ parity-gated; mechanical moves (zero parity risk) last, landing on stabilized co
   process for A/B (the globals forbid this today).
 - **Done when:** `grep g_cuda_` is empty (bar the migrated graph state); `ctest`
   numbers unchanged vs R0.
+- **Landed (scoped to the kernel-selection knobs)  ✅:** the 7 dispatch flags
+  (`force_naive_gemm` / `force_tiled_q8` / `use_wmma` / `use_dbuf` / `force_naive_attn`
+  / `use_tiled_attn` / `use_split_attn`) consolidated into one `CudaPolicy` struct
+  reached via `cuda_policy()`. The A/B harness now sets typed fields
+  (`cuda_policy().use_dbuf = true`) instead of loose globals — the red line honoured
+  (retyped, not removed). Dispatch ladders byte-identical; every BASELINE number
+  digit-identical (CPU `4.24385e-05`, CUDA fp32 `3.76701e-05`, bit-identical gates `=0`);
+  23/23 ctest, `test_cuda` exercises wmma/dbuf/tiled/split through the struct, A/B benches
+  intact (naive→GEMV 50.4→86.1 tok/s).
+- **Reality-check on the original sketch — deferred to R3, with reasons:**
+  - **The `GemmVariant`/`AttnVariant` enums don't fit the dispatch.** The flags are
+    *modifiers interleaved with intrinsic `m`/`dtype` conditions* (`force_naive`
+    overrides; `use_wmma` only at prefill; `use_dbuf` only inside the tiled branch), not a
+    flat selection — so a struct-of-bools is the parity-safe consolidation; enum-ifying
+    would restructure the ladder. Kept as bools.
+  - **Per-instance (immutable, reentrant) entangles with R3.** Two readers live outside
+    `CudaBackend` — the `cuda_linear_q8` free function and `CudaPagedKVCache::attend` — so a
+    per-instance member can't reach them until R3 threads the policy through the weight
+    seam. Kept file-scope (cohesive + typed) until then; the struct is exactly the handle
+    R3 will thread.
+  - **`fp16_weights` + `quantize_embed` (load-config) and the 3 graph globals
+    (`keep_device_logits` / `graph_pos` / `graph_token`, per-call state) are not
+    kernel-selection policy** — they fold into R3 (the weight seam / a per-call context),
+    and remain documented externs for now.
 
 ### R3 — the weight seam (keystone; highest value, highest risk)  ⬜
 - **Change:** unify fp32 / fp16 / Q8 / Q4 / W8A8 / int8-embed behind ONE call. Make the

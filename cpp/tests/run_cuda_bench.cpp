@@ -86,12 +86,12 @@ int main() {
 
     // NI_WMMA=1 routes the prefill (m>16) rows through the tensor-core kernel (G5d) instead of
     // the fp32 tiled GEMM, so the GFLOP/s and max|diff| columns then report wmma vs cuBLAS.
-    if (const char* e = std::getenv("NI_WMMA")) g_cuda_use_wmma = (e[0] == '1');
+    if (const char* e = std::getenv("NI_WMMA")) cuda_policy().use_wmma = (e[0] == '1');
     if (const char* e = std::getenv("NI_FP16W")) g_cuda_fp16_weights = (e[0] == '1');
-    if (const char* e = std::getenv("NI_DBUF")) g_cuda_use_dbuf = (e[0] == '1');
+    if (const char* e = std::getenv("NI_DBUF")) cuda_policy().use_dbuf = (e[0] == '1');
     std::printf("prefill (m>16) kernel: %s\n",
                 g_cuda_fp16_weights ? "wmma-h (fp16 weights)"
-                                    : (g_cuda_use_wmma ? "wmma (fp32 weights, fp16 staged)"
+                                    : (cuda_policy().use_wmma ? "wmma (fp32 weights, fp16 staged)"
                                                        : "tiled (fp32)"));
 
     // Qwen2.5-0.5B linears (hidden=896, intermediate=4864, kv=128, vocab=151936).
@@ -173,7 +173,7 @@ int main() {
     // global load behind compute; gate/up (152 blocks) already hides it via cross-block occupancy.
     // Bit-identical (only the load TIMING moves, not the math), so the dbuf-tiled diff column must
     // read 0 — the speedup is the whole story. ---
-    g_cuda_use_wmma = false;
+    cuda_policy().use_wmma = false;
     g_cuda_fp16_weights = false;
     std::printf("\ndouble-buffered projection GEMM vs default tiled, prefill m=128 (A/B, bit-identical):\n");
     std::printf("%-9s %7s %5s | %10s | %10s | %8s | %10s\n", "shape", "n", "k", "tiled GF/s",
@@ -189,9 +189,9 @@ int main() {
             Tensor xd = to_device(x), wd = to_device(w);
             auto run = [&] { Tensor y = gpu.linear(xd, wd, nullptr); };
 
-            g_cuda_use_dbuf = false;
+            cuda_policy().use_dbuf = false;
             Tensor y_tiled = to_host(gpu.linear(xd, wd, nullptr));
-            g_cuda_use_dbuf = true;
+            cuda_policy().use_dbuf = true;
             Tensor y_dbuf = to_host(gpu.linear(xd, wd, nullptr));
             double diff = 0.0;
             for (int64_t i = 0; i < y_tiled.numel(); ++i)
@@ -202,12 +202,12 @@ int main() {
             // rounds (min ≈ peak-clock, least-perturbed) to compare the kernels at the same clock.
             double tiled_ms = 1e30, dbuf_ms = 1e30;
             for (int r = 0; r < 8; ++r) {
-                g_cuda_use_dbuf = false;
+                cuda_policy().use_dbuf = false;
                 tiled_ms = std::min(tiled_ms, time_ms(run, 100, 20));
-                g_cuda_use_dbuf = true;
+                cuda_policy().use_dbuf = true;
                 dbuf_ms = std::min(dbuf_ms, time_ms(run, 100, 20));
             }
-            g_cuda_use_dbuf = false;
+            cuda_policy().use_dbuf = false;
 
             const double flop = 2.0 * m * n * k;
             std::printf("%-9s %7lld %5lld | %10.0f | %10.0f | %7.2fx | %10.1e\n", sh.label,
@@ -222,7 +222,7 @@ int main() {
     // activations every forward). "vs fp32" is the W8A8 quantization error, not a kernel check
     // (parity is test_cuda vs the CPU oracle). ---
     g_cuda_fp16_weights = false;
-    g_cuda_use_wmma = false;
+    cuda_policy().use_wmma = false;
     std::printf("\nint8 W8A8 (DP4A) vs fp32 tiled, prefill m=128 (int8 time incl. activation quant):\n");
     std::printf("%-9s %10s %10s %8s | %10s\n", "shape", "int8 GF/s", "fp32 GF/s", "speedup",
                 "quant err");
@@ -260,7 +260,7 @@ int main() {
     // The quantized lm_head (cuda_linear_q8) ran the tiled GEMM at every m; at decode (small m) its
     // 64-row tile leaves ~63/64 of the warps idle yet still streams the whole int8 weight, so the huge
     // lm_head runs under the bandwidth wall. The warp-per-output GEMV fixes that. A/B via
-    // g_cuda_force_tiled_q8 with everything else fixed; the two share the accumulate-then-scale math, so
+    // cuda_policy().force_tiled_q8 with everything else fixed; the two share the accumulate-then-scale math, so
     // GEMV==tiled within the fp32-reduction tolerance (the speed differs, not the result). Decode is
     // memory-bound, so effective GB/s (counting the int8 codes — the dominant traffic) is the metric. ---
     std::printf("\nweight-only int8 lm_head: decode GEMV vs tiled (cuda_linear_q8, A/B, %% of BW):\n");
@@ -280,19 +280,19 @@ int main() {
             Tensor codesd = to_device_i8(qw.q.data(), {n, k}), wsd = to_device(ws);
             auto run_q8 = [&] { Tensor y = cuda_linear_q8(xd, codesd, wsd, nullptr); };
 
-            g_cuda_force_tiled_q8 = false;
+            cuda_policy().force_tiled_q8 = false;
             Tensor y_gemv = to_host(cuda_linear_q8(xd, codesd, wsd, nullptr));
-            g_cuda_force_tiled_q8 = true;
+            cuda_policy().force_tiled_q8 = true;
             Tensor y_tiled = to_host(cuda_linear_q8(xd, codesd, wsd, nullptr));
             double diff = 0.0;
             for (int64_t i = 0; i < y_gemv.numel(); ++i)
                 diff = std::max(diff, std::fabs((double)y_gemv[i] - y_tiled[i]));
 
-            g_cuda_force_tiled_q8 = false;
+            cuda_policy().force_tiled_q8 = false;
             const double gemv_ms = time_ms(run_q8, 50, 10);
-            g_cuda_force_tiled_q8 = true;
+            cuda_policy().force_tiled_q8 = true;
             const double tiled_ms = time_ms(run_q8, 50, 10);
-            g_cuda_force_tiled_q8 = false;
+            cuda_policy().force_tiled_q8 = false;
 
             // int8 codes (n·k) + fp32 x (m·k) + fp32 scales (n) + fp32 y (m·n): total DRAM traffic.
             const double bytes = double(n) * k + 4.0 * (double(m) * k + n + double(m) * n);

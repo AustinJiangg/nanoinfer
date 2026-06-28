@@ -93,7 +93,7 @@ int main(int argc, char** argv) {
         // differs (contiguous buffer vs blocks), exactly like the warp kernels above. The golden prompt
         // is too short to engage split_count, so prefill a long synthetic context (>512, split engages
         // from the first decode step) into a fresh pair of caches and compare in lockstep.
-        g_cuda_use_split_attn = true;
+        cuda_policy().use_split_attn = true;
         std::vector<int64_t> longctx;
         while (static_cast<int64_t>(longctx.size()) < 512)
             longctx.insert(longctx.end(), ids.begin(), ids.end());
@@ -112,7 +112,7 @@ int main(int argc, char** argv) {
             splitd = std::fmax(splitd, full_maxdiff(dc, dp));
             st = argmax_row(dc, 0, vocab);
         }
-        g_cuda_use_split_attn = false;
+        cuda_policy().use_split_attn = false;
         const bool split_ok = splitd < 1e-4;
         std::printf("flash-decoding: paged-split == contiguous-split max|diff|=%g over %d steps (ctx=%zu)\n",
                     splitd, split_steps, longctx.size());

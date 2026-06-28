@@ -1,6 +1,6 @@
 // G5b end-to-end: confirm the warp-GEMV's decode win at the MODEL level (not just the
 // linear microbench). Loads the GPU model once and decodes the same way twice — forcing
-// the naive GEMM, then the GEMV (g_cuda_force_naive_gemm) — so the only thing that changes
+// the naive GEMM, then the GEMV (cuda_policy().force_naive_gemm) — so the only thing that changes
 // between the two runs is the decode kernel. Reports prefill/decode tok/s for both and the
 // decode speedup. Prefill is naive in BOTH runs (m>16 won't hit the GEMV until G5c), a
 // built-in control: it should barely move while decode jumps.
@@ -40,9 +40,9 @@ static Timing run_one(const Model& model, const std::vector<int64_t>& prompt, in
     // Default (G5b): the layer-projection GEMM (naive vs warp-GEMV). NI_QEMBED: the int8 lm_head
     // (prefill-tiled vs decode GEMV) — layers stay on the GEMV so only the lm_head kernel changes.
     if (g_ab_int8_lmhead)
-        g_cuda_force_tiled_q8 = force_slow;
+        cuda_policy().force_tiled_q8 = force_slow;
     else
-        g_cuda_force_naive_gemm = force_slow;
+        cuda_policy().force_naive_gemm = force_slow;
     const int64_t max_seq = static_cast<int64_t>(prompt.size()) + decode_len + 8;
     // Contiguous (G3, default) or paged (G4b) KV cache. The contiguous cache's cat_seq copies the whole
     // history each step (O(ctx)); the paged cache writes only the new token into a block — so NI_PAGED=1
@@ -105,13 +105,13 @@ int main(int argc, char** argv) {
         if (const char* e = std::getenv("NI_FP16W")) g_cuda_fp16_weights = (e[0] == '1');
         // NI_NAIVE_ATTN=1 forces the naive one-thread-per-query attention (G5e A/B): hold the GEMM
         // path fixed and toggle only attention to isolate its prefill/decode contribution.
-        if (const char* e = std::getenv("NI_NAIVE_ATTN")) g_cuda_force_naive_attn = (e[0] == '1');
+        if (const char* e = std::getenv("NI_NAIVE_ATTN")) cuda_policy().force_naive_attn = (e[0] == '1');
         // NI_TILE_ATTN=1 opts into the shared-memory K/V tiled kernel at prefill (G5f A/B): isolate
         // the tiling's prefill contribution (bit-identical output either way; default is non-tiled).
-        if (const char* e = std::getenv("NI_TILE_ATTN")) g_cuda_use_tiled_attn = (e[0] == '1');
+        if (const char* e = std::getenv("NI_TILE_ATTN")) cuda_policy().use_tiled_attn = (e[0] == '1');
         // NI_SPLIT_ATTN=1 opts into Flash-Decoding / split-KV attention (G5g): the long-context decode
         // lever. A/B the decode tok/s by running this bench at a long context with and without it set.
-        if (const char* e = std::getenv("NI_SPLIT_ATTN")) g_cuda_use_split_attn = (e[0] == '1');
+        if (const char* e = std::getenv("NI_SPLIT_ATTN")) cuda_policy().use_split_attn = (e[0] == '1');
         // NI_PAGED=1 decodes through the paged KV cache (G4b) instead of the contiguous one — no
         // O(ctx) cat_seq copy per step, so it pairs with NI_SPLIT_ATTN to show the undiluted decode win.
         bool use_paged = false;
@@ -188,8 +188,8 @@ int main(int argc, char** argv) {
 
         const Timing slow = run_one(model, prompt, decode_len, vocab, true, use_paged);
         const Timing fast = run_one(model, prompt, decode_len, vocab, false, use_paged);
-        g_cuda_force_naive_gemm = false;
-        g_cuda_force_tiled_q8 = false;
+        cuda_policy().force_naive_gemm = false;
+        cuda_policy().force_tiled_q8 = false;
 
         const char* slow_label = g_ab_int8_lmhead ? "tiled" : "naive";  // the slow kernel under test
         auto tps = [](int64_t n, double s) { return static_cast<double>(n) / s; };

@@ -49,7 +49,7 @@ static bool check_linear(int64_t m, int64_t n, int64_t k, double tol, bool f16w,
         maxdiff = std::max(maxdiff, std::fabs(static_cast<double>(y_cpu[i]) - y_gpu[i]));
     const bool ok = maxdiff < tol;
     const char* kern = f16w ? (m <= 16 ? "gemv-h" : (n >= 8192 ? "wmma-h" : "tiled-h"))
-                            : (g_cuda_use_wmma ? "wmma" : (m <= 16 ? "gemv" : "tiled"));
+                            : (cuda_policy().use_wmma ? "wmma" : (m <= 16 ? "gemv" : "tiled"));
     std::printf("test_cuda: [%4lld x %4lld] @ [%6lld x %4lld]^T (%-6s) max|diff|=%.3e (tol %.0e) %s\n",
                 (long long)m, (long long)k, (long long)n, (long long)k, kern, maxdiff, tol,
                 ok ? "ok" : "FAIL");
@@ -229,20 +229,20 @@ int main() {
     // Double-buffered projection GEMM (G5 micro-gain): bit-identical to the tiled-vec kernel (only the
     // load timing changes), so it must meet the same oracle on the narrow-n projection shapes it routes
     // — square, wide n, and the ragged-m + wide-k (down) case that exercises the prefetch's m-bound.
-    g_cuda_use_dbuf = true;
+    cuda_policy().use_dbuf = true;
     ok &= check_linear(128, 896, 896, 5e-3, false, rng);   // dbuf 64×64, square (q/o)
     ok &= check_linear(128, 4864, 896, 5e-3, false, rng);  // dbuf 64×64, wide n (gate/up)
     ok &= check_linear(100, 896, 4864, 5e-3, false, rng);  // dbuf 64×64, ragged m + wide k (down)
-    g_cuda_use_dbuf = false;
+    cuda_policy().use_dbuf = false;
 
     // Tensor-core (fp32 weight, fp16 staged) — the max|diff| is the fp16 cost. n<8192 hits the 64²
     // kernel; n>=8192 the 128² warp-tiled kernel (the lm_head path).
-    g_cuda_use_wmma = true;
+    cuda_policy().use_wmma = true;
     ok &= check_linear(128, 896, 896, 3e-1, false, rng);   // wmma 64², square
     ok &= check_linear(100, 896, 4864, 1e0, false, rng);   // wmma 64², ragged + wide k
     ok &= check_linear(128, 8192, 896, 5e-1, false, rng);  // wmma 128² warp-tiled, large n
     ok &= check_linear(100, 8192, 896, 5e-1, false, rng);  // wmma 128², large n + ragged m
-    g_cuda_use_wmma = false;
+    cuda_policy().use_wmma = false;
 
     // fp16 WEIGHTS (G5d): gemv-h (decode); prefill projections (n<8192) -> CUDA-core float4 tiled
     // (tiled-h: fp16-weight-only error, fp32 compute, so tighter than wmma's fp16-accumulate);
@@ -270,23 +270,23 @@ int main() {
     // Opt-in shared-memory K/V tiled kernel (G5f-tiled): same cases must meet the oracle (it's
     // bit-identical to the non-tiled path — same key order). Includes a ragged shape (sq,sk not
     // multiples of 32/warps-per-block) to exercise partial tiles and inactive warps.
-    g_cuda_use_tiled_attn = true;
+    cuda_policy().use_tiled_attn = true;
     ok &= check_attention(2, 40, 40, 64, true, 0, 1e-3, rng);    // tiled prefill, multi-tile
     ok &= check_attention(3, 16, 16, 64, false, 0, 1e-3, rng);   // tiled full (non-causal)
     ok &= check_attention(4, 5, 5, 64, true, 0, 1e-3, rng);      // tiled ragged: sq < warps/block
     ok &= check_attention(2, 130, 130, 64, true, 0, 1e-3, rng);  // tiled ragged tiles + query blocks
-    g_cuda_use_tiled_attn = false;
+    cuda_policy().use_tiled_attn = false;
 
     // Flash-Decoding / split-KV (G5g): the KV is split across warps and recombined, so the reduction
     // order differs from the non-split kernel — match the CPU oracle within tol (same 1e-3, not
     // bit-identical). Long-context decode (sq=1) is where split_count engages many splits; short
     // context and prefill fall back to the warp kernel (split_count<2), exercised here too.
-    g_cuda_use_split_attn = true;
+    cuda_policy().use_split_attn = true;
     ok &= check_attention(14, 1, 1024, 64, true, 1023, 1e-3, rng);  // decode, splits engage (~8)
     ok &= check_attention(14, 1, 4096, 64, true, 4095, 1e-3, rng);  // decode, more splits (~32)
     ok &= check_attention(2, 1, 100, 64, true, 99, 1e-3, rng);      // short decode: num_splits=1 fallback
     ok &= check_attention(2, 40, 40, 64, true, 0, 1e-3, rng);       // prefill: num_splits=1 fallback (no-op)
-    g_cuda_use_split_attn = false;
+    cuda_policy().use_split_attn = false;
 
     // W8A8 DP4A int8 GEMM (G5d): the projection shapes, prefill + small m, with and without bias.
     // The integer core is identical to the CPU oracle, so the tolerance is just the float dequant.
