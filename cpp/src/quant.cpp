@@ -73,6 +73,16 @@ void pack_nibble(uint8_t* row, int64_t j, int code) {
     if (j & 1) row[j / 2] |= static_cast<uint8_t>(nib << 4);
     else row[j / 2] |= nib;
 }
+
+// R5: every CPU quant weight reports the same two sizes over its {q, scale, out, in} tensor — so one
+// helper each, shared by the Weight wrappers below, replaces the per-class copies (a new quant format's
+// wrapper is then just linear() + format()). q is one byte per element (int8 code, or a packed nibble
+// pair), scale is fp32. (The CUDA device weights hold Tensors, not these structs, so they keep their
+// own byte math — the CPU/CUDA asymmetry R5 leaves, since the storage layout genuinely differs.)
+template <class QT>
+int64_t packed_bytes(const QT& t) { return int64_t(t.q.size()) + int64_t(t.scale.size()) * 4; }
+template <class QT>
+int64_t unquantized_bytes(const QT& t) { return t.out * t.in * 4; }
 }  // namespace
 
 QTensor quantize_q8(const Tensor& w) {
@@ -387,10 +397,8 @@ public:
     explicit Q8Weight(QTensor t) : t_(std::move(t)) {}
     Tensor linear(const Tensor& x, const Tensor* bias) const override { return linear_q8(x, t_, bias); }
     Format format() const override { return Format::Q8; }
-    int64_t bytes() const override {
-        return int64_t(t_.q.size()) + int64_t(t_.scale.size()) * 4;
-    }
-    int64_t fp32_bytes() const override { return t_.out * t_.in * 4; }
+    int64_t bytes() const override { return packed_bytes(t_); }
+    int64_t fp32_bytes() const override { return unquantized_bytes(t_); }
 };
 class Q4Weight : public Weight {
     Q4Tensor t_;
@@ -398,10 +406,8 @@ public:
     explicit Q4Weight(Q4Tensor t) : t_(std::move(t)) {}
     Tensor linear(const Tensor& x, const Tensor* bias) const override { return linear_q4(x, t_, bias); }
     Format format() const override { return Format::Q4; }
-    int64_t bytes() const override {
-        return int64_t(t_.q.size()) + int64_t(t_.scale.size()) * 4;
-    }
-    int64_t fp32_bytes() const override { return t_.out * t_.in * 4; }
+    int64_t bytes() const override { return packed_bytes(t_); }
+    int64_t fp32_bytes() const override { return unquantized_bytes(t_); }
 };
 class Q4GWeight : public Weight {
     Q4GTensor t_;
@@ -409,10 +415,8 @@ public:
     explicit Q4GWeight(Q4GTensor t) : t_(std::move(t)) {}
     Tensor linear(const Tensor& x, const Tensor* bias) const override { return linear_q4g(x, t_, bias); }
     Format format() const override { return Format::Q4G; }
-    int64_t bytes() const override {
-        return int64_t(t_.q.size()) + int64_t(t_.scale.size()) * 4;
-    }
-    int64_t fp32_bytes() const override { return t_.out * t_.in * 4; }
+    int64_t bytes() const override { return packed_bytes(t_); }
+    int64_t fp32_bytes() const override { return unquantized_bytes(t_); }
 };
 // W8A8 stores the same int8 weight as Q8 (a QTensor) — the difference is the LINEAR (int8×int8,
 // activations quantized at call time), so storage bytes match Q8; the win is compute, not memory.
@@ -422,10 +426,8 @@ public:
     explicit W8A8Weight(QTensor t) : t_(std::move(t)) {}
     Tensor linear(const Tensor& x, const Tensor* bias) const override { return linear_w8a8(x, t_, bias); }
     Format format() const override { return Format::W8A8; }
-    int64_t bytes() const override {
-        return int64_t(t_.q.size()) + int64_t(t_.scale.size()) * 4;
-    }
-    int64_t fp32_bytes() const override { return t_.out * t_.in * 4; }
+    int64_t bytes() const override { return packed_bytes(t_); }
+    int64_t fp32_bytes() const override { return unquantized_bytes(t_); }
 };
 // R3b: the tied embedding / lm_head as weight-only int8 — a QTensor that BOTH gathers (embedding_q8,
 // for embed_tokens) and projects (linear_q8, for the tied lm_head). The one quant weight that
@@ -437,10 +439,22 @@ public:
     Tensor linear(const Tensor& x, const Tensor* bias) const override { return linear_q8(x, t_, bias); }
     Tensor gather(const std::vector<int64_t>& ids) const override { return embedding_q8(t_, ids); }
     Format format() const override { return Format::Q8; }  // weight-only int8 (tied embed + lm_head)
-    int64_t bytes() const override { return int64_t(t_.q.size()) + int64_t(t_.scale.size()) * 4; }
-    int64_t fp32_bytes() const override { return t_.out * t_.in * 4; }
+    int64_t bytes() const override { return packed_bytes(t_); }
+    int64_t fp32_bytes() const override { return unquantized_bytes(t_); }
 };
 }  // namespace
+
+const char* format_name(Format f) {
+    switch (f) {
+        case Format::F32: return "f32";
+        case Format::F16: return "f16";
+        case Format::Q8: return "q8";
+        case Format::Q4: return "q4";
+        case Format::Q4G: return "q4g";
+        case Format::W8A8: return "w8a8";
+    }
+    return "?";  // unreachable: the switch is exhaustive over the enum
+}
 
 std::unique_ptr<Weight> make_quantized(const Tensor& w, QuantMode mode) {
     switch (mode) {

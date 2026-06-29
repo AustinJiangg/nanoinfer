@@ -40,6 +40,11 @@ enum class QuantMode { None, Q8, Q4, Q4G, W8A8 };
 // (DenseWeight, distinguished by Tensor dtype) that no QuantMode names. Q8/Q4/Q4G/W8A8 line up.
 enum class Format { F32, F16, Q8, Q4, Q4G, W8A8 };
 
+// R5: the shared Format's human-readable name — the ONE place that maps the representation tag to a
+// string, so a storage diagnostic on either backend names a weight's format without a switch of its
+// own (the symmetric counterpart to the shared enum). Pure metadata; never on the forward path.
+const char* format_name(Format f);
+
 // An int8-quantized [out, in] weight: codes row-major, one scale per output row.
 struct QTensor {
     std::vector<int8_t> q;     // [out * in]

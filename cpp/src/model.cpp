@@ -1,6 +1,7 @@
 #include "model.hpp"
 
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <utility>
@@ -176,6 +177,18 @@ std::pair<int64_t, int64_t> Model::weight_bytes() const {
         fp32 += lm_head_->fp32_bytes();
     }
     return {actual, fp32};
+}
+
+std::vector<std::pair<Format, int64_t>> Model::weight_format_breakdown() const {
+    // Sum bytes() per Format over the polymorphic Weights — the projections (weights_) plus the
+    // embedding / (untied) output projection. std::map keeps the result ordered by Format and folds
+    // duplicates, so a mixed model (e.g. W8A8 projections + a Q8 embed) reports each format once. The
+    // raw w_ tensors aren't Weights (no format()); they stay fp32 and are deliberately omitted.
+    std::map<Format, int64_t> by_format;
+    for (const auto& kv : weights_) by_format[kv.second->format()] += kv.second->bytes();
+    if (embed_) by_format[embed_->format()] += embed_->bytes();
+    if (lm_head_) by_format[lm_head_->format()] += lm_head_->bytes();
+    return {by_format.begin(), by_format.end()};
 }
 
 const Tensor& Model::W(const std::string& name) const {

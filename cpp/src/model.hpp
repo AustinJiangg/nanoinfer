@@ -63,6 +63,13 @@ public:
     // (quantization, and fp16 device weights under the backend's fp16_weights config).
     std::pair<int64_t, int64_t> weight_bytes() const;
 
+    // R5: bytes per storage Format over the polymorphic Weights (the projections + the embedding /
+    // lm_head), so a diagnostic can show WHICH representations the model holds, not just the total —
+    // the shared Format tag (Weight::format) put to use, the same call on a CPU or CUDA model. The raw
+    // w_ tensors (norms, q/k/v biases) are fp32 and aren't Weights, so they're omitted: this reports
+    // exactly what a quant mode / fp16 varies. Sorted by Format; only the formats present appear.
+    std::vector<std::pair<Format, int64_t>> weight_format_breakdown() const;
+
 private:
     const Tensor& W(const std::string& name) const;
     // A linear projection that dispatches to the Q8 path when `name` is quantized.

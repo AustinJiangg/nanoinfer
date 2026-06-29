@@ -49,6 +49,12 @@ int main(int argc, char** argv) {
         std::printf("weights: %.1f MB (%s) vs %.1f MB (fp32) -> %.2fx smaller\n",
                     bytes.first / 1e6, label.c_str(), bytes.second / 1e6,
                     double(bytes.second) / double(bytes.first));
+        // R5: the per-Format storage breakdown (Weight::format put to use) — e.g. q8 shows the
+        // projections at q8 with the embedding still f32, so it's legible where the bytes went.
+        std::printf("formats:");
+        for (const auto& fb : model.weight_format_breakdown())
+            std::printf(" %s=%.1fMB", ni::format_name(fb.first), fb.second / 1e6);
+        std::printf("\n");
 
         // Logit error vs the fp32 reference.
         ni::Tensor logits = model.forward(ids);

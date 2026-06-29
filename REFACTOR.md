@@ -236,10 +236,35 @@ parity-gated; mechanical moves (zero parity risk) last, landing on stabilized co
   globals survive the split). A `metal/` skeleton can now mirror this layout.
 - **R4 done.**
 
-### R5 — (optional) tighten the CPU side symmetrically  ⬜
+### R5 — tighten the CPU side symmetrically  ✅
 - **Change:** push the same weight-seam / format-enum down into `ops.cpp` / `quant.cpp`
   so CPU and CUDA share one `Format` enum and one dispatch contract. Lower priority
   than R0–R4; after it, CPU / CUDA / Metal share a single dispatch contract.
+- **Landed across three commits:**
+  - **R5a** — the shared `enum class Format {F32,F16,Q8,Q4,Q4G,W8A8}` + a pure-virtual
+    `Weight::format()` on all 8 weight classes (`DenseWeight`, the 5 CPU quant wrappers, the
+    2 CUDA device weights): the single weight-representation tag both backends report. `QuantMode`
+    stays the construction *selector*; `Format` is the constructed weight's runtime *tag*.
+  - **de-globalize load-config** — `g_cuda_fp16_weights` / `g_quantize_embed` folded into the
+    typed, per-instance `BackendConfig` (the load-config half of R3's deferred de-globalization —
+    the part that affects *what model you build*).
+  - **R5-close** — `Format` made a *used* contract, not dead metadata: a shared `format_name(Format)`
+    (the one enum→string map) + `Model::weight_format_breakdown()` (bytes per `Format` over the
+    polymorphic `Weight`s), surfaced in `run_quant` (CPU) and `run_cuda_parity` (CUDA). The identical
+    call on both backends prints e.g. CPU `q8`: `f32=544.5MB q8=359.0MB` (the embedding stays fp32
+    while the projections quantize) and GPU full-int8: `q8=136.7MB w8a8=359.0MB` — the device weights
+    reporting the same bytes as their CPU twins through the one seam. Plus the 5 CPU quant wrappers'
+    identical `bytes()`/`fp32_bytes()` deduped into two templated helpers (`packed_bytes`/`unquantized_bytes`).
+- **Honest scope — "one dispatch contract" was already built (by R3), not missing.** The keystone
+  was R3: `Model` drives every projection/embed through one polymorphic `Weight`, and builds device
+  weights through the `Backend` factory (`make_quant_weight` / `make_embed_weight`). That IS the
+  shared dispatch contract CPU/CUDA/Metal use — a `Format`-keyed `switch` would be a *redundant*
+  second dispatch (and R2/R3 already found enum-dispatch a poor fit for the CUDA modifier-on-m/dtype
+  ladder). So R5 did not add a switch; it made the `Format` tag a legible, *used* part of that
+  contract and tightened the CPU wrappers — the right-sized symmetric finish. Parity-locked: 23/23
+  ctest, every BASELINE number digit-identical (the new diagnostic lines are additive — the pinned
+  numbers are untouched), CPU-only `-DNI_CUDA=OFF` build clean.
+- **R5 done — the R-track (R0–R5) is complete. Metal is unblocked.**
 
 ## The red line
 
@@ -252,7 +277,8 @@ run in one process instead of mutating a shared global.
 
 ## Sequencing with the feature work
 
-The refactor enables the features; it does not replace them. After R0–R4:
+The refactor enables the features; it does not replace them. With R0–R5 done (the R-track is
+complete), the queue is:
 
 1. **Metal backend** — now "implement the Backend methods + a `MetalPolicy` subset";
    the `cuda_*.cu` split is the template for `metal_*.mm`. The third backend is what

@@ -2,6 +2,7 @@
 // bound, the int8 linear == dequantized-matmul, and zero-row handling.
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -366,6 +367,17 @@ int main() {
         CHECK(ni::make_quantized(w, ni::QuantMode::Q4G)->format() == ni::Format::Q4G);
         CHECK(ni::make_quantized(w, ni::QuantMode::W8A8)->format() == ni::Format::W8A8);
         CHECK(ni::make_q8_embed(w)->format() == ni::Format::Q8);  // weight-only int8 embed/lm_head
+
+        // R5: format_name is the ONE enum->string map the storage diagnostics use; cover every value
+        // (strcmp — comparing the const char* with == would compare pointers, not contents).
+        CHECK(std::strcmp(ni::format_name(ni::Format::F32), "f32") == 0);
+        CHECK(std::strcmp(ni::format_name(ni::Format::F16), "f16") == 0);
+        CHECK(std::strcmp(ni::format_name(ni::Format::Q8), "q8") == 0);
+        CHECK(std::strcmp(ni::format_name(ni::Format::Q4), "q4") == 0);
+        CHECK(std::strcmp(ni::format_name(ni::Format::Q4G), "q4g") == 0);
+        CHECK(std::strcmp(ni::format_name(ni::Format::W8A8), "w8a8") == 0);
+        // and it agrees with a built weight's own format() — the tag and its name stay in lockstep
+        CHECK(std::strcmp(ni::format_name(ni::make_quantized(w, ni::QuantMode::Q4)->format()), "q4") == 0);
     }
 
     // --- embedding_q8 (weight-only int8 token embedding / tied lm_head) ---

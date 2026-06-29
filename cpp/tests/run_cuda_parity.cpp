@@ -196,6 +196,13 @@ int main(int argc, char** argv) {
                     genf, ref_gen.size(), nextf ? "preserved" : "CHANGED",
                     double(modelfull.weight_bytes().first) / 1e6,
                     double(wb32.first) / double(modelfull.weight_bytes().first));
+        // R5: the same Weight::format breakdown on DEVICE weights — the full int8 GPU model holds
+        // W8A8 projections + a Q8 embed/lm_head, named through the one shared format_name() the CPU
+        // run_quant diagnostic uses. The Format tag is backend-agnostic: the R5 symmetry made legible.
+        std::printf("formats (full int8, GPU):");
+        for (const auto& fb : modelfull.weight_format_breakdown())
+            std::printf(" %s=%.1fMB", format_name(fb.first), fb.second / 1e6);
+        std::printf("\n");
 
         if (has_nan) std::printf("WARNING: GPU logits contain NaN\n");
         // Correctness = the tokens (argmax + greedy); maxd is a loose drift guard, looser
