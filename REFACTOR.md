@@ -278,16 +278,17 @@ run in one process instead of mutating a shared global.
 ## Sequencing with the feature work
 
 The refactor enables the features; it does not replace them. With R0–R5 done (the R-track is
-complete), the queue is:
+complete) and the **Qwen2.5-1.5B scale-up landed** (`cpp/tests/BASELINE-1.5b.md`), the queue is:
 
 1. **Metal backend** — now "implement the Backend methods + a `MetalPolicy` subset";
    the `cuda_*.cu` split is the template for `metal_*.mm`. The third backend is what
-   finally proves the `Backend` boundary is real.
-2. **A bigger model (Qwen2.5-1.5B / 7B)** — the highest single-step learning value. The
-   engine is validated only on 0.5B, where G5h / G5f-tiled / G6 / wmma all *tied*
-   precisely because the model is small / KV fits in L2 / batch-1. A 7B re-activates
-   those parked optimizations as real wins and tests whether the "ties on this model"
-   calls were right. R2's policy object makes per-model tuning clean, so this pairs with
-   the refactor.
+   finally proves the `Backend` boundary is real. *(The one remaining big item.)*
+2. **A bigger model (Qwen2.5-1.5B / 7B) — 1.5B DONE** (2026-07-03): zero model-code changes
+   (every dim from config), both backends parity-green (CPU 4.07e-5, CUDA 3.84e-5, all golden
+   0/12 + max|diff|=0), and it validated the G5 "ties on this model" calls precisely — shared-mem
+   attention **tiling** flipped from tie to the shipped `head_dim>=128` default (~2.7% e2e prefill),
+   while G5h-dbuf / G6-graphs stayed ties and fp16 / split-KV grew, exactly as the roofline reasoning
+   predicted. The one code change was `device_pool_trim()` (multi-format VRAM). 7B stays out of reach —
+   the fp32 CPU oracle needs ~28 GB RAM; ~1.7B is the ceiling on this box. Details in `BASELINE-1.5b.md`.
 3. **Backlog micro-items** — paged-attention shared-mem tiling, W8A8 lm_head,
    batched/paged-split CUDA graphs, int8-embed under graph (see ROADMAP.md Backlog).
