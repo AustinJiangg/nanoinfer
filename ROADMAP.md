@@ -443,6 +443,65 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
         paged-split graphs (the split grid grows with context — needs the max-split fixed-grid trick), and
         the int8-embed (`NI_QEMBED`) decode under graph (the gather'd need the same device-token path).
 
+## Speculative decoding (S-track) — the two-model track
+
+**Direction updated 2026-07-04: Metal is deferred** (parked below — *not* dropped; the
+R-track already paid its structural prerequisite, so it stays a clean pickup later). The
+lever now is the freshly-landed **Qwen2.5-1.5B**, which moves the roadmap two independent
+ways:
+
+1. **A draft/target pair.** 0.5B (fast, rough) + 1.5B (slow, accurate) share an *identical*
+   tokenizer (both `vocab_size` 151936) → a textbook speculative-decoding pair: the biggest
+   decode win we haven't built, and one that genuinely *needs* two models.
+2. **Big enough to un-mute the 0.5B ties** (P-track). head_dim 64→128, matrices ~3×, KV
+   ~2.3×/token — several G-track levers that honestly tied on 0.5B *and named the model as the
+   cause* now have real headroom.
+
+They compose: **S cuts the *number* of 1.5B forwards; P makes *each* 1.5B forward faster** —
+and S's verify forward *is* the 1.5B forward, so P directly accelerates S. Built in the Python
+serving layer over the C++ kernels (the F6–F8 shape), CPU-oracle-locked: greedy speculative
+decode is **token-identical to plain 1.5B greedy** (the accept rule guarantees it), so the
+golden-token gate extends unchanged (1.5B fits the ~1.7B fp32 CPU-oracle RAM ceiling).
+
+- [ ] **S0** — draft/target harness + the accept test (CPU oracle first). Load 0.5B (draft) +
+      1.5B (target) in one process; the loop: draft proposes K tokens autoregressively → target
+      verifies all K+1 positions in ONE forward → accept the longest matching prefix by the
+      rejection-sampling rule → on reject, resample from the adjusted (target−draft) distribution.
+      **New primitive:** *prefill K+1 tokens onto an existing KV cache* — today's prefill fills an
+      empty cache and `forward_batch` is N sequences × 1 token; neither is one sequence × K+1 over
+      a populated cache (also exactly what chunked prefill needs). Done when: greedy speculative ==
+      plain 1.5B greedy token-for-token; sampled speculative matches the target distribution (the
+      Stage-2 sampling-parity discipline).
+- [ ] **S1** — KV cache rollback. The verify forward writes K+1 KV entries; the rejected tail is
+      discarded from BOTH caches (truncate-to-length L). Real cache surgery: contiguous moves the
+      length pointer, paged frees the rejected blocks. Done when: the cache after rollback is
+      bit-identical to one that only ever decoded the accepted tokens.
+- [ ] **S2** — measure accept rate + tune K (the G5a discipline). Instrument the accept-length
+      distribution; sweep draft length K; report end-to-end decode tok/s vs plain 1.5B. No number
+      claimed until measured (honest target ~1.5–2.5×, gated on 0.5B→1.5B agreement).
+- [ ] **S3** — batched speculative decode + scheduler integration. Fold S into the
+      continuous-batching `Scheduler` (each sequence carries a draft + target cache; the verify
+      step batches across the running set) — the merge with the F7/F8 serving layer.
+- [ ] **S4 (stretch)** — draft *without* a second model: prompt-lookup / n-gram decoding (propose
+      tokens by matching recent context against the prompt — strong on summarize/code, zero draft
+      cost). Same verify + rollback machinery, a different proposer.
+
+## Perf retune for 1.5B (P-track) — harvest the un-muted levers
+Not new algorithms — **collect** existing G-track levers on a model that finally pays for them.
+Pulled in alongside S whenever the target (1.5B) forward is the bottleneck. Same parity spine
+(CPU-oracle `max|diff|` + golden tokens).
+- [ ] **P0** — re-bench the opt-in flags on 1.5B; flip the defaults that now win.
+      `g_cuda_use_tiled_attn` (head_dim 64→128 doubles per-tile K/V reuse — the real lever, not
+      KV-outgrows-L2), `g_cuda_use_dbuf` (bigger GEMMs → more blocks → the occupancy-bound
+      down/q-o unstick), wmma (bigger tiles feed the tensor cores), CUDA graphs (28 vs 24 layers).
+      The `head_dim>=128` prefill-attention flip (commit e76b69a) was the first — find the rest.
+- [ ] **P1** — quantization ROI on 1.5B. fp32 is 5.8 GB; on the 12 GB 4070S, keeping target +
+      draft resident (S3) + longer context needs int8 W8A8 / fp16 — now the *enabler*, not just
+      speed. The 4:1-MAC and ½-byte levers pay more on the ~3× matrices. Measure memory headroom +
+      prefill/decode deltas at 1.5B scale.
+- [ ] **P2** — long context on 1.5B. KV ~2.3×/token → Flash-Decoding (G5g) + paged wins grow and
+      the "muted by L2" ceiling lifts; re-run the ctx sweep, find where paged+split now dominates.
+
 ## Cross-platform (portability proof, after the GPU is learned)
 - [x] **NEON** — `simd.hpp`'s `#elif` path now carries the three inner products on aarch64
       (Apple M-series), so `CpuBackend` runs on Apple ARM. `dot_f32`/`dot_qf32` widen each
@@ -461,8 +520,10 @@ The Python serving layer (`cpp/python/scheduler.py`) and the oracle (`nanoinfer/
       timing, so tok/s and the weight-level run_parity wait for the real M4. Op-level
       parity is the right-sized gate for a change to the inner-product primitives (it's the
       same gate that validated the C5 AVX2 SIMD).
-- [ ] **Metal** — a `MetalBackend` on the M4 GPU; unified memory removes most H2D. The
-      same Python serving layer on a third backend = the Backend boundary proven real.
+- [ ] **Metal** — *deferred 2026-07-04: parked behind the S/P tracks (not dropped — the
+      R-track already paid its structural prerequisite, so it's a clean pickup later).* A
+      `MetalBackend` on the M4 GPU; unified memory removes most H2D. The same Python serving
+      layer on a third backend = the Backend boundary proven real.
 
 ## Refactor track (R-track)
 The feature roadmap is ~90% done; the GPU optimization arc left exploration-debt (a

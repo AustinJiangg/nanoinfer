@@ -1,8 +1,10 @@
 # Refactor track (R-track)
 
 The feature roadmap is ~90% done: Python oracle (stages 0–2), C++ core (C0–C5),
-Fusion (F6–F8c, the mini-vLLM), CUDA (G0–G6), and NEON all landed. What remains is
-one big feature — **Metal** — plus a few backlog micro-items (see ROADMAP.md).
+Fusion (F6–F8c, the mini-vLLM), CUDA (G0–G6), and NEON all landed. Next (per the
+2026-07-04 direction update in ROADMAP.md) is the **S-track** (speculative decoding, the
+0.5B/1.5B two-model win) + the **P-track** (retune the G-track levers for 1.5B); **Metal
+is deferred** behind them (this R-track already paid its structural prerequisite).
 
 But the GPU optimization arc (G5a→G6, ~25 commits) left real, locatable
 **exploration-debt**, and that debt sits directly in front of Metal. This track pays
