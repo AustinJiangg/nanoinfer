@@ -7,6 +7,10 @@ bar is stricter than a feature stage: not just "golden tokens hold," but *every 
 number stays identical to the last digit*, including the GPU tolerance values. A moved
 digit means a stage changed math it shouldn't have.
 
+> **Bigger model:** the Qwen2.5-**1.5B** port baseline lives in
+> [`BASELINE-1.5b.md`](BASELINE-1.5b.md) (same gates, 1.5B numbers). This file stays the 0.5B
+> R-track invariant. The 1.5B port added `device_pool_trim()`; the numbers below are unchanged by it.
+
 Captured on: RTX 4070 SUPER (12 GB), Qwen2.5-0.5B, `weights/qwen2.5-0.5b`, build-cuda
 (`-DNI_CUDA=ON`, sm_89). Prompt: `"The capital of France is"` →
 `ref_ids = 785 6722 315 9625 374`. Golden greedy continuation (12 tokens):

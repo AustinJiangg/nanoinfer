@@ -60,16 +60,23 @@ double maxdiff(const Tensor& a, const Tensor& b) {
 }
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (!cuda_available()) {
         std::printf("run_cuda_attn_bench: no CUDA device visible — skipping\n");
         return 0;
     }
-    // Qwen2.5-0.5B attention shapes after repeat_kv: H=14 query heads, head_dim=64, causal, the
-    // query block sitting at the end of the context (query_offset = sk - sq). Prefill sweeps sq=sk;
-    // the last row is a decode step (sq=1) over a long context — there tiling has no query reuse, so
-    // it should fall back to the non-tiled kernel (the dispatch sends sq=1 there) and tie it exactly.
-    const int64_t H = 14, D = 64;
+    // Attention shapes after repeat_kv: H query heads, head_dim D, causal, the query block sitting
+    // at the end of the context (query_offset = sk - sq). Prefill sweeps sq=sk; the last rows are
+    // decode steps (sq=1) over a long context — there tiling has no query reuse, so it falls back to
+    // the non-tiled kernel (the dispatch sends sq=1 there) and ties it exactly.
+    //   default: Qwen2.5-0.5B (H=14, D=64).  Pass "H D" to sweep another model —
+    //   e.g. `run_cuda_attn_bench 12 128` for Qwen2.5-1.5B (head_dim doubles: 2x the per-key bytes,
+    //   so L2 pressure — the thing that decides whether shared-mem TILING wins — hits at half the sk).
+    int64_t H = 14, D = 64;
+    if (argc > 2) {
+        H = std::stoll(argv[1]);
+        D = std::stoll(argv[2]);
+    }
     struct Cfg {
         int64_t sq, sk;
     };

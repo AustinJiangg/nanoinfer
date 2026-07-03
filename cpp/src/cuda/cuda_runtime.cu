@@ -64,12 +64,31 @@ struct DevicePool {
         }
         free_[it->second].push_back(p);
     }
+    // Return every FREE-list buffer to the driver (real cudaFree) — the one place the pool
+    // shrinks. In-use buffers (held by live Tensors, so absent from free_) are untouched, so
+    // this changes no computation; it only reclaims retained VRAM. Off the hot path: it exists
+    // so a test can free one Model's weights before building the next format (run_cuda_parity
+    // builds five), since otherwise the leaked buffers sum across formats and OOM a big model.
+    void trim() {
+        for (auto& [nbytes, bufs] : free_) {
+            for (void* p : bufs) {
+                cudaFree(p);
+                size_of_.erase(p);
+            }
+        }
+        free_.clear();
+    }
 };
 DevicePool& pool() {
     static DevicePool* p = new DevicePool();  // leaked on purpose (see above)
     return *p;
 }
 }  // namespace
+
+// Reclaim pooled-but-free device memory to the driver (real cudaFree). Off any hot path — it
+// lets a test free one Model's buffers before building the next so the caching pool doesn't
+// accumulate every weight format's weights and OOM a large model. Correctness-neutral.
+void device_pool_trim() { pool().trim(); }
 
 // Allocate a device tensor of `shape` (+ dtype) from the pool and hand the Tensor a deleter
 // that returns the buffer to the pool (not cudaFree) — so steady-state forwards do no

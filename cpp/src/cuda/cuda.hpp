@@ -47,4 +47,11 @@ Tensor cuda_embedding_q8(const Tensor& codes, const Tensor& scale, const std::ve
 // codes+scale as the gather above.
 Tensor cuda_linear_q8(const Tensor& x, const Tensor& codes, const Tensor& scale, const Tensor* bias);
 
+// Return device buffers the pool is holding on its free list to the driver (cudaFree). A no-op
+// for correctness — it only shrinks the caching allocator's retained memory, touching no live
+// buffer. Used by tests that build several independent Models in one process (e.g.
+// run_cuda_parity's five weight formats) so the pool doesn't accumulate each format's weights
+// and OOM a large model (1.5B fp32 weights are ~6 GB; five formats would blow past 12 GB VRAM).
+void device_pool_trim();
+
 }  // namespace ni
