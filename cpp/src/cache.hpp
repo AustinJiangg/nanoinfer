@@ -16,6 +16,7 @@
 #pragma once
 
 #include <cstdint>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -45,6 +46,18 @@ public:
     // Mark `t` more positions filled (once per forward, after all layers).
     virtual void advance(int64_t t) = 0;
 
+    // Roll back to `length` filled positions — the speculative-decode rollback (S1).
+    // Speculative decode's verify forward writes K+1 *tentative* K/V onto the cache;
+    // when the target rejects a drafted token, the tail beyond the accepted prefix is
+    // dropped by discarding positions >= length. The contiguous cache just moves the
+    // length pointer (stale slots are overwritten before they're read again); the paged
+    // / CUDA overrides land in S1. The base default refuses, so a cache that can't yet
+    // roll back fails loudly instead of silently serving stale K/V.
+    virtual void truncate(int64_t length) {
+        (void)length;
+        throw std::runtime_error("KVCacheBase::truncate: this cache has no rollback yet (S1)");
+    }
+
     virtual int64_t length() const = 0;  // filled positions
 };
 
@@ -70,6 +83,7 @@ public:
     Tensor attend(int64_t layer, const Tensor& q, const Tensor& k, const Tensor& v,
                   int64_t n_rep, bool causal, int64_t query_offset) override;
     void advance(int64_t t) override;
+    void truncate(int64_t length) override;
 
 private:
     std::vector<Tensor> k_;  // per layer: [n_kv_heads, max_seq, head_dim]

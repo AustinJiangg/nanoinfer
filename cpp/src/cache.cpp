@@ -64,4 +64,14 @@ Tensor KVCache::attend(int64_t layer, const Tensor& q, const Tensor& k, const Te
 
 void KVCache::advance(int64_t t) { length_ += t; }
 
+void KVCache::truncate(int64_t length) {
+    if (length < 0 || length > length_)
+        throw std::invalid_argument("KVCache::truncate: length " + std::to_string(length) +
+                                    " out of range [0, " + std::to_string(length_) + "]");
+    // Preallocated buffers: positions >= length keep stale K/V but are never read — the
+    // next forward's update() overwrites [length : length+t] before attend() reads
+    // [0 : length+t]. So rollback is just moving the shared length pointer back.
+    length_ = length;
+}
+
 }  // namespace ni

@@ -463,15 +463,26 @@ serving layer over the C++ kernels (the F6–F8 shape), CPU-oracle-locked: greed
 decode is **token-identical to plain 1.5B greedy** (the accept rule guarantees it), so the
 golden-token gate extends unchanged (1.5B fits the ~1.7B fp32 CPU-oracle RAM ceiling).
 
-- [ ] **S0** — draft/target harness + the accept test (CPU oracle first). Load 0.5B (draft) +
-      1.5B (target) in one process; the loop: draft proposes K tokens autoregressively → target
-      verifies all K+1 positions in ONE forward → accept the longest matching prefix by the
-      rejection-sampling rule → on reject, resample from the adjusted (target−draft) distribution.
-      **New primitive:** *prefill K+1 tokens onto an existing KV cache* — today's prefill fills an
-      empty cache and `forward_batch` is N sequences × 1 token; neither is one sequence × K+1 over
-      a populated cache (also exactly what chunked prefill needs). Done when: greedy speculative ==
-      plain 1.5B greedy token-for-token; sampled speculative matches the target distribution (the
-      Stage-2 sampling-parity discipline).
+- [x] **S0** ✅ landed — draft/target harness + the greedy accept test, CPU-oracle-locked.
+      **Key finding: the verify primitive already existed.** `forward([cur, d₀..d_{K-1}], cache)`
+      onto a POPULATED cache is bit-identical to K+1 sequential single-token forwards (max|diff|=0,
+      `run_spec.py` foundation check) — the attention op's `causal + query_offset` masking already
+      handles the `(length>0, t>1)` corner, so "prefill K+1 onto an existing cache" needed ZERO new
+      kernel code; it was only the untested *combination* of prefill's multi-query mask and decode's
+      offset. Rollback is `KVCache::truncate(L)` (contiguous: move the length pointer — stale slots
+      are overwritten before the next read, so truncate+replay is bit-identical, max|diff|=0). The
+      greedy loop (`cpp/python/speculative.py`): draft proposes k from cur (k+1 feeds, so the draft
+      cache stays lock-step with the target and ONE `truncate(L+a+1)` rolls back BOTH — no
+      all-accepted special case), target verifies `[cur, d₀..d_{k-1}]` in one forward, accept the
+      longest prefix the target's argmax agrees with, emit accepted + the correction/bonus.
+      Token-identical to plain target greedy by construction (every emitted token is the target's
+      own argmax; the primitive makes the batched verify logits equal sequential decode). Tested
+      (`tests/run_spec.py`): draft==target (0.5B) → 100% accept + output==plain greedy at k∈{1,2,4,8};
+      draft=0.5B/target=1.5B → output==plain 1.5B greedy at k∈{2,4,8}, real accept **65%@k=2 (2.4
+      tok/verify)** falling to 48%@k=8 (the draft drifts the longer it runs — the k tradeoff S2 tunes).
+      No regression (test_cache, run_serve MATCH). Sampling-parity accept (rejection sampling) is the
+      open S0 tail, folds into S2. Already efficient on the contiguous cache; S1 promotes `truncate`
+      to a tested `KVCacheBase` method + the paged impl (free blocks) + the dedicated rollback gate.
 - [ ] **S1** — KV cache rollback. The verify forward writes K+1 KV entries; the rejected tail is
       discarded from BOTH caches (truncate-to-length L). Real cache surgery: contiguous moves the
       length pointer, paged frees the rejected blocks. Done when: the cache after rollback is

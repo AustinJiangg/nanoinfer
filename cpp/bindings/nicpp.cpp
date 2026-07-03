@@ -120,7 +120,10 @@ PYBIND11_MODULE(nicpp, m) {
     // KV cache interface: forward()/forward_batch() accept any subclass, so the same
     // pass runs over the contiguous (C3) or paged (F8b) cache. Abstract — no init.
     py::class_<KVCacheBase>(m, "KVCacheBase")
-        .def_property_readonly("length", &KVCacheBase::length, "Filled positions so far.");
+        .def_property_readonly("length", &KVCacheBase::length, "Filled positions so far.")
+        .def("truncate", &KVCacheBase::truncate, py::arg("length"),
+             "Roll back to `length` filled positions (speculative-decode rollback): drop the "
+             "K/V for positions >= length. Contiguous cache only until S1.");
 
     // Contiguous per-sequence KV cache (C3). Created by Model.make_cache, fed back
     // into forward(); move-only in C++, so no copy/constructor is exposed.
