@@ -112,19 +112,23 @@ int main(int argc, char** argv) {
         const double ms_naive = time_ms(run, 30, 5);
 
         cuda_policy().force_naive_attn = false;
-        cuda_policy().use_tiled_attn = false;  // non-tiled online (the default for all sq)
+        cuda_policy().use_tiled_attn = false;
+        cuda_policy().no_tiled_attn = true;  // force the non-tiled online kernel (tiling is the D>=128 default)
         Tensor o_notile = to_host(gpu.attention(qd, kd, vd, true, qoff));
         const double ms_notile = time_ms(run, 30, 5);
 
-        cuda_policy().use_tiled_attn = true;  // opt-in shared-memory tiling (sq>1)
+        cuda_policy().use_tiled_attn = true;  // force shared-memory tiling on (sq>1), at any head_dim
+        cuda_policy().no_tiled_attn = false;
         Tensor o_tiled = to_host(gpu.attention(qd, kd, vd, true, qoff));
         const double ms_tiled = time_ms(run, 30, 5);
 
         cuda_policy().use_tiled_attn = false;
+        cuda_policy().no_tiled_attn = true;   // keep tiling off so split (or its warp fallback) runs, not the D>=128 tile
         cuda_policy().use_split_attn = true;  // Flash-Decoding / split-KV (engages for small sq + long sk)
         Tensor o_split = to_host(gpu.attention(qd, kd, vd, true, qoff));
         const double ms_split = time_ms(run, 30, 5);
         cuda_policy().use_split_attn = false;
+        cuda_policy().no_tiled_attn = false;
 
         const double d_tn = maxdiff(o_tiled, o_notile);   // must be 0 (same key order)
         const double d_na = maxdiff(o_notile, o_naive);   // ~1e-6 (reduction reorder)
@@ -136,6 +140,7 @@ int main(int argc, char** argv) {
     }
     cuda_policy().force_naive_attn = false;
     cuda_policy().use_tiled_attn = false;
+    cuda_policy().no_tiled_attn = false;
     cuda_policy().use_split_attn = false;
     std::printf("run_cuda_attn_bench: %s\n", ok ? "ok" : "FAIL (parity)");
     return ok ? 0 : 1;

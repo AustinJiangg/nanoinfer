@@ -45,6 +45,11 @@ __global__ void f32_to_f16_kernel(const float* __restrict__ src, half* __restric
 // visible keys twice (max, then softmax+weighted-V), recomputing scores rather than
 // storing them. Two-pass max-subtract mirrors ops.cpp; acc holds the output row.
 constexpr int kMaxHeadDim = 128;
+// Shared-mem K/V tiling (G5f) becomes the prefill default at head_dim >= this. It ties when a head's
+// KV fits L2 (0.5B, D=64) but wins as the per-key bytes grow (1.5B, D=128: ~2.7% e2e prefill,
+// bit-identical). 128 is the measured crossover and the standard Llama-family head_dim; smaller-head
+// models stay on the non-tiled kernel. Forced on by use_tiled_attn, off by no_tiled_attn.
+constexpr int kTileMinHeadDim = 128;
 __global__ void attention_kernel(const float* __restrict__ q, const float* __restrict__ k,
                                  const float* __restrict__ v, float* __restrict__ out,
                                  int64_t H, int64_t sq, int64_t sk, int64_t D,
@@ -607,10 +612,12 @@ Tensor CudaBackend::attention(const Tensor& q, const Tensor& k, const Tensor& v,
         attention_kernel<<<grid1d(H * sq, kBlock), kBlock>>>(
             dptr(q), dptr(k), dptr(v), dptr(out), H, sq, sk, D, causal ? 1 : 0, query_offset, scale);
         launch_check("attention_kernel");
-    } else if (sq > 1 && cuda_policy().use_tiled_attn) {
-        // Opt-in: shared-memory K/V tiling (G5f-tiled). A block of 8 warps shares each K/V tile, so
-        // grid is (query-tiles per head, H). Default off — see cuda_policy().use_tiled_attn. Decode (sq=1)
-        // has no query reuse anyway, so it always takes the non-tiled path below.
+    } else if (sq > 1 && !cuda_policy().no_tiled_attn &&
+               (cuda_policy().use_tiled_attn || D >= kTileMinHeadDim)) {
+        // Shared-memory K/V tiling (G5f-tiled). A block of 8 warps shares each K/V tile, so grid is
+        // (query-tiles per head, H). DEFAULT for head_dim >= kTileMinHeadDim (where it wins — 1.5B);
+        // forced on at any D by use_tiled_attn, forced off by no_tiled_attn. Decode (sq=1) has no
+        // query reuse anyway, so it always takes the non-tiled path below regardless.
         const int threads = 256, warpsPerBlock = threads / 32;  // 8 queries/block
         const dim3 grid(static_cast<unsigned>((sq + warpsPerBlock - 1) / warpsPerBlock),
                         static_cast<unsigned>(H));

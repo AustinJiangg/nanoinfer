@@ -52,13 +52,17 @@ struct CudaPolicy {
     // can A/B the int8 decode GEMV's win on the quantized lm_head (G5d). Left false in normal use.
     bool force_tiled_q8 = false;
     // Attention (CudaBackend::attention + CudaPagedKVCache::attend). force_naive_attn: the naive
-    // one-thread-per-query kernel, the A/B baseline (G5e). use_tiled_attn: the shared-mem K/V tiled
-    // kernel at prefill (sq>1) — bit-identical, only ties on this model (KV fits in L2), the
-    // FlashAttention structure for when K/V outgrow L2 (G5f). use_split_attn: Flash-Decoding split-KV
-    // when the shape warrants it (small sq, long context) — reorders the reduction (not bit-identical
-    // to non-split, within GPU tolerance), degrades to the warp kernel otherwise (G5g).
+    // one-thread-per-query kernel, the A/B baseline (G5e). Shared-mem K/V tiling (G5f) at prefill
+    // (sq>1) is bit-identical to the non-tiled kernel; it TIES on 0.5B (KV fits L2) but WINS at
+    // head_dim>=128 (~1.03-1.26x isolated, ~2.7% e2e prefill on 1.5B — the doubled per-key smem bytes
+    // make the reuse pay), so it is the DEFAULT for D>=kTileMinHeadDim. use_tiled_attn forces it on at
+    // any D (e.g. to A/B it on 0.5B); no_tiled_attn forces it off (the A/B baseline at D>=128 — how a
+    // bench measures the non-tiled path once tiling is the default). use_split_attn: Flash-Decoding
+    // split-KV when the shape warrants it (small sq, long context) — reorders the reduction (not
+    // bit-identical to non-split, within GPU tolerance), degrades to the warp kernel otherwise (G5g).
     bool force_naive_attn = false;
-    bool use_tiled_attn = false;
+    bool use_tiled_attn = false;  // force tiling on at any head_dim (overrides the D>=kTileMinHeadDim gate)
+    bool no_tiled_attn = false;   // force tiling off (A/B the non-tiled path at head_dim>=128)
     bool use_split_attn = false;
 };
 

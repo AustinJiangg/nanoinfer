@@ -111,6 +111,14 @@ split-vs-non-tiled (`notl/spl`), 30-iter timings:
 - **Split-KV / Flash-Decoding (G5g)** stays a large **decode** win on both models (5.7–23×, sq=1) —
   it's parallelism (H·splits warps vs H), independent of head_dim; the isolated win is ~unchanged.
 - Decode rows (sq=1) tile-tie exactly on both (the dispatch sends sq=1 to the non-tiled kernel).
+- **Tiling landed as the head_dim-gated default.** End-to-end (`run_cuda_decode_bench`) the isolated
+  win is Amdahl-diluted to a consistent **~2.7% prefill** gain on 1.5B (prefill 256/512/1024/2048:
+  1733→1779, 1668→1714, 1453→1494, 992→1017 tok/s), decode-neutral. Small but free (bit-identical)
+  and consistent, so tiling is now the DEFAULT at `head_dim >= kTileMinHeadDim` (=128, cuda_backend.cu)
+  — `run_cuda_decode_bench` baseline prefill jumped 1668→**1790** with no flag. `use_tiled_attn` still
+  forces it on at any D; **`no_tiled_attn`** forces it off (the R2-red-line A/B baseline — how the bench
+  measures the non-tiled column now that tiling is the default). 0.5B (D=64) stays non-tiled, unchanged
+  (ctest 23/23); 1.5B logits bit-identical (`3.83854e-05`), all golden/max|diff|=0 gates hold.
 
 ### Verdict
 
@@ -118,5 +126,6 @@ The port validated the G5 "ties on this model" calls precisely: **tiling** (the 
 pressure) turned into a real win at head_dim=128, while **dbuf** and **graphs** (gated on occupancy
 and launch-overhead-fraction, which the bigger model doesn't relieve) stayed ties. **fp16** and
 **split-KV** grew as predicted. Every parked lever behaved as the roadmap's roofline reasoning said
-it would — the honest-tie discipline paid off.
+it would — the honest-tie discipline paid off. And tiling flipped from parked-opt-in to the
+`head_dim >= 128` **default** — the first G5 lever a bigger model promoted from tie to shipped win.
 
