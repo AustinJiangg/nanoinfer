@@ -538,11 +538,37 @@ extends unchanged (1.5B fits the ~1.7B fp32 CPU-oracle RAM ceiling).
 - [ ] **S3** — batched speculative decode + scheduler integration. Fold S into the
       continuous-batching `Scheduler` (each sequence carries a draft + target cache; the verify
       step batches across the running set) — the merge with the F7/F8 serving layer.
-- [ ] **S4 (stretch)** — draft *without* a second model: prompt-lookup / n-gram decoding (propose
-      tokens by matching recent context against the prompt — strong on summarize/code, zero draft
-      cost). Same verify + rollback machinery, a different proposer. **S2 promoted this from stretch to
-      the point:** with `r → 0` (no draft forward) the win can't regress and the ceiling is k+1 — the
-      exact ratio lever the 0.5B/1.5B pair's r ≈ 0.45 lacks.
+- [x] **S4** ✅ landed — draft *without* a second model: **prompt-lookup / n-gram decoding**, the r→0
+      ratio lever S2 named as the point (the 0.5B/1.5B pair's r ≈ 0.45 caps it at 1.24×; a free draft
+      doesn't). **Same verify + rollback machinery, a different proposer** — realized literally: the S0
+      loop is refactored into a proposer-parameterized `_greedy_spec_core`, and `greedy_speculative`
+      (draft model) + `greedy_prompt_lookup` (n-gram) are thin wrappers differing ONLY in a `Proposer`
+      (`DraftModelProposer` vs `PromptLookupProposer`). The n-gram proposer (`prompt_lookup`) matches
+      the last `ngram` tokens of the context against the most-recent earlier occurrence and copies up
+      to k tokens that followed — **no model, no draft cache** (so rollback is a no-op; only the
+      target's `truncate` runs). A miss returns [], degrading that step to a plain greedy forward([cur]),
+      the loop's k=0 corner (verify over 1 token, keep=L+1).
+      **Correctness (S0 invariant, proposer-independent):** token-identical to plain target greedy at
+      every (ngram, k) — a wrong copy is rejected by the verify, never emitted. `run_spec.py` §C (0.5B +
+      1.5B) + a `prompt_lookup` matcher unit test; every config MATCH, and the accept path is exercised
+      (the France prompt's greedy self-repeats so proposals actually land).
+      **Measured (`tests/bench_lookup.py`, 4070S, 1.5B fp32, max_tokens 128, every config token-gated):
+      the win is COPY-DEPENDENT, not a flat ~1.2×.** france **3.35×**, copy(Fibonacci passage)
+      **2.80×** — the target's OWN greedy quotes earlier context (hit 52–74%, accept 82–97%, tok/verify
+      up to 5.57); reason 1.21×, code 1.17× (some structure to copy); story 1.04×, list 1.00× (open-
+      ended → no matches → degrades to plain greedy). Range **1.00×–3.35×**.
+      **Sharp edge / the honest nuance: the PROPOSER is free (r→0) but the VERIFY is NOT** — a k+1-token
+      verify is a mini-prefill, so on rarely-matching text a *large* k can mildly net-lose (list @k=8:
+      **0.86×**): the few matched-but-rejected steps pay a fat verify for ~1 token. This is far milder
+      than the draft model's story @k=8: 0.64× (which paid k draft forwards EVERY step at r=0.45) — here
+      a miss costs only the free lookup, so the floor is ~1× not 0.64×. Tuning: small k when hits are
+      rare (k=4 keeps list ≥0.93×), large k when copies are long (france/copy peak at k=16); higher
+      ngram → fewer but higher-accept matches (france ng=3 accept 95–97% vs ng=2 82%).
+      **Verdict — S4 delivers the lever S2 named:** on copy-heavy text (RAG / summarize / code-edit /
+      repetitive) it reaches 2.8–3.4×, well past the draft pair's 1.24× ceiling, *because the draft cost
+      is gone* — and it needs no second model and no extra memory. Not universal (open-ended is a ~1×
+      no-op), but it never meaningfully regresses. The open S0 tail (sampling-parity rejection-sampling
+      accept) is unchanged; batched integration is S3.
 
 ## Perf retune for 1.5B (P-track) — harvest the un-muted levers
 Not new algorithms — **collect** existing G-track levers on a model that finally pays for them.

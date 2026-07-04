@@ -27,11 +27,29 @@ sys.path.insert(0, str(CPP / "build"))    # nicpp.*.so
 sys.path.insert(0, str(CPP / "python"))   # speculative
 
 import nicpp  # noqa: E402
-from speculative import greedy_speculative  # noqa: E402
+from speculative import greedy_speculative, greedy_prompt_lookup, prompt_lookup  # noqa: E402
 
 
 def read_ids(path: Path) -> list[int]:
     return [int(x) for x in path.read_text().split()]
+
+
+def check_lookup_matcher() -> bool:
+    """The S4 seam in isolation: prompt_lookup() copies the tokens that followed an earlier
+    occurrence of the context's suffix, most-recent-first, capped at max_k, [] on no match.
+    Pure logic (no model), so it's cheap to pin exactly — a wrong match is a silent speed
+    regression, never a correctness bug (the verify catches it), so this only guards speed."""
+    cases = [
+        (([1, 2, 3, 1, 2], 2, 4), [3, 1, 2]),   # suffix "1 2" recurs at pos 0, copy what followed
+        (([1, 2, 3, 1, 2], 2, 1), [3]),          # capped at max_k
+        (([1, 2, 3, 1, 2], 3, 4), []),           # "3 1 2" never occurs earlier
+        (([1, 2, 3], 3, 4), []),                 # n<=ngram: nothing precedes the suffix
+        (([], 2, 4), []),
+        (([9, 5, 9, 7, 9], 1, 2), [7, 9]),       # most-recent-first: copy after the LATEST "9"
+    ]
+    ok = all(prompt_lookup(ctx, ng, k) == exp for (ctx, ng, k), exp in cases)
+    print(f"  matcher: prompt_lookup {len(cases)} cases -> {'OK' if ok else 'FAIL'}")
+    return ok
 
 
 def check_primitive(model, prompt: list[int]) -> bool:
@@ -92,6 +110,31 @@ def run_case(name, target, draft, prompt, max_tokens, ks, *, expect_full_accept=
     return ok
 
 
+def run_lookup_case(name, target, prompt, max_tokens, ngrams, ks, *, eos_id=-1) -> bool:
+    """S4: prompt-lookup output must be token-identical to plain target greedy at every
+    (ngram, k) — no draft model, so this is purely the verify + rollback machinery driven by
+    the n-gram proposer. We also require the accept path to actually FIRE (some verify accepts
+    a proposal), else the prompt never repeats and we'd be trivially matching plain greedy
+    without exercising the interesting path."""
+    ref = plain_greedy(target, prompt, max_tokens, eos_id)   # once — same for every config
+    ok, any_accept = True, False
+    for ng in ngrams:
+        for k in ks:
+            out, st = greedy_prompt_lookup(target, prompt, max_tokens, ngram=ng, k=k, eos_id=eos_id)
+            match = out == ref
+            any_accept = any_accept or st.accepted > 0
+            ok = ok and match
+            print(f"  {name}  ng={ng} k={k:2d}: {'MATCH' if match else 'MISMATCH'}  "
+                  f"hit={st.hit_rate:5.1%}  accept={st.accept_rate:5.1%}  "
+                  f"tok/verify={st.tokens_per_verify:.2f}")
+            if not match:
+                print(f"     ref={ref}")
+                print(f"     out={out}")
+    if not any_accept:
+        print(f"  {name}: WARN — no proposal ever accepted (accept path not exercised)")
+    return ok and any_accept
+
+
 def main() -> int:
     d05 = Path(sys.argv[1] if len(sys.argv) > 1 else "weights/qwen2.5-0.5b")
     d15 = Path(sys.argv[2] if len(sys.argv) > 2 else "weights/qwen2.5-1.5b")
@@ -101,11 +144,13 @@ def main() -> int:
 
     print("0. foundations (bit-identical):")
     ok &= check_primitive(m05, read_ids(d05 / "ref_ids.txt"))
+    ok &= check_lookup_matcher()
 
     print("\nA. draft == target (0.5B/0.5B): expect 100% accept, output == plain greedy")
     ok &= run_case("self  0.5B/0.5B", m05, m05, read_ids(d05 / "ref_ids.txt"),
                    max_tokens=24, ks=(1, 2, 4, 8), expect_full_accept=True)
 
+    m15 = None
     if d15.exists():
         print("\nB. draft=0.5B, target=1.5B (the real pair): output == plain 1.5B greedy")
         m15 = nicpp.Model(str(d15))
@@ -113,6 +158,17 @@ def main() -> int:
                        max_tokens=24, ks=(2, 4, 8))
     else:
         print(f"\nB. skipped — no 1.5B weights at {d15}")
+
+    # S4: prompt-lookup — no draft model. Token-identity is proposer-independent, so 48 tokens
+    # off the France prompt (which drifts into repetitive geography) suffice to make the target's
+    # OWN greedy quote earlier context and fire the accept path. Run on both models it's present.
+    print("\nC. prompt-lookup (S4): no draft model — output == plain target greedy")
+    lookup_prompt = read_ids(d05 / "ref_ids.txt")
+    ok &= run_lookup_case("lookup 0.5B", m05, lookup_prompt, max_tokens=48,
+                          ngrams=(2, 3), ks=(4, 10))
+    if m15 is not None:
+        ok &= run_lookup_case("lookup 1.5B", m15, read_ids(d15 / "ref_ids.txt"), max_tokens=48,
+                              ngrams=(2, 3), ks=(4, 10))
 
     print("\nrun_spec:", "ok" if ok else "FAIL")
     return 0 if ok else 1

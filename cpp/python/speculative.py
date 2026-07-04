@@ -1,6 +1,6 @@
-"""Speculative decoding (S-track, S0): a small fast *draft* model proposes K tokens,
-the big *target* model verifies all K+1 in ONE forward, and we keep the longest prefix
-the target agrees with — emitting several tokens per target forward instead of one.
+"""Speculative decoding (S-track): a cheap *proposer* guesses K tokens, the big *target*
+model verifies all K+1 in ONE forward, and we keep the longest prefix the target agrees
+with — emitting several tokens per target forward instead of one.
 
 The engine already has everything this needs (verified in S0):
 
@@ -10,16 +10,33 @@ The engine already has everything this needs (verified in S0):
     single multi-token pass IS the verify step: forward([cur, d0..d_{K-1}], target_cache)
     → K+1 logit rows, the target's own next-token at each drafted position.
   * `cache.truncate(L)` drops the K/V for positions >= L — the rollback that discards
-    rejected drafts (the contiguous cache just moves its length pointer).
+    rejected drafts (S1 gave all four caches this).
 
-Correctness (the S0 gate): with GREEDY decoding this is *token-identical* to plain
-target greedy. Each emitted token is the target's argmax at its position (an accepted
-draft equals it by construction; a rejected one is replaced by it), and the target
-logits at a drafted position equal what plain sequential decode would produce. So the
-draft only changes SPEED (how many tokens land per verify), never the output.
+The verify + rollback machinery is FIXED; the only thing that varies is the **proposer** —
+where the K candidate tokens come from (roadmap: "same verify + rollback, a different
+proposer"). Two live proposers:
 
-CPU-oracle-locked: run over the CPU backend, `tokens == model.generate(...)` for the
-target. `run_spec.py` is the test.
+  * `DraftModelProposer` (S0/S1) — a small draft model runs K forwards. Cost per verify is
+    K draft forwards, i.e. r = t_draft/t_target per proposed token; S2 measured r ≈ 0.45 on
+    the 0.5B/1.5B pair, which caps the speedup regardless of accept rate.
+  * `PromptLookupProposer` (S4) — no model at all: match the recent context against an
+    earlier occurrence and copy what followed (prompt-lookup / n-gram decoding). Cost per
+    verify is an array scan → r → 0: a MISS costs only the (free) lookup — not k draft
+    forwards — so the step degrades to plain greedy with no waste. The one remaining downside
+    is the fatter verify (k+1 tokens is a mini-prefill), so a large k on rarely-matching text
+    can *mildly* net-lose (S4 measured list @k=8: 0.86×) — far milder than a draft model's
+    r·k tax (S2 measured story @k=8: 0.64×). Ceiling K+1 tokens/verify; S4 measured up to
+    3.35× on copy-heavy text. S2 named this the real ratio lever the draft/target pair lacks.
+
+Correctness (the S0 gate, proposer-independent): with GREEDY decoding this is *token-
+identical* to plain target greedy. Each emitted token is the target's argmax at its
+position (an accepted guess equals it by construction; a rejected one is replaced by it),
+and the target logits at a proposed position equal what plain sequential decode would
+produce. So the proposer only changes SPEED (how many tokens land per verify), never the
+output — a wrong guess costs a verify slot, never a wrong token.
+
+CPU-oracle-locked: over the CPU backend, `tokens == model.generate(...)` for the target.
+`run_spec.py` is the test.
 """
 
 from __future__ import annotations
@@ -31,10 +48,11 @@ import numpy as np
 
 @dataclass
 class SpecStats:
-    """Speculation efficiency (for S2's tuning; irrelevant to correctness)."""
+    """Speculation efficiency (for tuning; irrelevant to correctness)."""
     verifies: int = 0        # target forwards (each emits >= 1 token)
-    drafted: int = 0         # draft tokens proposed
-    accepted: int = 0        # draft tokens the target accepted
+    proposals: int = 0       # verifies that actually proposed >=1 token (prompt-lookup can find none)
+    drafted: int = 0         # candidate tokens proposed
+    accepted: int = 0        # candidate tokens the target accepted
     emitted: int = 0         # tokens actually emitted
     accept_lengths: list[int] = field(default_factory=list)  # accepted count `a` per verify (S2)
 
@@ -43,14 +61,20 @@ class SpecStats:
         return self.accepted / self.drafted if self.drafted else 0.0
 
     @property
+    def hit_rate(self) -> float:
+        # Fraction of verifies that found something to propose. For a draft model this is
+        # always 1.0; for prompt-lookup it's the match rate — the r→0 win only lands on hits.
+        return self.proposals / self.verifies if self.verifies else 0.0
+
+    @property
     def tokens_per_verify(self) -> float:
         # The speedup proxy: how many tokens each (expensive) target forward yields.
         return self.emitted / self.verifies if self.verifies else 0.0
 
     def accept_histogram(self, k: int) -> list[int]:
-        """Counts of verifies by accepted-draft length a = 0..k — the accept-length
-        DISTRIBUTION (S2). The mean (accept_rate) hides the shape: a draft that either
-        nails a whole run or fails at token 0 is bimodal, and that shape is what picks K."""
+        """Counts of verifies by accepted length a = 0..k — the accept-length DISTRIBUTION
+        (S2). The mean (accept_rate) hides the shape: a proposer that either nails a whole
+        run or fails at token 0 is bimodal, and that shape is what picks K."""
         h = [0] * (k + 1)
         for a in self.accept_lengths:
             if 0 <= a <= k:
@@ -58,10 +82,165 @@ class SpecStats:
         return h
 
 
+# ---------------------------------------------------------------------------
+# Proposers — the ONLY thing S0 (draft model) and S4 (prompt-lookup) differ by.
+# A proposer owns: prefill(prompt, cap), propose(cur, context) -> [tok..], rollback(keep),
+# and max_k (its longest proposal, for cache sizing).
+# ---------------------------------------------------------------------------
+
+
+class DraftModelProposer:
+    """S0/S1: a small draft model autoregressively proposes k tokens, keeping its own KV
+    cache lock-step with the target so ONE truncate(keep) rolls back both."""
+
+    def __init__(self, draft, k: int):
+        self.draft = draft
+        self.max_k = k
+        self.dcache = None
+
+    def prefill(self, prompt_ids: list[int], cap: int) -> None:
+        # The draft cache must track the same history so its proposals are conditioned right.
+        self.dcache = self.draft.make_cache(cap)
+        self.draft.forward(prompt_ids, self.dcache)
+
+    def propose(self, cur: int, context: list[int]) -> list[int]:
+        # Feed cur, d0, .., d_{k-2} to collect d0..d_{k-1} (k proposals), then feed d_{k-1}
+        # once more (output discarded) so the draft cache ends at L+k+1 — the SAME length the
+        # target reaches after verifying k+1 tokens. Lock-step caches let one truncate(L+a+1)
+        # roll back BOTH, with no all-accepted special case (else at a==k the draft is short).
+        d: list[int] = []
+        x = cur
+        for _ in range(self.max_k):
+            dl = self.draft.forward([x], self.dcache)
+            x = int(np.argmax(dl[-1]))
+            d.append(x)
+        self.draft.forward([d[-1]], self.dcache)   # k+1-th feed; keeps dcache == tcache length
+        return d
+
+    def rollback(self, keep: int) -> None:
+        self.dcache.truncate(keep)
+
+
+class PromptLookupProposer:
+    """S4: no model. Match the last `ngram` tokens of the context against an earlier
+    occurrence and copy up to `max_k` tokens that followed (prompt-lookup / n-gram
+    decoding). Cost per verify ~0 (an array scan) → r → 0. Stateless: no cache to keep,
+    so rollback is a no-op."""
+
+    def __init__(self, ngram: int, max_k: int):
+        self.ngram = ngram
+        self.max_k = max_k
+
+    def prefill(self, prompt_ids: list[int], cap: int) -> None:
+        pass
+
+    def propose(self, cur: int, context: list[int]) -> list[int]:
+        return prompt_lookup(context, self.ngram, self.max_k)
+
+    def rollback(self, keep: int) -> None:
+        pass
+
+
+def prompt_lookup(context: list[int], ngram: int, max_k: int) -> list[int]:
+    """Find an earlier occurrence of the last `ngram` tokens of `context` and return the
+    up-to-`max_k` tokens that followed it. Returns [] when there's no match — a free draft
+    that simply degrades that step to plain greedy (no wasted forward, so it can never
+    regress; this is S2's r→0 lever).
+
+    Scans most-recent-first so the copy reflects the latest matching context. Any guess is
+    safe: the target verify keeps only the prefix it agrees with, so a wrong match costs
+    nothing but the (free) lookup — output stays token-identical to plain greedy.
+    """
+    n = len(context)
+    if ngram < 1 or n <= ngram:          # nothing precedes the suffix yet
+        return []
+    suffix = context[n - ngram:]
+    # Positions n-ngram.. are the suffix itself; scan earlier starts, most recent first.
+    for i in range(n - ngram - 1, -1, -1):
+        if context[i:i + ngram] == suffix:
+            return context[i + ngram:i + ngram + max_k]
+    return []
+
+
+# ---------------------------------------------------------------------------
+# The greedy speculative loop, parameterized by a proposer.
+# ---------------------------------------------------------------------------
+
+
+def _greedy_spec_core(target, prompt_ids: list[int], max_tokens: int, proposer,
+                      eos_id: int) -> tuple[list[int], SpecStats]:
+    """Core greedy speculative decode. Returns (generated_ids, stats) with generated_ids
+    token-identical to plain target greedy — regardless of what `proposer` returns."""
+    # Caches sized for prompt + everything we emit, plus max_k slack for the tentative tail
+    # a verify writes before rollback.
+    cap = len(prompt_ids) + max_tokens + proposer.max_k + 1
+    tcache = target.make_cache(cap)
+    proposer.prefill(prompt_ids, cap)
+
+    # Prefill the target on the prompt; its last row gives the first token.
+    tlog = target.forward(prompt_ids, tcache)
+    cur = int(np.argmax(tlog[-1]))
+
+    generated: list[int] = []
+    stats = SpecStats()
+    context = list(prompt_ids)     # == prompt_ids + generated; proposer matches against it
+
+    def emit(tok: int) -> bool:
+        """Append tok unless it's eos; return False when generation should stop."""
+        if eos_id >= 0 and tok == eos_id:
+            return False                       # eos: stop without emitting (matches generate.cpp)
+        generated.append(tok)
+        context.append(tok)                    # keep context == prompt + generated for lookup
+        stats.emitted += 1
+        return len(generated) < max_tokens
+
+    if not emit(cur):                          # the first token (g_0), eos/limit-checked
+        return generated, stats
+
+    while True:
+        L = tcache.length                      # confirmed prefix length
+
+        # --- Propose: k candidate tokens (k may be 0 — prompt-lookup with no match, which
+        # degrades this step to a plain greedy forward([cur]), never a regression). ---
+        d = proposer.propose(cur, context)
+        k = len(d)
+
+        # --- Verify: ONE target forward over [cur, d0..d_{k-1}] -> k+1 logit rows. ---
+        # Row i is the target's distribution AFTER [cur, d0..d_{i-1}], i.e. its own token
+        # for the position the proposer guessed as d_i (row k is the bonus after all drafts).
+        tl = target.forward([cur] + d, tcache)
+        tv = np.argmax(tl, axis=1).astype(np.int64)   # target's greedy token at each position
+
+        # --- Accept the longest prefix the target agrees with. ---
+        a = 0
+        while a < k and int(tv[a]) == d[a]:
+            a += 1
+        # Confirmed this step: d[0..a-1] (accepted) + tv[a] (the correction if a<k, else the
+        # free bonus token if all k accepted). tv has k+1 rows, so tv[a] is always valid.
+        new = d[:a] + [int(tv[a])]
+        stats.verifies += 1
+        stats.proposals += 1 if k else 0
+        stats.drafted += k
+        stats.accepted += a
+        stats.accept_lengths.append(a)
+
+        # --- Rollback: keep cur + d[0..a-1] (positions L..L+a); tv[a] becomes the next cur,
+        # fed fresh next iteration (its K/V isn't in the cache yet). ---
+        keep = L + a + 1
+        tcache.truncate(keep)
+        proposer.rollback(keep)
+
+        # --- Emit the confirmed tokens, tracking cur as the last one. ---
+        for tok in new:
+            cur = tok
+            if not emit(tok):
+                return generated, stats
+
+
 def greedy_speculative(target, draft, prompt_ids: list[int], max_tokens: int,
                        k: int = 4, eos_id: int = -1) -> tuple[list[int], SpecStats]:
-    """Greedy speculative decode. Returns (generated_ids, stats), with generated_ids
-    token-identical to `target.generate(prompt_ids, max_tokens, greedy, eos_id)`.
+    """Greedy speculative decode with a DRAFT MODEL (S0/S1). Returns (generated_ids, stats),
+    with generated_ids token-identical to `target.generate(prompt_ids, max_tokens, greedy)`.
 
     `target` and `draft` are nicpp.Model handles (pass the same model as both for a
     draft==target self-check: every draft is accepted). k >= 1 is the draft length.
@@ -70,76 +249,21 @@ def greedy_speculative(target, draft, prompt_ids: list[int], max_tokens: int,
         raise ValueError("k (draft length) must be >= 1")
     if max_tokens <= 0 or not prompt_ids:
         return [], SpecStats()
+    return _greedy_spec_core(target, prompt_ids, max_tokens, DraftModelProposer(draft, k), eos_id)
 
-    # Caches sized for prompt + everything we emit, plus k slack for the tentative
-    # tail a verify writes before rollback.
-    cap = len(prompt_ids) + max_tokens + k + 1
-    tcache = target.make_cache(cap)
-    dcache = draft.make_cache(cap)
 
-    # Prefill both on the prompt (the draft cache must track the same history so its
-    # proposals are conditioned correctly). The target's last row gives the first token.
-    tlog = target.forward(prompt_ids, tcache)
-    draft.forward(prompt_ids, dcache)
-    cur = int(np.argmax(tlog[-1]))
-
-    generated: list[int] = []
-    stats = SpecStats()
-
-    def emit(tok: int) -> bool:
-        """Append tok unless it's eos; return False when generation should stop."""
-        if eos_id >= 0 and tok == eos_id:
-            return False                       # eos: stop without emitting (matches generate.cpp)
-        generated.append(tok)
-        stats.emitted += 1
-        return len(generated) < max_tokens
-
-    if not emit(cur):                          # the first token (g_0), eos/limit-checked
-        return generated, stats
-
-    while True:
-        L = tcache.length                      # confirmed prefix length (== dcache.length)
-
-        # --- Draft: propose k tokens autoregressively from cur. ---
-        # We feed cur, d0, .., d_{k-2} to collect d0..d_{k-1} (k proposals), then feed
-        # d_{k-1} once more (its output discarded) so the draft cache ends at L+k+1 —
-        # the SAME length the target reaches after verifying k+1 tokens. Keeping the two
-        # caches lock-step lets one truncate(L+a+1) roll back BOTH, with no all-accepted
-        # special case (when a==k the draft would otherwise be one position short).
-        d: list[int] = []
-        x = cur
-        for _ in range(k):
-            dl = draft.forward([x], dcache)
-            x = int(np.argmax(dl[-1]))
-            d.append(x)
-        draft.forward([d[-1]], dcache)         # the k+1-th feed; keeps dcache == tcache length
-
-        # --- Verify: ONE target forward over [cur, d0..d_{k-1}] -> k+1 logit rows. ---
-        # Row i is the target's distribution AFTER [cur, d0..d_{i-1}], i.e. its own token
-        # for the position draft guessed as d_i (and row k is the bonus after all drafts).
-        tl = target.forward([cur] + d, tcache)
-        tv = np.argmax(tl, axis=1).astype(np.int64)   # target's greedy token at each position
-
-        # --- Accept the longest prefix the target agrees with. ---
-        a = 0
-        while a < k and int(tv[a]) == d[a]:
-            a += 1
-        # Confirmed this step: d[0..a-1] (accepted) + tv[a] (the correction if a<k, else
-        # the free bonus token if all k accepted). tv has k+1 rows, so tv[a] is valid.
-        new = d[:a] + [int(tv[a])]
-        stats.verifies += 1
-        stats.drafted += k
-        stats.accepted += a
-        stats.accept_lengths.append(a)
-
-        # --- Rollback: keep cur + d[0..a-1] (positions L..L+a); tv[a] becomes the next
-        # cur, fed fresh next iteration (its K/V isn't in the cache yet). ---
-        keep = L + a + 1
-        tcache.truncate(keep)
-        dcache.truncate(keep)
-
-        # --- Emit the confirmed tokens, tracking cur as the last one. ---
-        for tok in new:
-            cur = tok
-            if not emit(tok):
-                return generated, stats
+def greedy_prompt_lookup(target, prompt_ids: list[int], max_tokens: int,
+                         ngram: int = 3, k: int = 10, eos_id: int = -1) -> tuple[list[int], SpecStats]:
+    """Greedy speculative decode with PROMPT-LOOKUP (S4) — no draft model. Proposes by
+    matching the last `ngram` tokens of the context against an earlier occurrence and
+    copying up to `k` tokens that followed. Returns (generated_ids, stats), token-identical
+    to plain target greedy. The draft is free (r→0), so it can't regress; k can be larger
+    than a draft model's (a long wrong copy costs only a verify slot, not k forwards).
+    """
+    if ngram < 1:
+        raise ValueError("ngram must be >= 1")
+    if k < 1:
+        raise ValueError("k (max proposal length) must be >= 1")
+    if max_tokens <= 0 or not prompt_ids:
+        return [], SpecStats()
+    return _greedy_spec_core(target, prompt_ids, max_tokens, PromptLookupProposer(ngram, k), eos_id)
