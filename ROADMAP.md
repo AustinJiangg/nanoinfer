@@ -457,11 +457,13 @@ ways:
    ~2.3×/token — several G-track levers that honestly tied on 0.5B *and named the model as the
    cause* now have real headroom.
 
-They compose: **S cuts the *number* of 1.5B forwards; P makes *each* 1.5B forward faster** —
-and S's verify forward *is* the 1.5B forward, so P directly accelerates S. Built in the Python
-serving layer over the C++ kernels (the F6–F8 shape), CPU-oracle-locked: greedy speculative
-decode is **token-identical to plain 1.5B greedy** (the accept rule guarantees it), so the
-golden-token gate extends unchanged (1.5B fits the ~1.7B fp32 CPU-oracle RAM ceiling).
+They both add tok/s — **S cuts the *number* of target forwards; P makes *each* target forward
+faster** — but S2 measured that they **add, they don't multiply**: P speeds the target verify AND
+the plain baseline (and the draft) together, so it lifts absolute tok/s without changing S's
+speedup *ratio*, which is bound by `r = t_draft/t_target` (S2). Built in the Python serving layer
+over the C++ kernels (the F6–F8 shape), CPU-oracle-locked: greedy speculative decode is
+**token-identical to plain 1.5B greedy** (the accept rule guarantees it), so the golden-token gate
+extends unchanged (1.5B fits the ~1.7B fp32 CPU-oracle RAM ceiling).
 
 - [x] **S0** ✅ landed — draft/target harness + the greedy accept test, CPU-oracle-locked.
       **Key finding: the verify primitive already existed.** `forward([cur, d₀..d_{K-1}], cache)`
@@ -505,15 +507,42 @@ golden-token gate extends unchanged (1.5B fits the ~1.7B fp32 CPU-oracle RAM cei
       at block_size 4 forces the free+reuse path, and the pool fully recovers its blocks afterward.
       Regressions green (run_cache, run_cuda_cache, run_cuda_parity golden, run_serve, run_cuda_serve,
       and S0's run_spec — 0.5B/0.5B 100% accept, 0.5B→1.5B output == plain 1.5B greedy).
-- [ ] **S2** — measure accept rate + tune K (the G5a discipline). Instrument the accept-length
-      distribution; sweep draft length K; report end-to-end decode tok/s vs plain 1.5B. No number
-      claimed until measured (honest target ~1.5–2.5×, gated on 0.5B→1.5B agreement).
+- [x] **S2** ✅ landed — measured the speedup + swept K on the clock (the G5a "no number until
+      measured" discipline), and the honest result is a **wash-to-modest win that the draft/target
+      COST RATIO caps, not the accept rate.** Instrumented the accept-length DISTRIBUTION
+      (`SpecStats.accept_histogram` — the mean hides a bimodal shape) and built `tests/bench_spec.py`:
+      times plain target greedy (the baseline), plain draft greedy (to measure `r = t_draft/t_target`),
+      then sweeps K reporting accept%, tok/verify, the accept histogram, and WALL-CLOCK spec tok/s vs a
+      roofline prediction — every K correctness-gated (token-identical to plain greedy, the S0
+      invariant; `bench_spec: ok` = all matched, across 5 built-in diverse prompts). Measured on the
+      4070S, fp32, both models resident (~8 GB), max_tokens 128:
+      - **r ≈ 0.45** — the 0.5B draft forward costs ~45% of a 1.5B target forward (only ~2.2× cheaper;
+        plain target ~40 tok/s, plain draft ~91). This is the binding constraint: even at 100% accept
+        the ceiling is (k+1)/(1+k·r) ≈ 1.4–2.0×, and the target VERIFY forward over k+1 tokens is a
+        mini-prefill (costs more than one decode step), pulling realized speedup to ~1.2×.
+      - **Accept rate is text-dependent:** repetitive/predictable text (france 82–97%, code 83–97%,
+        list 67–95%), reasoning 63–88%, open-ended story ~36%.
+      - **Speedup range 0.91×–1.24×** (best K per prompt): code 1.24×, france 1.22×, list 1.13×, reason
+        1.11×, **story 0.91× — a NET LOSS** (k=8 → 0.64×): when the draft misses, its wasted forwards
+        (0.45× each) + the fatter verify exceed the tokens saved. Predicted (roofline) ran ~0.3–0.4×
+        above measured — the gap is the fatter k+1-token verify + Python's k sequential draft calls,
+        each D2H-ing a full 151936-vocab logit row (device-side token selection is the lever, S3).
+      **Verdict — below the roadmap's *hoped* 1.5–2.5×, and the diagnosis says why:** that target
+      assumes a 7B/70B-style gap (r ~0.1), not 0.5B/1.5B (r ~0.45); the 0.5B isn't cheap enough. Two
+      honest consequences: **P-track can't rescue the *ratio*** (fp16/int8 speeds the target AND the
+      draft together, so tok/s rises but the speedup ratio is ~unchanged — S and P add tok/s
+      independently, they don't multiply here), and **S4 (prompt-lookup, r→0) is the real ratio
+      lever** — a free draft can't regress and its ceiling is k+1. No universal best K (accept falls
+      with k while the verify fattens): k=3–4 balances upside against the low-accept regression.
+      Tuning K is a knob; lowering r is the fix.
 - [ ] **S3** — batched speculative decode + scheduler integration. Fold S into the
       continuous-batching `Scheduler` (each sequence carries a draft + target cache; the verify
       step batches across the running set) — the merge with the F7/F8 serving layer.
 - [ ] **S4 (stretch)** — draft *without* a second model: prompt-lookup / n-gram decoding (propose
       tokens by matching recent context against the prompt — strong on summarize/code, zero draft
-      cost). Same verify + rollback machinery, a different proposer.
+      cost). Same verify + rollback machinery, a different proposer. **S2 promoted this from stretch to
+      the point:** with `r → 0` (no draft forward) the win can't regress and the ceiling is k+1 — the
+      exact ratio lever the 0.5B/1.5B pair's r ≈ 0.45 lacks.
 
 ## Perf retune for 1.5B (P-track) — harvest the un-muted levers
 Not new algorithms — **collect** existing G-track levers on a model that finally pays for them.

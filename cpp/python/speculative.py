@@ -24,7 +24,7 @@ target. `run_spec.py` is the test.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -36,6 +36,7 @@ class SpecStats:
     drafted: int = 0         # draft tokens proposed
     accepted: int = 0        # draft tokens the target accepted
     emitted: int = 0         # tokens actually emitted
+    accept_lengths: list[int] = field(default_factory=list)  # accepted count `a` per verify (S2)
 
     @property
     def accept_rate(self) -> float:
@@ -45,6 +46,16 @@ class SpecStats:
     def tokens_per_verify(self) -> float:
         # The speedup proxy: how many tokens each (expensive) target forward yields.
         return self.emitted / self.verifies if self.verifies else 0.0
+
+    def accept_histogram(self, k: int) -> list[int]:
+        """Counts of verifies by accepted-draft length a = 0..k — the accept-length
+        DISTRIBUTION (S2). The mean (accept_rate) hides the shape: a draft that either
+        nails a whole run or fails at token 0 is bimodal, and that shape is what picks K."""
+        h = [0] * (k + 1)
+        for a in self.accept_lengths:
+            if 0 <= a <= k:
+                h[a] += 1
+        return h
 
 
 def greedy_speculative(target, draft, prompt_ids: list[int], max_tokens: int,
@@ -119,6 +130,7 @@ def greedy_speculative(target, draft, prompt_ids: list[int], max_tokens: int,
         stats.verifies += 1
         stats.drafted += k
         stats.accepted += a
+        stats.accept_lengths.append(a)
 
         # --- Rollback: keep cur + d[0..a-1] (positions L..L+a); tv[a] becomes the next
         # cur, fed fresh next iteration (its K/V isn't in the cache yet). ---
