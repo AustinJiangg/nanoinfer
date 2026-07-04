@@ -219,4 +219,25 @@ void CudaBackend::place_row(Tensor& dst, int64_t s, const Tensor& row) {
                           static_cast<size_t>(width) * sizeof(float), cudaMemcpyDeviceToDevice),
                "place_row");
 }
+
+// Ragged-batch block copies (S3b): [count, width] rows [row_start, row_start+count) are
+// contiguous, so — like extract_row — this is one strideless D2D copy (split_heads does
+// the head transpose downstream). count==1 recovers the extract_row/place_row byte range.
+Tensor CudaBackend::extract_rows(const Tensor& x, int64_t row_start, int64_t count) {
+    const int64_t width = x.size(1);
+    Tensor out = device_alloc({count, width});
+    cuda_check(cudaMemcpy(out.device_ptr(), dptr(x) + row_start * width,
+                          static_cast<size_t>(count * width) * sizeof(float),
+                          cudaMemcpyDeviceToDevice),
+               "extract_rows");
+    return out;
+}
+
+void CudaBackend::place_rows(Tensor& dst, int64_t row_start, const Tensor& block) {
+    const int64_t width = dst.size(1), count = block.size(0);
+    cuda_check(cudaMemcpy(dptr(dst) + row_start * width, block.device_ptr(),
+                          static_cast<size_t>(count * width) * sizeof(float),
+                          cudaMemcpyDeviceToDevice),
+               "place_rows");
+}
 }  // namespace ni

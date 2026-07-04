@@ -1,5 +1,6 @@
 #include "backend.hpp"
 
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 
@@ -56,6 +57,22 @@ Tensor CpuBackend::extract_row(const Tensor& x, int64_t s, int64_t heads, int64_
 void CpuBackend::place_row(Tensor& dst, int64_t s, const Tensor& row) {
     const int64_t width = dst.size(1);
     for (int64_t c = 0; c < width; ++c) dst.at(s, c) = row.at(0, c);
+}
+
+// A contiguous [count, width] block of rows [row_start, row_start+count) of [M, width] —
+// a plain copy (rows are contiguous), no head transpose (split_heads handles that).
+Tensor CpuBackend::extract_rows(const Tensor& x, int64_t row_start, int64_t count) {
+    const int64_t width = x.size(1);
+    Tensor out({count, width});
+    std::memcpy(out.data(), x.data() + row_start * width,
+                static_cast<size_t>(count * width) * sizeof(float));
+    return out;
+}
+
+void CpuBackend::place_rows(Tensor& dst, int64_t row_start, const Tensor& block) {
+    const int64_t width = dst.size(1), count = block.size(0);
+    std::memcpy(dst.data() + row_start * width, block.data(),
+                static_cast<size_t>(count * width) * sizeof(float));
 }
 
 std::unique_ptr<KVCacheBase> CpuBackend::make_kv_cache(int64_t num_layers, int64_t n_kv_heads,

@@ -29,6 +29,7 @@ CPP = HERE.parent
 sys.path.insert(0, str(CPP / "build"))   # nicpp.*.so
 sys.path.insert(0, str(CPP / "python"))  # spec_scheduler, speculative
 
+import numpy as np  # noqa: E402
 import nicpp  # noqa: E402
 from spec_scheduler import SpecRequest, SpecScheduler  # noqa: E402
 from speculative import greedy_prompt_lookup, greedy_speculative  # noqa: E402
@@ -36,6 +37,55 @@ from speculative import greedy_prompt_lookup, greedy_speculative  # noqa: E402
 
 def read_ids(path: Path) -> list[int]:
     return [int(x) for x in path.read_text().split()]
+
+
+def check_spec_batch(model, base: list[int], device: str = "cpu") -> bool:
+    """S3b foundation: the ragged batched verify forward_spec_batch produces the SAME logits
+    as a per-sequence forward for each sequence's block. Sequences at DIFFERENT cache lengths
+    and DIFFERENT block sizes (incl. a 1-row block — the k=0 / prompt-lookup-miss shape)
+    exercise the ragged row_start / pos bookkeeping.
+
+    On the CPU oracle each output row is an independent dot, so fusing the projection GEMMs
+    over all rows cannot change any row -> bit-identical (max|diff|==0), the same reason
+    forward_batch is row-for-row exact. On CUDA the batched vs per-seq row counts can pick a
+    different GEMM kernel (tiled vs GEMV), reordering the float reductions, so the bar is the
+    CLAUDE.md GPU rule: within ~1e-3 AND the greedy token (argmax) identical per row."""
+    # (prompt, verify_block); the block tokens are arbitrary (a real draft guesses wrong).
+    specs = [
+        (base,           [40, 100, 785]),               # 3-row block
+        (base[:3],       [11]),                          # 1-row block (k=0 shape)
+        (base + [12095], [13, 279, 7772, 304, 5]),       # 5-row block, longer prefix
+    ]
+    ref = []                                             # per-sequence forward (the reference)
+    for prompt, block in specs:
+        c = model.make_cache(256)
+        model.forward(prompt, c)
+        ref.append(model.forward(block, c))              # [count, vocab]
+
+    caches = []                                          # fresh caches, same prefills
+    for prompt, _ in specs:
+        c = model.make_cache(256)
+        model.forward(prompt, c)
+        caches.append(c)
+    tokens: list[int] = []
+    counts: list[int] = []
+    for _, block in specs:
+        tokens.extend(block)
+        counts.append(len(block))
+    batched = model.forward_spec_batch(tokens, counts, caches)  # [sum(counts), vocab]
+
+    off, dmax, tok_ok = 0, 0.0, True
+    for r, (_, block) in zip(ref, specs):
+        cnt = len(block)
+        dmax = max(dmax, float(np.max(np.abs(batched[off:off + cnt] - r))))
+        tok_ok = tok_ok and np.array_equal(np.argmax(batched[off:off + cnt], axis=1),
+                                            np.argmax(r, axis=1))
+        off += cnt
+    tol = 0.0 if device == "cpu" else 2e-3
+    ok = dmax <= tol and tok_ok
+    print(f"  spec_batch: forward_spec_batch == per-seq forward  |diff|={dmax:.1e} "
+          f"(tol={tol:.0e}) tokens={'==' if tok_ok else '!='} -> {'OK' if ok else 'FAIL'}")
+    return ok
 
 
 def plain_greedy(model, prompt: list[int], max_tokens: int, eos_id: int = -1) -> list[int]:
@@ -80,27 +130,38 @@ def run_configs(label, target, draft, reqs, batch_sizes) -> bool:
     print(f"{label}: standalone spec == plain greedy -> {'OK' if base_ok else 'FAIL'}")
 
     ok = base_ok
-    for mb in batch_sizes:
-        sched = SpecScheduler(target, draft=draft, max_batch=mb)
-        for r in reqs:
-            sched.add(r)
-        out = sched.run()
-        mism = [rid for rid in ref_spec if out.get(rid) != ref_spec[rid]]
-        match = not mism and len(out) == len(reqs)
-        ok = ok and match
-        tpv = sched.stats.tokens_per_verify
-        print(f"  mb={mb}: steps={sched.steps} peak_batch={sched.peak_batch} "
-              f"verifies={sched.stats.verifies} accept={sched.stats.accept_rate:5.1%} "
-              f"tok/verify={tpv:.2f} -> {'MATCH' if match else 'MISMATCH ' + str(mism)}")
+    # Every request token-identical to standalone spec, invariant to batch size AND to the
+    # verify backing: S3a (per-seq forward loop) and S3b (one ragged forward_spec_batch).
+    for batched in (False, True):
+        tag = "S3b batched " if batched else "S3a per-seq "
+        for mb in batch_sizes:
+            sched = SpecScheduler(target, draft=draft, max_batch=mb, batched=batched)
+            for r in reqs:
+                sched.add(r)
+            out = sched.run()
+            mism = [rid for rid in ref_spec if out.get(rid) != ref_spec[rid]]
+            match = not mism and len(out) == len(reqs)
+            ok = ok and match
+            tpv = sched.stats.tokens_per_verify
+            print(f"  {tag} mb={mb}: steps={sched.steps} peak_batch={sched.peak_batch} "
+                  f"verifies={sched.stats.verifies} accept={sched.stats.accept_rate:5.1%} "
+                  f"tok/verify={tpv:.2f} -> {'MATCH' if match else 'MISMATCH ' + str(mism)}")
     return ok
 
 
 def main() -> int:
     d05 = Path(sys.argv[1] if len(sys.argv) > 1 else "weights/qwen2.5-0.5b")
     d15 = Path(sys.argv[2] if len(sys.argv) > 2 else "weights/qwen2.5-1.5b")
+    device = sys.argv[3] if len(sys.argv) > 3 else "cpu"  # 'cpu' oracle (bit-identical) or 'cuda'
 
-    m05 = nicpp.Model(str(d05))
+    m05 = nicpp.Model(str(d05), device=device)
     ok = True
+    print(f"device={device}")
+
+    # 0. S3b foundation: the ragged batched verify vs per-seq forward (bit-identical on CPU,
+    #    within tolerance + identical tokens on CUDA).
+    print("0. ragged batched verify:")
+    ok &= check_spec_batch(m05, read_ids(d05 / "ref_ids.txt"), device)
 
     # A. target == draft (0.5B/0.5B): draft requests hit 100% accept (all-accepted + bonus
     #    path every step), a strong exercise of the verify+rollback machinery under batching.
@@ -111,7 +172,7 @@ def main() -> int:
     # B. the real pair: target=1.5B, draft=0.5B — genuine (<100%) accept, still token-identical.
     if d15.exists():
         print("\nB. target=1.5B, draft=0.5B (the real pair) + prompt-lookup, mixed batch")
-        m15 = nicpp.Model(str(d15))
+        m15 = nicpp.Model(str(d15), device=device)
         ok &= run_configs("  0.5B->1.5B", m15, m05, build_requests(read_ids(d15 / "ref_ids.txt")),
                           batch_sizes=(1, 2, 8))
     else:

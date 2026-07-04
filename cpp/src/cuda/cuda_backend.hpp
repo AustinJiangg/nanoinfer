@@ -102,6 +102,8 @@ public:
     Tensor alloc(const std::vector<int64_t>& shape) override;
     Tensor extract_row(const Tensor& x, int64_t s, int64_t heads, int64_t dim) override;
     void place_row(Tensor& dst, int64_t s, const Tensor& row) override;
+    Tensor extract_rows(const Tensor& x, int64_t row_start, int64_t count) override;
+    void place_rows(Tensor& dst, int64_t row_start, const Tensor& block) override;
     // R1: the device-resident KV cache (grows by concat, so max_seq is unused) and the result
     // D2H (respecting the graph driver's keep-on-device flag), behind the Backend so the model
     // needs no #ifdef for either. Bodies in cuda_backend.cu.

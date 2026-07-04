@@ -331,4 +331,88 @@ Tensor Model::forward_batch(const std::vector<int64_t>& tokens,
     return backend_->finalize_logits(std::move(logits));
 }
 
+Tensor Model::forward_spec_batch(const std::vector<int64_t>& tokens,
+                                 const std::vector<int64_t>& counts,
+                                 const std::vector<KVCacheBase*>& caches) const {
+    const int64_t n = static_cast<int64_t>(counts.size());
+    if (static_cast<int64_t>(caches.size()) != n)
+        throw std::invalid_argument("forward_spec_batch: counts and caches differ in size");
+    const float eps = cfg_.rms_norm_eps;
+    const int64_t H = cfg_.num_attention_heads, KV = cfg_.num_kv_heads, D = cfg_.head_dim;
+
+    // Each sequence contributes counts[s] contiguous query rows at row_start[s]. Capture
+    // its pre-step cache length (the RoPE position + attention offset of its FIRST verify
+    // row; rows 1..counts[s]-1 sit at pos+1.. — apply_rope/attend advance within the block,
+    // exactly as prefill does) and validate the whole block fits the context window.
+    std::vector<int64_t> pos(static_cast<size_t>(n)), row_start(static_cast<size_t>(n));
+    int64_t M = 0;
+    for (int64_t s = 0; s < n; ++s) {
+        if (caches[s] == nullptr) throw std::invalid_argument("forward_spec_batch: null cache");
+        if (counts[static_cast<size_t>(s)] < 1)
+            throw std::invalid_argument("forward_spec_batch: counts[s] must be >= 1");
+        row_start[static_cast<size_t>(s)] = M;
+        M += counts[static_cast<size_t>(s)];
+        pos[static_cast<size_t>(s)] = caches[s]->length();
+        if (pos[static_cast<size_t>(s)] + counts[static_cast<size_t>(s)] > rope_.cos.size(0))
+            throw std::runtime_error("forward_spec_batch: position " +
+                                     std::to_string(pos[static_cast<size_t>(s)] +
+                                                    counts[static_cast<size_t>(s)]) +
+                                     " exceeds context length " +
+                                     std::to_string(rope_.cos.size(0)));
+    }
+    if (M != static_cast<int64_t>(tokens.size()))
+        throw std::invalid_argument("forward_spec_batch: sum(counts) != tokens.size()");
+    if (M == 0) return Tensor({0, cfg_.vocab_size});
+
+    Tensor x = embed_tokens(tokens);  // [M, hidden]
+
+    for (int64_t i = 0; i < cfg_.num_layers; ++i) {
+        const std::string L = "layers." + std::to_string(i) + ".";
+
+        // --- attention (pre-norm + residual) ---
+        Tensor h = backend_->rmsnorm(x, W(L + "input_layernorm.weight"), eps);  // [M, hidden]
+        // Batched projections: one matmul over all M verify rows, weights streamed once
+        // (the F8a lever — here across the whole ragged verify batch, not one token/seq).
+        Tensor q = project(h, L + "self_attn.q_proj.weight", &W(L + "self_attn.q_proj.bias"));
+        Tensor k = project(h, L + "self_attn.k_proj.weight", &W(L + "self_attn.k_proj.bias"));
+        Tensor v = project(h, L + "self_attn.v_proj.weight", &W(L + "self_attn.v_proj.bias"));
+
+        // Per-sequence attention over that sequence's contiguous query block. Extracting
+        // the block ([cnt, *]) then split_heads is the SAME sequence of ops as forward()
+        // runs for one multi-token pass, so each block is bit-identical to a standalone
+        // forward([cur_s, d_s..], caches[s]) — the S0 verify primitive, now batched.
+        Tensor attn = backend_->alloc({M, H * D});
+        for (int64_t s = 0; s < n; ++s) {
+            const int64_t rs = row_start[static_cast<size_t>(s)];
+            const int64_t cnt = counts[static_cast<size_t>(s)];
+            const int64_t p = pos[static_cast<size_t>(s)];
+            Tensor qh = backend_->split_heads(backend_->extract_rows(q, rs, cnt), H, D);   // [H,cnt,D]
+            Tensor kh = backend_->split_heads(backend_->extract_rows(k, rs, cnt), KV, D);  // [KV,cnt,D]
+            Tensor vh = backend_->split_heads(backend_->extract_rows(v, rs, cnt), KV, D);
+            qh = backend_->apply_rope(qh, rope_.cos, rope_.sin, p);
+            kh = backend_->apply_rope(kh, rope_.cos, rope_.sin, p);
+            // Multi-query causal attend at offset p: query row j attends keys 0..p+j (its
+            // own prefix incl. earlier drafts in the block). The cache appends all cnt K/V.
+            Tensor ah = caches[s]->attend(i, qh, kh, vh, cfg_.n_rep(), /*causal=*/true,
+                                          /*query_offset=*/p);              // [H, cnt, D]
+            backend_->place_rows(attn, rs, backend_->merge_heads(ah));      // [cnt, H*D] -> block
+        }
+        Tensor a = project(attn, L + "self_attn.o_proj.weight", nullptr);  // o_proj: no bias
+        x = backend_->add(x, a);
+
+        // --- SwiGLU MLP (pre-norm + residual), all batched over the M rows ---
+        Tensor hm = backend_->rmsnorm(x, W(L + "post_attention_layernorm.weight"), eps);
+        Tensor gate = backend_->silu(project(hm, L + "mlp.gate_proj.weight", nullptr));
+        Tensor up = project(hm, L + "mlp.up_proj.weight", nullptr);
+        Tensor down = project(backend_->mul(gate, up), L + "mlp.down_proj.weight", nullptr);
+        x = backend_->add(x, down);
+    }
+
+    for (int64_t s = 0; s < n; ++s) caches[s]->advance(counts[static_cast<size_t>(s)]);
+
+    x = backend_->rmsnorm(x, W("norm.weight"), eps);
+    Tensor logits = lm_head(x);  // [M, vocab]
+    return backend_->finalize_logits(std::move(logits));
+}
+
 }  // namespace ni

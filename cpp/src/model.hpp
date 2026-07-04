@@ -46,6 +46,20 @@ public:
     Tensor forward_batch(const std::vector<int64_t>& tokens,
                          const std::vector<KVCacheBase*>& caches) const;
 
+    // Ragged batched verify for speculative decoding (S3b). N sequences, sequence s
+    // contributing counts[s] = k_s+1 query rows (its [cur_s, d_s..] verify block);
+    // `tokens` is the flat concatenation of every sequence's rows (length M = sum(counts)).
+    // The projection GEMMs (q/k/v/o/gate/up/down) fuse over all M rows — every weight
+    // streamed once (the F8a lever, now over the whole verify batch, not one token each);
+    // attention is a per-sequence loop over that sequence's CONTIGUOUS query block, each
+    // block a multi-query causal attend at the sequence's cache offset (the S0 verify
+    // primitive). Rows [row_start_s, row_start_s+counts[s]) of the result equal a standalone
+    // forward([cur_s, d_s..], caches[s]) bit-for-bit; each cache advances by counts[s].
+    // forward_batch is the all-counts==1 special case. Returns logits [M, vocab].
+    Tensor forward_spec_batch(const std::vector<int64_t>& tokens,
+                              const std::vector<int64_t>& counts,
+                              const std::vector<KVCacheBase*>& caches) const;
+
     // Allocate a KV cache sized to this model.
     KVCache make_cache(int64_t max_seq) const;
 

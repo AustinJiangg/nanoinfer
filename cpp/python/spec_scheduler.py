@@ -13,9 +13,10 @@ The scheduler drives the running set in three phases per step:
 
   1. propose — each sequence's proposer guesses k_s tokens (k_s may be 0: a prompt-lookup
      miss degrades that sequence to a plain greedy forward, never a regression).
-  2. verify  — the target confirms each sequence's [cur_s, d_s..]. S3a runs one target
-     forward() PER sequence (the F7-analog: the *scheduling* win, existing kernels). S3b
-     will fuse these into one ragged forward_spec_batch (the F8a-analog: the throughput win).
+  2. verify  — the target confirms each sequence's [cur_s, d_s..]. batched=True (S3b) fuses
+     these into ONE ragged forward_spec_batch — the projection GEMMs run over Sigma(k_s+1)
+     rows (the F8a-analog: the throughput win); batched=False (S3a) runs one forward() per
+     sequence (the F7-analog: the scheduling win alone). The two are token-identical.
   3. commit  — per sequence: accept the longest prefix (the shared `accept_prefix` rule),
      truncate() both caches to discard rejects, emit the confirmed tokens, stop on eos /
      max_tokens.
@@ -107,10 +108,17 @@ class SpecScheduler:
     standalone greedy.
     """
 
-    def __init__(self, target, draft=None, max_batch: int = 8):
+    def __init__(self, target, draft=None, max_batch: int = 8, batched: bool = True):
         self.model = target
         self.draft = draft
         self.max_batch = max_batch
+        # batched=True (S3b) verifies the whole running set in ONE ragged forward_spec_batch:
+        # the per-sequence verify blocks ([cur_s, d_s..], k_s+1 rows each) concatenate into
+        # one call, so the projection GEMMs fuse over Sigma(k_s+1) rows (each weight streamed
+        # once). False (S3a) keeps the per-sequence forward() loop — same tokens, for A/B and
+        # the bit-identity gate. Either way the output is token-identical (paged/contiguous
+        # both bit-exact per block), so this is a throughput knob, never an output change.
+        self.batched = batched
         self.waiting: deque[SpecRequest] = deque()
         self.running: list[SpecSequence] = []
         self.finished: dict[str, list[int]] = {}
@@ -157,13 +165,37 @@ class SpecScheduler:
         seq.proposer = None
 
     def _verify(self, seqs: list[SpecSequence], proposals: list[list[int]]) -> list[np.ndarray]:
-        """S3a verify: one target forward PER sequence over [cur_s, d_s..] -> k_s+1 logit
-        rows, argmax'd to the target's own token at each position. Captures each cache's
-        pre-verify length (verify_L) so commit's truncate rolls back to the confirmed prefix.
-        The single point S3b swaps for one ragged forward_spec_batch across all sequences."""
-        out: list[np.ndarray] = []
-        for seq, d in zip(seqs, proposals):
+        """Verify each sequence's [cur_s, d_s..] (k_s+1 tokens) against the target, returning
+        the target's own argmax at each of the k_s+1 positions per sequence. Two backings,
+        token-identical (S3b is bit-identical to S3a per block):
+          * batched (S3b): ONE ragged forward_spec_batch over the concatenated verify blocks —
+            the projection GEMMs fuse over Sigma(k_s+1) rows.
+          * per-seq (S3a): one forward() per sequence.
+        Each sequence's pre-verify cache length (verify_L) is captured FIRST — a forward only
+        advances its own cache, so capturing up front is valid for both paths — so commit's
+        truncate rolls back to exactly the confirmed prefix."""
+        for seq in seqs:
             seq.verify_L = seq.tcache.length            # confirmed prefix length before verify
+
+        if self.batched:
+            tokens: list[int] = []
+            counts: list[int] = []
+            caches = []
+            for seq, d in zip(seqs, proposals):
+                block = [seq.cur] + d                   # k_s+1 verify tokens
+                tokens.extend(block)
+                counts.append(len(block))
+                caches.append(seq.tcache)
+            logits = self.model.forward_spec_batch(tokens, counts, caches)  # [sum(counts), vocab]
+            out: list[np.ndarray] = []
+            off = 0
+            for c in counts:                            # slice each sequence's block back out
+                out.append(np.argmax(logits[off:off + c], axis=1).astype(np.int64))
+                off += c
+            return out
+
+        out = []
+        for seq, d in zip(seqs, proposals):
             tl = self.model.forward([seq.cur] + d, seq.tcache)
             out.append(np.argmax(tl, axis=1).astype(np.int64))
         return out

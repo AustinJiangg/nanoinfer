@@ -562,14 +562,36 @@ extends unchanged (1.5B fits the ~1.7B fp32 CPU-oracle RAM ceiling).
         same as F7's: this is the **scheduling** win (no head-of-line blocking, dynamic admit/evict,
         one place to serve draft-model AND prompt-lookup requests together) — the verify is still one
         forward per sequence, so the batched-GEMM **throughput** win is S3b.
-  - [ ] **S3b** — the **batched ragged verify kernel** (the F8a-analog, C++): generalize
-        `forward_batch` (which does 1 query row per sequence) to a RAGGED batch — sequence s
-        contributes k_s+1 query rows, so the verify's projection GEMMs fuse over Σ(k_s+1) rows (each
-        weight streamed once, the F8a lever) while attention stays a per-sequence loop over that
-        sequence's contiguous query block (each row causal-masked to its own position — the S0 verify
-        primitive, now per-block). `forward_batch` becomes the all-k_s=1 special case. Swap it in under
-        the phase-2 `_verify` seam; parity gate is bit-identical to the S3a per-sequence verify
-        (`max|diff|=0`) + the run_spec_serve token-identity, both backends.
+  - [x] **S3b** ✅ landed — the **batched ragged verify kernel** (the F8a-analog, C++).
+        `Model::forward_spec_batch(tokens, counts, caches)` generalizes `forward_batch` (1 query row
+        per sequence) to a RAGGED batch: sequence s contributes `counts[s]=k_s+1` query rows and
+        `tokens` is the flat concatenation of every sequence's `[cur_s, d_s..]` (M = Σcounts). The
+        projection GEMMs (q/k/v/o/gate/up/down) fuse over ALL M rows — every weight streamed once (the
+        F8a lever, now across the whole verify batch, not one token per sequence) — while attention
+        stays a per-sequence loop over that sequence's CONTIGUOUS query block: a multi-query causal
+        attend at the sequence's cache offset (the S0 verify primitive, one block at a time).
+        **The key simplification that kept it small: extract the contiguous `[cnt, width]` block then
+        `split_heads` — the SAME op sequence `forward()` runs for one sequence — so NO head transpose is
+        needed.** (`extract_row`'s single-row→`[heads,1,dim]` reshape doesn't generalize: a multi-row
+        block would transpose heads↔rows, but `split_heads` already does exactly that.) So the only new
+        backend ops are `extract_rows`/`place_rows` — contiguous block copies (CPU `memcpy` / one CUDA
+        D2D), the block generalization of `extract_row`/`place_row`, `count==1` recovering them. Wired
+        under the phase-2 `_verify` seam (`SpecScheduler(batched=True)`, the default; `batched=False`
+        keeps the S3a per-seq loop for A/B). **Gate** (`tests/run_spec_serve.py`): `forward_spec_batch`
+        is **bit-identical** to the per-sequence forward on the CPU oracle (`max|diff|=0`, sequences at
+        different cache lengths + block sizes incl. the k=0 1-row shape — the ragged pos/row_start
+        bookkeeping), and every request token-identical to standalone spec at every batch size under
+        BOTH backings (0.5B/0.5B 100% accept + the real 1.5B/0.5B pair 36.8%). On CUDA the batched vs
+        per-seq row count can pick a different GEMM kernel (tiled vs GEMV) → the bar is the CLAUDE.md
+        GPU rule (within ~1e-3 + identical greedy tokens); here M≤16 so both hit GEMV and it's `0.0`
+        anyway. **Honest scope:** S3 makes speculative decode *composable with continuous batching* and
+        fuses the verify's projection GEMMs — the throughput *lever*. It does NOT change spec's
+        per-sequence economics: the realized tok/s win is still bound by S2's r-cap (draft/target cost
+        ratio) per sequence; batching amortizes the *weight streaming* across sequences, which pays when
+        many sequences verify together (server load), the same win F8a gives plain decode. Contiguous
+        caches for now; a paged spec cache (block pool + block-aware admission, the F8b analog) is the
+        follow-up — `forward_spec_batch` already drives any `KVCacheBase` (it calls `attend()`
+        polymorphically), so it's scheduler bookkeeping, not new kernel work.
 - [x] **S4** ✅ landed — draft *without* a second model: **prompt-lookup / n-gram decoding**, the r→0
       ratio lever S2 named as the point (the 0.5B/1.5B pair's r ≈ 0.45 caps it at 1.24×; a free draft
       doesn't). **Same verify + rollback machinery, a different proposer** — realized literally: the S0

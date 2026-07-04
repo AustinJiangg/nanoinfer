@@ -228,6 +228,29 @@ PYBIND11_MODULE(nicpp, m) {
             "Batched single-token decode (F8a): N new tokens + their N KVCaches -> "
             "logits [N, vocab]. Row s equals forward([tokens[s]], caches[s]); each "
             "cache advances by 1. The projection GEMMs are fused over the N rows.")
+        .def(
+            "forward_spec_batch",
+            [](const Model& self, const std::vector<int64_t>& tokens,
+               const std::vector<int64_t>& counts, py::list caches_list) {
+                // Ragged batched verify (S3b): sequence s contributes counts[s] rows of the
+                // flat `tokens`. Cast the cache handles (GIL held) before releasing.
+                std::vector<KVCacheBase*> caches;
+                caches.reserve(caches_list.size());
+                for (const py::handle h : caches_list) caches.push_back(h.cast<KVCacheBase*>());
+                Tensor logits;
+                {
+                    py::gil_scoped_release release;
+                    logits = self.forward_spec_batch(tokens, counts, caches);
+                }
+                return tensor_to_numpy(logits);
+            },
+            py::arg("tokens"), py::arg("counts"), py::arg("caches"),
+            "Ragged batched verify for speculative decoding (S3b): N sequences, sequence s "
+            "contributing counts[s]=k_s+1 query rows (flattened into `tokens`, length "
+            "sum(counts)) + its KVCache -> logits [sum(counts), vocab]. Rows "
+            "[start_s, start_s+counts[s]) equal forward(tokens_s, caches[s]); each cache "
+            "advances by counts[s]. The projection GEMMs fuse over all rows; forward_batch "
+            "is the all-counts==1 case.")
         .def("make_cache",
              [](const Model& self, int64_t max_seq) { return self.make_kv_cache(max_seq); },
              py::arg("max_seq"),

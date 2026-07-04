@@ -54,6 +54,16 @@ public:
     // Write a merged-head [1, width] row back into row s of dst [n, width], in place.
     virtual void place_row(Tensor& dst, int64_t s, const Tensor& row) = 0;
 
+    // --- ragged-batch (speculative verify, S3b) plumbing: forward_spec_batch verifies N
+    // sequences at once, sequence s contributing count_s query rows (k_s+1). Unlike the
+    // decode case above, a sequence's attention block is MULTI-query, so these move a
+    // CONTIGUOUS block of `count` rows [count, width] out of / into a [M, width] batched
+    // tensor — a plain slice (rows are contiguous), NO transpose: split_heads/merge_heads
+    // do the head transpose, exactly as forward() does per sequence. count==1 recovers
+    // extract_row/place_row (which specialize to a single-row reshape). ---
+    virtual Tensor extract_rows(const Tensor& x, int64_t row_start, int64_t count) = 0;
+    virtual void place_rows(Tensor& dst, int64_t row_start, const Tensor& block) = 0;
+
     // --- R1: device objects the factory owns, so Model stays #ifdef-free ---
     // The KV cache native to this backend (CPU KVCache / device CudaKVCache), returned through
     // the base so the model drives either via one pointer. max_seq sizes the preallocated CPU
@@ -108,6 +118,8 @@ public:
     Tensor alloc(const std::vector<int64_t>& shape) override;
     Tensor extract_row(const Tensor& x, int64_t s, int64_t heads, int64_t dim) override;
     void place_row(Tensor& dst, int64_t s, const Tensor& row) override;
+    Tensor extract_rows(const Tensor& x, int64_t row_start, int64_t count) override;
+    void place_rows(Tensor& dst, int64_t row_start, const Tensor& block) override;
     std::unique_ptr<KVCacheBase> make_kv_cache(int64_t num_layers, int64_t n_kv_heads,
                                                int64_t head_dim, int64_t max_seq) override;
 };
