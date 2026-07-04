@@ -117,10 +117,51 @@ int main(int argc, char** argv) {
         std::printf("flash-decoding: paged-split == contiguous-split max|diff|=%g over %d steps (ctx=%zu)\n",
                     splitd, split_steps, longctx.size());
 
-        // Paging is pure indexing — same K/V, same order — so expect bit-identical (split path too).
-        const bool ok = maxd < 1e-4 && greedy_ok && split_ok;
-        std::printf(ok ? "run_cuda_paged: ok\n" : "run_cuda_paged: FAIL\n");
-        return ok ? 0 : 1;
+        // Rollback (S1): truncate(L) + replay is bit-identical to a cache that only ever decoded
+        // the accepted tokens — the same kernels in the same order, so max|diff|==0 even on the
+        // GPU. The contiguous CudaKVCache slices its cat_seq-grown history; the paged cache FREES
+        // the rejected tail blocks, which the replay re-allocates and reuses (small block_size + a
+        // tail longer than the accepted tail forces that reuse). Both must equal the never-had-a-
+        // tail run to the last bit. This is S1's "done when".
+        {
+            const size_t plen = std::min<size_t>(ids.size(), 6);
+            std::vector<int64_t> prompt(ids.begin(), ids.begin() + plen);
+            const std::vector<int64_t> tail = {40, 100, 12095, 785, 11, 42, 7};  // rejected tentative tail
+            const std::vector<int64_t> accepted = {40, 100, 999};                // confirmed continuation
+            auto roll = [&](KVCacheBase* cache) {
+                model.forward(prompt, cache);
+                const int64_t L = cache->length();
+                model.forward(tail, cache);     // tentative K/V for the rejected tail
+                cache->truncate(L);             // roll back to the confirmed prefix
+                return model.forward(accepted, cache);
+            };
+            auto only = [&](KVCacheBase* cache) {
+                model.forward(prompt, cache);
+                return model.forward(accepted, cache);
+            };
+            std::unique_ptr<KVCacheBase> rc =
+                model.make_kv_cache(ids.size() + tail.size() + accepted.size() + 1);
+            std::unique_ptr<KVCacheBase> oc = model.make_kv_cache(ids.size() + accepted.size() + 1);
+            const double rdc = full_maxdiff(roll(rc.get()), only(oc.get()));
+
+            CudaBlockPool rpool(c.num_layers, c.num_kv_heads, c.head_dim, block_size, num_blocks);
+            double rdp;
+            {
+                CudaPagedKVCache rp(&rpool), op(&rpool);
+                rdp = full_maxdiff(roll(&rp), only(&op));
+            }  // both caches finish -> every block returns to the pool
+            const bool recovered = rpool.free_blocks() == rpool.num_blocks();
+            const bool rollback_ok = rdc == 0.0 && rdp == 0.0 && recovered;
+            std::printf("rollback (S1): truncate+replay == decode-only  contiguous max|diff|=%g  "
+                        "paged max|diff|=%g  blocks recovered=%s -> %s\n",
+                        rdc, rdp, recovered ? "yes" : "no",
+                        rollback_ok ? "BIT-IDENTICAL" : "MISMATCH");
+
+            // Paging is pure indexing — same K/V, same order — so expect bit-identical (split path too).
+            const bool ok = maxd < 1e-4 && greedy_ok && split_ok && rollback_ok;
+            std::printf(ok ? "run_cuda_paged: ok\n" : "run_cuda_paged: FAIL\n");
+            return ok ? 0 : 1;
+        }
     } catch (const std::exception& e) {
         std::printf("run_cuda_paged: exception: %s\n", e.what());
         return 1;

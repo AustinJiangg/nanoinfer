@@ -483,10 +483,28 @@ golden-token gate extends unchanged (1.5B fits the ~1.7B fp32 CPU-oracle RAM cei
       No regression (test_cache, run_serve MATCH). Sampling-parity accept (rejection sampling) is the
       open S0 tail, folds into S2. Already efficient on the contiguous cache; S1 promotes `truncate`
       to a tested `KVCacheBase` method + the paged impl (free blocks) + the dedicated rollback gate.
-- [ ] **S1** — KV cache rollback. The verify forward writes K+1 KV entries; the rejected tail is
-      discarded from BOTH caches (truncate-to-length L). Real cache surgery: contiguous moves the
-      length pointer, paged frees the rejected blocks. Done when: the cache after rollback is
-      bit-identical to one that only ever decoded the accepted tokens.
+- [x] **S1** ✅ landed — KV cache rollback, promoted to a `truncate()` override on ALL FOUR caches
+      (S0 shipped only the CPU-contiguous one, behind a base-class default-throw so any cache missing
+      it fails loudly). The verify forward writes K+1 tentative K/V; `truncate(L)` discards the
+      rejected tail, and each cache does its own surgery: **CPU-contiguous** (preallocated) just moves
+      the length pointer — the stale slots past L are overwritten before the next read; **paged (CPU +
+      GPU)** frees every block holding only rejected positions (keep `ceil(L/bs)` — the block
+      straddling L is kept, its stale tail overwritten before read), returning them to the pool where
+      the next forward re-allocates and reuses them (LIFO free-list → it hands back the just-freed
+      tail blocks); **GPU-contiguous** `CudaKVCache` has NO preallocation (it grows by `cat_seq`), so
+      the "move a pointer" trick doesn't exist — rollback slices each layer's `[n_kv, len, hd]` device
+      history to its first L rows per head (the same per-head device-to-device copy `cat_seq` does for
+      its "old" side, so the retained K/V is byte-for-byte unchanged). **Sharp edge (GPU paged):** the
+      device block table only ever *appends* (`sync` uploads `[d_bt_count_, size)`), so after freeing
+      tail blocks `d_bt_count_` is rolled back to the kept count — else a re-allocated slot handed a
+      DIFFERENT physical block id would keep the stale device entry and read wrong K/V. No new kernel
+      code and no binding change (`truncate` was already virtual on `KVCacheBase`) — pure cache
+      bookkeeping. **Done-when gate** (`run_paged` CPU + `run_cuda_paged` GPU): `truncate(L)` +
+      replay-the-accepted-tail is **bit-identical** (max|diff|=0 on every cache, both backends) to a
+      cache that only ever decoded the accepted tokens — a tail longer than the accepted continuation
+      at block_size 4 forces the free+reuse path, and the pool fully recovers its blocks afterward.
+      Regressions green (run_cache, run_cuda_cache, run_cuda_parity golden, run_serve, run_cuda_serve,
+      and S0's run_spec — 0.5B/0.5B 100% accept, 0.5B→1.5B output == plain 1.5B greedy).
 - [ ] **S2** — measure accept rate + tune K (the G5a discipline). Instrument the accept-length
       distribution; sweep draft length K; report end-to-end decode tok/s vs plain 1.5B. No number
       claimed until measured (honest target ~1.5–2.5×, gated on 0.5B→1.5B agreement).

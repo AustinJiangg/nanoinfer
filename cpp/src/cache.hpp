@@ -49,13 +49,16 @@ public:
     // Roll back to `length` filled positions — the speculative-decode rollback (S1).
     // Speculative decode's verify forward writes K+1 *tentative* K/V onto the cache;
     // when the target rejects a drafted token, the tail beyond the accepted prefix is
-    // dropped by discarding positions >= length. The contiguous cache just moves the
-    // length pointer (stale slots are overwritten before they're read again); the paged
-    // / CUDA overrides land in S1. The base default refuses, so a cache that can't yet
-    // roll back fails loudly instead of silently serving stale K/V.
+    // dropped by discarding positions >= length. Every cache overrides this (S1): the
+    // contiguous CPU cache moves the length pointer (stale slots are overwritten before
+    // they're read again); the paged caches free the rejected tail blocks; the device
+    // contiguous cache slices its cat_seq-grown history. All are bit-identical to a cache
+    // that only ever decoded the accepted tokens (run_paged / run_cuda_paged rollback
+    // gate). The base default refuses, so any future cache that forgets to implement it
+    // fails loudly instead of silently serving stale K/V.
     virtual void truncate(int64_t length) {
         (void)length;
-        throw std::runtime_error("KVCacheBase::truncate: this cache has no rollback yet (S1)");
+        throw std::runtime_error("KVCacheBase::truncate: this cache has no rollback (S1)");
     }
 
     virtual int64_t length() const = 0;  // filled positions

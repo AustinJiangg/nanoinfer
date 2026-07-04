@@ -699,6 +699,37 @@ Tensor CudaKVCache::attend(int64_t layer, const Tensor& q, const Tensor& k, cons
 void CudaKVCache::advance(int64_t t) { length_ += t; }
 int64_t CudaKVCache::length() const { return length_; }
 
+void CudaKVCache::truncate(int64_t length) {
+    if (length < 0 || length > length_)
+        throw std::invalid_argument("CudaKVCache::truncate: length " + std::to_string(length) +
+                                    " out of range [0, " + std::to_string(length_) + "]");
+    if (length == length_) return;
+    // No preallocated buffer to move a pointer in (the CPU cache's trick) — the per-layer history
+    // is a cat_seq-grown [n_kv, len, hd] device tensor, so slice it to the first `length` rows per
+    // head. Same per-head device-to-device copy cat_seq does for its "old" side, so the retained
+    // K/V is byte-for-byte what was there. length==0 leaves an empty (numel()==0) history, which
+    // the next cat_seq treats as the first append.
+    const int64_t hd = head_dim_;
+    for (size_t l = 0; l < k_.size(); ++l) {
+        if (k_[l].numel() == 0) continue;             // this layer never written (shouldn't happen)
+        const int64_t oldL = k_[l].size(1);
+        if (length == 0) { k_[l] = Tensor(); v_[l] = Tensor(); continue; }
+        Tensor nk = device_alloc({n_kv_heads_, length, hd});
+        Tensor nv = device_alloc({n_kv_heads_, length, hd});
+        for (int64_t h = 0; h < n_kv_heads_; ++h) {
+            cuda_check(cudaMemcpy(dptr(nk) + h * length * hd, dptr(k_[l]) + h * oldL * hd,
+                                  static_cast<size_t>(length * hd) * sizeof(float),
+                                  cudaMemcpyDeviceToDevice), "CudaKVCache::truncate k");
+            cuda_check(cudaMemcpy(dptr(nv) + h * length * hd, dptr(v_[l]) + h * oldL * hd,
+                                  static_cast<size_t>(length * hd) * sizeof(float),
+                                  cudaMemcpyDeviceToDevice), "CudaKVCache::truncate v");
+        }
+        k_[l] = std::move(nk);
+        v_[l] = std::move(nv);
+    }
+    length_ = length;
+}
+
 // --- Paged KV cache (G4b) ---
 
 CudaBlockPool::CudaBlockPool(int64_t num_layers, int64_t n_kv_heads, int64_t head_dim,
@@ -800,6 +831,24 @@ void CudaPagedKVCache::share_prefix(const std::vector<int64_t>& blocks, int64_t 
     // boundary), so the shared blocks stay read-only — no copy-on-write.
     block_table_ = blocks;
     for (int64_t b : block_table_) pool_->incref(b);
+    length_ = length;
+}
+
+void CudaPagedKVCache::truncate(int64_t length) {
+    if (length < 0 || length > length_)
+        throw std::invalid_argument("CudaPagedKVCache::truncate: length " + std::to_string(length) +
+                                    " out of range [0, " + std::to_string(length_) + "]");
+    const int64_t bs = pool_->block_size();
+    const int64_t keep = (length + bs - 1) / bs;  // ceil(length/bs); 0 when length==0
+    for (int64_t i = keep; i < static_cast<int64_t>(block_table_.size()); ++i)
+        pool_->free(block_table_[static_cast<size_t>(i)]);
+    block_table_.resize(static_cast<size_t>(keep));
+    // The device block table only ever appends (sync uploads [d_bt_count_, size)). After dropping
+    // tail blocks the kept prefix is unchanged and still valid on device, but a later re-allocation
+    // may hand a slot a DIFFERENT physical block, so roll d_bt_count_ back to the kept count to
+    // force that slot's re-upload. No CUDA call — the stale device entries beyond block_table_ are
+    // never read (the kernel only indexes positions < length).
+    if (d_bt_count_ > keep) d_bt_count_ = keep;
     length_ = length;
 }
 

@@ -130,6 +130,10 @@ public:
     Tensor attend(int64_t layer, const Tensor& q, const Tensor& k, const Tensor& v,
                   int64_t n_rep, bool causal, int64_t query_offset) override;
     void advance(int64_t t) override;
+    // Speculative-decode rollback (S1). The device history grows by cat_seq (no preallocation),
+    // so — unlike the CPU cache's move-the-pointer — rollback slices each layer's [n_kv, len, hd]
+    // down to its first `length` rows per head (mirroring cat_seq's per-head copy).
+    void truncate(int64_t length) override;
     int64_t length() const override;
 
 private:
@@ -192,6 +196,10 @@ public:
     Tensor attend(int64_t layer, const Tensor& q, const Tensor& k, const Tensor& v, int64_t n_rep,
                   bool causal, int64_t query_offset) override;
     void advance(int64_t t) override { length_ += t; }
+    // Speculative-decode rollback (S1): free the rejected tail blocks (pure host bookkeeping, like
+    // the CPU PagedKVCache) and roll the device-block-table sync count back so a later
+    // ensure_capacity re-uploads any re-allocated slot (a reused block id may differ).
+    void truncate(int64_t length) override;
     int64_t length() const override { return length_; }
     int64_t num_blocks() const { return static_cast<int64_t>(block_table_.size()); }
     const std::vector<int64_t>& block_table() const { return block_table_; }

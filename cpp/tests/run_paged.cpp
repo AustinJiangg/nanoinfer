@@ -227,6 +227,56 @@ int main(int argc, char** argv) {
                         pass ? "BIT-IDENTICAL" : "MISMATCH");
         }
 
+        // --- 6. Rollback (S1): truncate(L) + replay is bit-identical to a cache that only
+        //     ever decoded the accepted tokens. Speculative decode's verify forward writes a
+        //     tentative tail; truncate discards the rejected part. Contiguous just moves the
+        //     length pointer; paged FREES the tail blocks — which the next forward re-allocates
+        //     and reuses, so a small block_size + a tail longer than the accepted tail exercises
+        //     that reuse. Checked for BOTH cache types; both must equal the never-had-a-tail run
+        //     to the last bit (the retained K/V is untouched, the stale tail is overwritten). ---
+        {
+            const int64_t BS = 4;
+            const size_t plen = std::min<size_t>(base.size(), 6);
+            std::vector<int64_t> prompt(base.begin(), base.begin() + plen);
+            // A long "rejected" tentative tail and a shorter "accepted" continuation (arbitrary
+            // token positions — a draft guesses wrong, so the rejected values never matter).
+            const std::vector<int64_t> tail = {40, 100, 12095, 785, 11, 42, 7};
+            const std::vector<int64_t> accepted = {40, 100, 999};
+
+            // roll: prefill, write the tentative tail, truncate back, replay the accepted tail.
+            auto roll = [&](ni::KVCacheBase* c) {
+                model.forward(prompt, c);
+                const int64_t L = c->length();
+                model.forward(tail, c);       // tentative K/V for the rejected tail
+                c->truncate(L);               // roll back to the confirmed prefix
+                return model.forward(accepted, c);
+            };
+            // only: prefill, then decode ONLY the accepted tail — the reference state.
+            auto only = [&](ni::KVCacheBase* c) {
+                model.forward(prompt, c);
+                return model.forward(accepted, c);
+            };
+
+            ni::KVCache rc = model.make_cache((int64_t)(plen + tail.size() + accepted.size() + 1));
+            ni::KVCache oc = model.make_cache((int64_t)(plen + accepted.size() + 1));
+            const double dc = max_abs_diff(roll(&rc), only(&oc));
+
+            ni::BlockPool pool(cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, BS, /*num_blocks=*/64);
+            double dp;
+            {
+                ni::PagedKVCache rp(&pool), op(&pool);
+                dp = max_abs_diff(roll(&rp), only(&op));
+            }  // both paged caches finish -> every block must return to the pool
+            const bool blocks_recovered = pool.free_blocks() == pool.num_blocks();
+
+            const bool pass = (dc == 0.0) && (dp == 0.0) && blocks_recovered;
+            ok = ok && pass;
+            std::printf("\nrollback (S1): truncate+replay == decode-only  contiguous max|diff|=%g  "
+                        "paged max|diff|=%g  blocks recovered=%s -> %s\n",
+                        dc, dp, blocks_recovered ? "yes" : "no",
+                        pass ? "BIT-IDENTICAL" : "MISMATCH");
+        }
+
         std::printf(ok ? "\nrun_paged: ok\n" : "\nrun_paged: FAIL\n");
         return ok ? 0 : 1;
     } catch (const std::exception& e) {

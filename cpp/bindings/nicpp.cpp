@@ -123,7 +123,8 @@ PYBIND11_MODULE(nicpp, m) {
         .def_property_readonly("length", &KVCacheBase::length, "Filled positions so far.")
         .def("truncate", &KVCacheBase::truncate, py::arg("length"),
              "Roll back to `length` filled positions (speculative-decode rollback): drop the "
-             "K/V for positions >= length. Contiguous cache only until S1.");
+             "K/V for positions >= length. Implemented by every cache (S1): contiguous moves the "
+             "length pointer, paged frees the rejected tail blocks.");
 
     // Contiguous per-sequence KV cache (C3). Created by Model.make_cache, fed back
     // into forward(); move-only in C++, so no copy/constructor is exposed.

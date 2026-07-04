@@ -89,6 +89,11 @@ public:
     Tensor attend(int64_t layer, const Tensor& q, const Tensor& k, const Tensor& v,
                   int64_t n_rep, bool causal, int64_t query_offset) override;
     void advance(int64_t t) override { length_ += t; }
+    // Speculative-decode rollback (S1): drop positions >= `length`, freeing every block that
+    // holds only rejected positions back to the pool. The block straddling `length` is kept —
+    // its stale slots past `length` are overwritten before the next read, exactly like the
+    // contiguous cache's move-the-length-pointer rollback — so it stays bit-identical.
+    void truncate(int64_t length) override;
     int64_t length() const override { return length_; }
     int64_t num_blocks() const { return static_cast<int64_t>(block_table_.size()); }
 

@@ -96,6 +96,22 @@ void PagedKVCache::ensure_capacity(int64_t positions) {
         block_table_.push_back(pool_->allocate());
 }
 
+void PagedKVCache::truncate(int64_t length) {
+    if (length < 0 || length > length_)
+        throw std::invalid_argument("PagedKVCache::truncate: length " + std::to_string(length) +
+                                    " out of range [0, " + std::to_string(length_) + "]");
+    const int64_t bs = pool_->block_size();
+    // Block i covers logical positions [i*bs, (i+1)*bs), so it holds ONLY rejected positions
+    // iff i*bs >= length. Keep ceil(length/bs) blocks (0 when length==0) — the last kept block
+    // may straddle `length`, and its stale tail is overwritten by the next write before it's
+    // read. Free the rest to the pool (a following forward re-allocates, reusing them).
+    const int64_t keep = (length + bs - 1) / bs;
+    for (int64_t i = keep; i < static_cast<int64_t>(block_table_.size()); ++i)
+        pool_->free(block_table_[static_cast<size_t>(i)]);
+    block_table_.resize(static_cast<size_t>(keep));
+    length_ = length;
+}
+
 void PagedKVCache::share_prefix(const std::vector<int64_t>& blocks, int64_t length) {
     if (!block_table_.empty() || length_ != 0)
         throw std::runtime_error("share_prefix: must seed a fresh cache");
