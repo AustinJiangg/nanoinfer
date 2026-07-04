@@ -141,6 +141,32 @@ class PromptLookupProposer:
         pass
 
 
+def accept_prefix(d: list[int], target_argmax) -> tuple[int, list[int]]:
+    """The accept rule — the single source of truth for what a verify confirms (S0).
+
+    Given the proposal `d` (k candidate tokens) and the target's own greedy token at each
+    of the k+1 verified positions (`target_argmax`, an argmax over the k+1 verify logit
+    rows), return `(a, confirmed)`:
+
+      * `a` — the number of accepted drafts: the length of the longest prefix of `d` the
+        target's argmax agrees with.
+      * `confirmed = d[:a] + [target_argmax[a]]` — the tokens to emit this step. If a < k,
+        `target_argmax[a]` is the *correction* replacing the wrong draft d[a]; if a == k,
+        every draft matched and it's the *bonus* token after all k (target_argmax has k+1
+        rows, so index a is always valid).
+
+    Every confirmed token is the target's own argmax at its position, so the output is
+    token-identical to plain target greedy no matter what the proposer guessed — a wrong
+    guess only costs a verify slot, never a wrong token. Shared by the single-sequence loop
+    (`_greedy_spec_core`) and the batched `SpecScheduler`, so the invariant is proved once.
+    """
+    k = len(d)
+    a = 0
+    while a < k and int(target_argmax[a]) == d[a]:
+        a += 1
+    return a, d[:a] + [int(target_argmax[a])]
+
+
 def prompt_lookup(context: list[int], ngram: int, max_k: int) -> list[int]:
     """Find an earlier occurrence of the last `ngram` tokens of `context` and return the
     up-to-`max_k` tokens that followed it. Returns [] when there's no match — a free draft
@@ -211,13 +237,8 @@ def _greedy_spec_core(target, prompt_ids: list[int], max_tokens: int, proposer,
         tl = target.forward([cur] + d, tcache)
         tv = np.argmax(tl, axis=1).astype(np.int64)   # target's greedy token at each position
 
-        # --- Accept the longest prefix the target agrees with. ---
-        a = 0
-        while a < k and int(tv[a]) == d[a]:
-            a += 1
-        # Confirmed this step: d[0..a-1] (accepted) + tv[a] (the correction if a<k, else the
-        # free bonus token if all k accepted). tv has k+1 rows, so tv[a] is always valid.
-        new = d[:a] + [int(tv[a])]
+        # --- Accept the longest prefix the target agrees with (the shared rule). ---
+        a, new = accept_prefix(d, tv)
         stats.verifies += 1
         stats.proposals += 1 if k else 0
         stats.drafted += k

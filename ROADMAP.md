@@ -535,9 +535,41 @@ extends unchanged (1.5B fits the ~1.7B fp32 CPU-oracle RAM ceiling).
       lever** — a free draft can't regress and its ceiling is k+1. No universal best K (accept falls
       with k while the verify fattens): k=3–4 balances upside against the low-accept regression.
       Tuning K is a knob; lowering r is the fix.
-- [ ] **S3** — batched speculative decode + scheduler integration. Fold S into the
-      continuous-batching `Scheduler` (each sequence carries a draft + target cache; the verify
-      step batches across the running set) — the merge with the F7/F8 serving layer.
+- **S3** — batched speculative decode + scheduler integration: fold S into the serving layer
+      (each sequence carries its own target cache + proposer; the running set is driven together).
+      Staged the way this repo has always split scheduling from kernels (F7 → F8a):
+  - [x] **S3a** ✅ landed — the **scheduling** integration (the F7-analog), **pure Python over the
+        existing kernels, no rebuild.** `SpecScheduler` (`cpp/python/spec_scheduler.py`) mirrors the
+        continuous-batching `Scheduler` shape — admit / evict / dynamic batch — around the S0 spec
+        loop, but a step emits a VARIABLE number of tokens per sequence (0..k+1), so it can't reuse
+        `Scheduler` directly. Each running `SpecSequence` owns its target KV cache AND its proposer (a
+        `DraftModelProposer` keeps a per-sequence draft cache lock-step with the target;
+        `PromptLookupProposer` is stateless), and the step runs three phases: **propose** (each
+        proposer guesses k_s, k_s may be 0 on a lookup miss → that sequence degrades to a plain greedy
+        forward), **verify** (S3a: one target `forward([cur_s, d_s..])` PER sequence — the single point
+        S3b swaps for a ragged batched forward), **commit** (per sequence: the shared `accept_prefix`
+        rule → `truncate` BOTH caches to the confirmed prefix → emit → stop on eos/max_tokens). The
+        accept rule was extracted to ONE helper (`speculative.accept_prefix`) shared by the
+        single-sequence loop and the scheduler, so the token-identity invariant is proved once; the
+        scheduler's `_emit` mirrors `_greedy_spec_core.emit` (eos convention included) exactly, making
+        a scheduled sequence provably identical to standalone `greedy_speculative` /
+        `greedy_prompt_lookup`. **Done-when gate** (`tests/run_spec_serve.py`, the run_serve.py analog):
+        every request's output is token-identical to BOTH standalone spec AND plain greedy (the S0
+        invariant), at every batch size (mb 1/2/8) and for every proposer — including a **MIXED
+        draft+lookup batch** (the real test of per-sequence proposer independence). Green on 0.5B/0.5B
+        (100% accept, all-accepted+bonus path every step) and the real 1.5B/0.5B pair (genuine 36.8%
+        accept, peak_batch 6, batch-invariant: verifies + output identical across mb). Honest scope,
+        same as F7's: this is the **scheduling** win (no head-of-line blocking, dynamic admit/evict,
+        one place to serve draft-model AND prompt-lookup requests together) — the verify is still one
+        forward per sequence, so the batched-GEMM **throughput** win is S3b.
+  - [ ] **S3b** — the **batched ragged verify kernel** (the F8a-analog, C++): generalize
+        `forward_batch` (which does 1 query row per sequence) to a RAGGED batch — sequence s
+        contributes k_s+1 query rows, so the verify's projection GEMMs fuse over Σ(k_s+1) rows (each
+        weight streamed once, the F8a lever) while attention stays a per-sequence loop over that
+        sequence's contiguous query block (each row causal-masked to its own position — the S0 verify
+        primitive, now per-block). `forward_batch` becomes the all-k_s=1 special case. Swap it in under
+        the phase-2 `_verify` seam; parity gate is bit-identical to the S3a per-sequence verify
+        (`max|diff|=0`) + the run_spec_serve token-identity, both backends.
 - [x] **S4** ✅ landed — draft *without* a second model: **prompt-lookup / n-gram decoding**, the r→0
       ratio lever S2 named as the point (the 0.5B/1.5B pair's r ≈ 0.45 caps it at 1.24×; a free draft
       doesn't). **Same verify + rollback machinery, a different proposer** — realized literally: the S0
