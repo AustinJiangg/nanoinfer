@@ -96,6 +96,7 @@ class SpecSequence:
         self.context: list[int] = list(req.prompt_ids)  # prompt + generated; drives lookup
         self.cur: int = -1                # set from the prefill logits at admission
         self.verify_L: int = 0            # tcache length captured just before a verify
+        self.reserved_blocks = 0          # target KV blocks reserved for it (paged mode)
         self.state = State.WAITING
 
 
@@ -108,7 +109,8 @@ class SpecScheduler:
     standalone greedy.
     """
 
-    def __init__(self, target, draft=None, max_batch: int = 8, batched: bool = True):
+    def __init__(self, target, draft=None, max_batch: int = 8, batched: bool = True,
+                 block_size: int = 0, num_blocks: int = 0):
         self.model = target
         self.draft = draft
         self.max_batch = max_batch
@@ -119,6 +121,18 @@ class SpecScheduler:
         # the bit-identity gate. Either way the output is token-identical (paged/contiguous
         # both bit-exact per block), so this is a throughput knob, never an output change.
         self.batched = batched
+        # block_size>0 pages the TARGET cache (the F8b analog for the verify cache): each
+        # sequence draws a PagedKVCache from one shared BlockPool instead of preallocating a
+        # contiguous cache to its worst-case length, and admission is gated on KV blocks
+        # (conservatively reserving each sequence's worst case so the pool can't over-commit,
+        # even at the tentative-verify peak). block_size=0 keeps the contiguous cache. The
+        # target is the memory-dominant 1.5B cache and the one truncate() rolls back; the
+        # draft proposer's cache stays contiguous (the smaller 0.5B model — paging it needs a
+        # separate draft-dim pool, a follow-up). Paged is bit-exact (S1), so tokens are
+        # unchanged; the win is no per-sequence preallocation + block reuse across requests.
+        self.paged = block_size > 0
+        self.pool = target.make_block_pool(block_size, num_blocks) if self.paged else None
+        self.reserved = 0              # target KV blocks reserved by running sequences (paged)
         self.waiting: deque[SpecRequest] = deque()
         self.running: list[SpecSequence] = []
         self.finished: dict[str, list[int]] = {}
@@ -161,6 +175,9 @@ class SpecScheduler:
     def _finish(self, seq: SpecSequence) -> None:
         seq.state = State.FINISHED
         self.finished[seq.req.request_id] = seq.output_ids
+        if self.paged:
+            # Drop the reservation; the PagedKVCache destructor returns its blocks to the pool.
+            self.reserved -= seq.reserved_blocks
         seq.tcache = None            # release the target cache; the draft cache frees with the proposer
         seq.proposer = None
 
@@ -228,18 +245,40 @@ class SpecScheduler:
         """Fill free slots with queued requests: prefill the target on the prompt, prime the
         proposer, emit the first token from the prefill logits (so an admitted sequence has
         produced one token by the end of its admission step — same as the single-sequence
-        loop and as Scheduler's prefill-then-emit)."""
+        loop and as Scheduler's prefill-then-emit). In paged mode admission is also gated on
+        target KV blocks (FCFS: if the head request can't be reserved yet, wait rather than
+        skip ahead — no starvation)."""
         while len(self.running) < self.max_batch and self.waiting:
-            req = self.waiting.popleft()
+            req = self.waiting[0]                        # peek: FCFS block gating may make us wait
             if not req.prompt_ids:                       # nothing to condition on
+                self.waiting.popleft()
                 self.finished[req.request_id] = []
                 continue
 
-            # Cache sized for prompt + everything emitted + max_k slack for the tentative tail.
+            # Cache sized for prompt + everything emitted + max_k slack for the tentative tail
+            # (the k+1 tentative rows a verify writes before truncate rolls them back).
             cap = len(req.prompt_ids) + req.max_tokens + req.max_k + 1
+            reserved = 0
+            if self.paged:
+                bs = self.pool.block_size
+                worst = (cap + bs - 1) // bs             # worst-case blocks (incl. tentative tail)
+                if worst > self.pool.num_blocks:
+                    raise ValueError(
+                        f"request {req.request_id} needs {worst} blocks; pool has "
+                        f"{self.pool.num_blocks} (raise num_blocks or block_size)")
+                if self.reserved + worst > self.pool.num_blocks:
+                    break                                # not enough free blocks now; keep it queued
+                reserved = worst
+                tcache = self.pool.make_cache()          # PagedKVCache / CudaPagedKVCache by device
+                self.reserved += reserved
+            else:
+                tcache = self.model.make_cache(cap)
+
+            self.waiting.popleft()
             proposer = self._make_proposer(req)
             proposer.prefill(req.prompt_ids, cap)        # draft: prefill its lock-step cache
-            seq = SpecSequence(req, self.model.make_cache(cap), proposer)
+            seq = SpecSequence(req, tcache, proposer)
+            seq.reserved_blocks = reserved
 
             tlog = self.model.forward(req.prompt_ids, seq.tcache)
             seq.cur = int(np.argmax(tlog[-1]))           # first token (its K/V fed fresh next step)

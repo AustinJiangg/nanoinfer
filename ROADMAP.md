@@ -588,10 +588,25 @@ extends unchanged (1.5B fits the ~1.7B fp32 CPU-oracle RAM ceiling).
         fuses the verify's projection GEMMs — the throughput *lever*. It does NOT change spec's
         per-sequence economics: the realized tok/s win is still bound by S2's r-cap (draft/target cost
         ratio) per sequence; batching amortizes the *weight streaming* across sequences, which pays when
-        many sequences verify together (server load), the same win F8a gives plain decode. Contiguous
-        caches for now; a paged spec cache (block pool + block-aware admission, the F8b analog) is the
-        follow-up — `forward_spec_batch` already drives any `KVCacheBase` (it calls `attend()`
-        polymorphically), so it's scheduler bookkeeping, not new kernel work.
+        many sequences verify together (server load), the same win F8a gives plain decode.
+  - [x] **S3c** ✅ landed — **paged spec cache** (the F8b analog, pure Python — no rebuild).
+        `SpecScheduler(block_size=..., num_blocks=...)` draws each sequence's TARGET cache from one
+        shared `BlockPool` (`CudaBlockPool` on GPU) instead of preallocating a contiguous cache to its
+        worst-case length, and gates admission on KV blocks (FCFS: peek the head, reserve its
+        worst-case, or wait — no starvation). The reservation is the key correctness point: it includes
+        the **tentative-verify tail** (`cap = prompt + max_tokens + max_k + 1`), because one
+        `forward_spec_batch` writes all N sequences' k_s+1 tentative K/V *before* any `truncate` rolls
+        the rejected part back — so all N tentative peaks coexist in the pool at once; reserving each
+        sequence's worst-case (≥ its tentative peak) means the sum can't over-commit mid-verify. **No
+        new kernel:** `forward_spec_batch` already drives the paged cache through the same polymorphic
+        `attend()` (block-indexed write, tested for multi-query since prefill) and `_commit` rolls back
+        via the same `truncate()` (paged frees the rejected tail blocks, S1) — so paging is bit-exact
+        and output token-identical. **Gate** (`tests/run_spec_serve.py`, the run_serve.py paged analog):
+        every request token-identical to standalone spec under a paged target cache, on CPU + CUDA; a
+        TIGHT pool (bs=8, nb=8) forces block-aware queueing + reuse (peak_batch 6→2) and every block
+        returns to the pool once all sequences finish (`pool_free == num_blocks`, no leak). The draft
+        proposer's cache stays contiguous (the smaller 0.5B model; paging it needs a second draft-dim
+        pool — the remaining refinement, plus prefix-sharing across spec requests, both mechanical).
 - [x] **S4** ✅ landed — draft *without* a second model: **prompt-lookup / n-gram decoding**, the r→0
       ratio lever S2 named as the point (the 0.5B/1.5B pair's r ≈ 0.45 caps it at 1.24×; a free draft
       doesn't). **Same verify + rollback machinery, a different proposer** — realized literally: the S0

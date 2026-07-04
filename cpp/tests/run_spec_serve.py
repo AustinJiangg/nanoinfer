@@ -130,22 +130,35 @@ def run_configs(label, target, draft, reqs, batch_sizes) -> bool:
     print(f"{label}: standalone spec == plain greedy -> {'OK' if base_ok else 'FAIL'}")
 
     ok = base_ok
-    # Every request token-identical to standalone spec, invariant to batch size AND to the
-    # verify backing: S3a (per-seq forward loop) and S3b (one ragged forward_spec_batch).
+    # Every request token-identical to standalone spec, invariant to: batch size, the verify
+    # backing (S3a per-seq loop / S3b ragged forward_spec_batch), AND the target cache being
+    # contiguous or paged. The paged cache is bit-exact (S1), so paging can't change a token;
+    # a TIGHT pool (nb=8) forces block-aware queueing + reuse, and all blocks must return to
+    # the pool once every sequence finishes.
+    configs = []
     for batched in (False, True):
-        tag = "S3b batched " if batched else "S3a per-seq "
         for mb in batch_sizes:
-            sched = SpecScheduler(target, draft=draft, max_batch=mb, batched=batched)
-            for r in reqs:
-                sched.add(r)
-            out = sched.run()
-            mism = [rid for rid in ref_spec if out.get(rid) != ref_spec[rid]]
-            match = not mism and len(out) == len(reqs)
-            ok = ok and match
-            tpv = sched.stats.tokens_per_verify
-            print(f"  {tag} mb={mb}: steps={sched.steps} peak_batch={sched.peak_batch} "
-                  f"verifies={sched.stats.verifies} accept={sched.stats.accept_rate:5.1%} "
-                  f"tok/verify={tpv:.2f} -> {'MATCH' if match else 'MISMATCH ' + str(mism)}")
+            configs.append((f"S3{'b' if batched else 'a'} {'batched' if batched else 'per-seq'} mb={mb}    ",
+                            dict(max_batch=mb, batched=batched)))
+    configs.append(("S3b paged bs=8 nb=8 (tight)", dict(max_batch=8, batched=True, block_size=8, num_blocks=8)))
+    configs.append(("S3b paged bs=8 nb=32       ", dict(max_batch=8, batched=True, block_size=8, num_blocks=32)))
+    for name, kw in configs:
+        sched = SpecScheduler(target, draft=draft, **kw)
+        for r in reqs:
+            sched.add(r)
+        out = sched.run()
+        mism = [rid for rid in ref_spec if out.get(rid) != ref_spec[rid]]
+        match = not mism and len(out) == len(reqs)
+        extra = ""
+        if sched.paged:
+            # Every block must return to the pool once all sequences finish (no leak).
+            freed = sched.pool.free_blocks == sched.pool.num_blocks
+            match = match and freed
+            extra = f" pool_free={sched.pool.free_blocks}/{sched.pool.num_blocks}"
+        ok = ok and match
+        print(f"  {name}: steps={sched.steps} peak_batch={sched.peak_batch}{extra} "
+              f"accept={sched.stats.accept_rate:5.1%} tok/verify={sched.stats.tokens_per_verify:.2f} "
+              f"-> {'MATCH' if match else 'MISMATCH ' + str(mism)}")
     return ok
 
 
