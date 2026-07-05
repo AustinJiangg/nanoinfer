@@ -114,6 +114,7 @@ class SpecSequence:
         self.cur: int = -1                # set from the prefill logits at admission
         self.verify_L: int = 0            # tcache length captured just before a verify
         self.reserved_blocks = 0          # target KV blocks reserved for it (paged mode)
+        self.reserved_draft_blocks = 0    # draft KV blocks reserved for it (paged draft, S3d)
         # Sampling (S5): a per-sequence numpy Generator seeded from the request, so the draw
         # sequence is independent of every other sequence — that's what makes a sampled
         # sequence token-identical to standalone at the same seed, batch-invariant.
@@ -149,14 +150,21 @@ class SpecScheduler:
         # sequence draws a PagedKVCache from one shared BlockPool instead of preallocating a
         # contiguous cache to its worst-case length, and admission is gated on KV blocks
         # (conservatively reserving each sequence's worst case so the pool can't over-commit,
-        # even at the tentative-verify peak). block_size=0 keeps the contiguous cache. The
-        # target is the memory-dominant 1.5B cache and the one truncate() rolls back; the
-        # draft proposer's cache stays contiguous (the smaller 0.5B model — paging it needs a
-        # separate draft-dim pool, a follow-up). Paged is bit-exact (S1), so tokens are
-        # unchanged; the win is no per-sequence preallocation + block reuse across requests.
+        # even at the tentative-verify peak). block_size=0 keeps the contiguous cache. Paged is
+        # bit-exact (S1), so tokens are unchanged; the win is no per-sequence preallocation +
+        # block reuse across requests.
         self.paged = block_size > 0
         self.pool = target.make_block_pool(block_size, num_blocks) if self.paged else None
         self.reserved = 0              # target KV blocks reserved by running sequences (paged)
+        # S3d: when paged, the DRAFT proposer's cache is paged too — from a SEPARATE pool, since
+        # the draft model's dims (0.5B) differ from the target's (1.5B). Same block_size/
+        # num_blocks: a draft cache grows lock-step with its target, so it needs the same number
+        # of token-blocks per sequence. Only "draft"-proposer requests draw draft blocks
+        # (prompt-lookup is stateless), so its reservation is tracked independently of the
+        # target's (a lookup-heavy batch fills the target pool while the draft pool stays idle).
+        self.dpool = (draft.make_block_pool(block_size, num_blocks)
+                      if self.paged and draft is not None else None)
+        self.reserved_draft = 0        # draft KV blocks reserved by running draft sequences
         self.waiting: deque[SpecRequest] = deque()
         self.running: list[SpecSequence] = []
         self.finished: dict[str, list[int]] = {}
@@ -175,7 +183,8 @@ class SpecScheduler:
             if self.draft is None:
                 raise ValueError(f"request {req.request_id} uses the draft proposer but the "
                                  "scheduler has no draft model")
-            return DraftModelProposer(self.draft, req.k)
+            # pool is None unless paged (S3d): the draft cache pages from its own draft-dim pool.
+            return DraftModelProposer(self.draft, req.k, pool=self.dpool)
         if req.proposer == "lookup":
             return PromptLookupProposer(req.ngram, req.k)
         raise ValueError(f"unknown proposer {req.proposer!r} (want 'draft' or 'lookup')")
@@ -200,8 +209,10 @@ class SpecScheduler:
         seq.state = State.FINISHED
         self.finished[seq.req.request_id] = seq.output_ids
         if self.paged:
-            # Drop the reservation; the PagedKVCache destructor returns its blocks to the pool.
+            # Drop both reservations; each PagedKVCache destructor returns its blocks to its own
+            # pool (target when tcache clears; draft when the proposer clears — S3d).
             self.reserved -= seq.reserved_blocks
+            self.reserved_draft -= seq.reserved_draft_blocks
         seq.tcache = None            # release the target cache; the draft cache frees with the proposer
         seq.proposer = None
 
@@ -296,26 +307,38 @@ class SpecScheduler:
             # (the k+1 tentative rows a verify writes before truncate rolls them back).
             cap = len(req.prompt_ids) + req.max_tokens + req.max_k + 1
             reserved = 0
+            reserved_draft = 0
             if self.paged:
                 bs = self.pool.block_size
                 worst = (cap + bs - 1) // bs             # worst-case blocks (incl. tentative tail)
-                if worst > self.pool.num_blocks:
+                # A "draft" request also draws `worst` DRAFT blocks (its draft cache grows
+                # lock-step with the target, same cap/block_size — S3d); "lookup" draws none.
+                dworst = worst if req.proposer == "draft" and self.dpool is not None else 0
+                if worst > self.pool.num_blocks or dworst > (self.dpool.num_blocks if self.dpool else 0):
                     raise ValueError(
-                        f"request {req.request_id} needs {worst} blocks; pool has "
-                        f"{self.pool.num_blocks} (raise num_blocks or block_size)")
-                if self.reserved + worst > self.pool.num_blocks:
+                        f"request {req.request_id} needs {worst} target / {dworst} draft blocks; "
+                        f"pool has {self.pool.num_blocks} (raise num_blocks or block_size)")
+                # Gate on BOTH pools (FCFS): keep the head request queued unless target AND draft
+                # blocks are free. Target pressure >= draft pressure (lookups reserve only target),
+                # so the target check usually binds — but check both so paging is self-evidently
+                # safe regardless of pool sizing.
+                if (self.reserved + worst > self.pool.num_blocks
+                        or (dworst and self.reserved_draft + dworst > self.dpool.num_blocks)):
                     break                                # not enough free blocks now; keep it queued
                 reserved = worst
+                reserved_draft = dworst
                 tcache = self.pool.make_cache()          # PagedKVCache / CudaPagedKVCache by device
                 self.reserved += reserved
+                self.reserved_draft += reserved_draft
             else:
                 tcache = self.model.make_cache(cap)
 
             self.waiting.popleft()
             proposer = self._make_proposer(req)
-            proposer.prefill(req.prompt_ids, cap)        # draft: prefill its lock-step cache
+            proposer.prefill(req.prompt_ids, cap)        # draft: prefill its lock-step (paged) cache
             seq = SpecSequence(req, tcache, proposer)
             seq.reserved_blocks = reserved
+            seq.reserved_draft_blocks = reserved_draft
 
             tlog = self.model.forward(req.prompt_ids, seq.tcache)
             if seq.sampling:                             # first token: a draw from the shaped

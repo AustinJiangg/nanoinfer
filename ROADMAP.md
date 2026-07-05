@@ -606,7 +606,30 @@ extends unchanged (1.5B fits the ~1.7B fp32 CPU-oracle RAM ceiling).
         TIGHT pool (bs=8, nb=8) forces block-aware queueing + reuse (peak_batch 6→2) and every block
         returns to the pool once all sequences finish (`pool_free == num_blocks`, no leak). The draft
         proposer's cache stays contiguous (the smaller 0.5B model; paging it needs a second draft-dim
-        pool — the remaining refinement, plus prefix-sharing across spec requests, both mechanical).
+        pool — S3d below, plus prefix-sharing across spec requests — S3e).
+  - [x] **S3d** ✅ landed — **paged draft cache** (S3c's named follow-up: the DraftModelProposer's KV
+        cache, the one cache S3c left contiguous, now pages too). `DraftModelProposer(pool=...)` draws
+        its draft cache from a `BlockPool` — but a SECOND, DRAFT-DIM pool: the draft model's dims (0.5B:
+        fewer layers, smaller head_dim) differ from the target's (1.5B), so its blocks are a different
+        size and it needs its OWN pool (`SpecScheduler` builds `self.dpool = draft.make_block_pool(...)`
+        when paged). Both caches page independently; each `truncate` frees its own tail blocks (S1), so
+        the lock-step invariant (one accept-length rolls back BOTH caches) is unchanged — only *where*
+        the draft blocks come from moved. **The reservation is the subtle part:** only "draft"-proposer
+        requests draw draft blocks (prompt-lookup is stateless), so the draft reservation is tracked
+        SEPARATELY from the target's — a lookup-heavy batch fills the target pool while the draft pool
+        stays idle. Admission gates on BOTH pools (each draft sequence reserves the same
+        `worst = ceil(cap/bs)` blocks in the draft pool as the target — the draft cache grows lock-step,
+        same cap/block_size; target pressure ≥ draft pressure since lookups reserve only target, so the
+        target check usually binds, but both are checked so paging is self-evidently safe). **No new
+        kernel, no binding change** — pure Python orchestration over the existing polymorphic
+        `KVCacheBase` (the draft `forward`/`truncate` have driven a paged cache since F8b). **Gate**
+        (`tests/run_spec_serve.py`): with the target paged the draft is auto-paged from its own pool, and
+        every request stays token-identical to standalone spec on the real 1.5B/0.5B pair (draft pool =
+        0.5B dims, target pool = 1.5B dims) at every batch size; a TIGHT pool (bs=8, nb=8) forces
+        draft-block REUSE across the 3 draft requests (3 reqs × 3 blocks > 8) and BOTH pools fully return
+        (`pool_free == dpool_free == num_blocks`, no leak on either). **Honest scope:** removes the last
+        per-sequence worst-case preallocation in the spec scheduler (the draft cache) — a memory/packing
+        win, not a tok/s one; realized speedup is still S2's r-cap.
 - [x] **S4** ✅ landed — draft *without* a second model: **prompt-lookup / n-gram decoding**, the r→0
       ratio lever S2 named as the point (the 0.5B/1.5B pair's r ≈ 0.45 caps it at 1.24×; a free draft
       doesn't). **Same verify + rollback machinery, a different proposer** — realized literally: the S0

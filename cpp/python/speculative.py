@@ -105,16 +105,26 @@ class SpecStats:
 
 class DraftModelProposer:
     """S0/S1: a small draft model autoregressively proposes k tokens, keeping its own KV
-    cache lock-step with the target so ONE truncate(keep) rolls back both."""
+    cache lock-step with the target so ONE truncate(keep) rolls back both.
 
-    def __init__(self, draft, k: int):
+    The draft cache is contiguous by default; pass a `pool` (a draft-dim BlockPool) to page it
+    (S3d) — the F8b/S3c win for the draft cache. The draft model's dims differ from the
+    target's, so it needs its OWN pool; both caches page independently and each truncate frees
+    its own tail blocks. Everything downstream (propose / rollback) drives the cache through the
+    polymorphic KVCacheBase interface, so paging changes only where blocks come from, never the
+    tokens (paged is bit-exact — S1)."""
+
+    def __init__(self, draft, k: int, pool=None):
         self.draft = draft
         self.max_k = k
+        self.pool = pool          # draft-dim BlockPool -> paged draft cache; None -> contiguous
         self.dcache = None
 
     def prefill(self, prompt_ids: list[int], cap: int) -> None:
         # The draft cache must track the same history so its proposals are conditioned right.
-        self.dcache = self.draft.make_cache(cap)
+        # Paged (S3d): draw it from the draft pool (lazy blocks, reused across requests) instead
+        # of preallocating a contiguous cache to `cap` — mirrors how the target cache is paged.
+        self.dcache = self.pool.make_cache() if self.pool is not None else self.draft.make_cache(cap)
         self.draft.forward(prompt_ids, self.dcache)
 
     def propose(self, cur: int, context: list[int]) -> list[int]:

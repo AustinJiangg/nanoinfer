@@ -151,10 +151,15 @@ def run_configs(label, target, draft, reqs, batch_sizes) -> bool:
         match = not mism and len(out) == len(reqs)
         extra = ""
         if sched.paged:
-            # Every block must return to the pool once all sequences finish (no leak).
+            # Every block must return to the pool once all sequences finish (no leak) — both the
+            # target pool AND the draft pool (S3d pages the draft cache from its own draft-dim pool).
             freed = sched.pool.free_blocks == sched.pool.num_blocks
-            match = match and freed
             extra = f" pool_free={sched.pool.free_blocks}/{sched.pool.num_blocks}"
+            if sched.dpool is not None:
+                dfreed = sched.dpool.free_blocks == sched.dpool.num_blocks
+                freed = freed and dfreed
+                extra += f" dpool_free={sched.dpool.free_blocks}/{sched.dpool.num_blocks}"
+            match = match and freed
         ok = ok and match
         print(f"  {name}: steps={sched.steps} peak_batch={sched.peak_batch}{extra} "
               f"accept={sched.stats.accept_rate:5.1%} tok/verify={sched.stats.tokens_per_verify:.2f} "
