@@ -107,4 +107,32 @@ int64_t sample_next_token(std::vector<float> logits, const SamplingParams& param
     return dist(rng);
 }
 
+std::vector<float> token_probs(std::vector<float> logits, const SamplingParams& params,
+                               const std::vector<int64_t>& context) {
+    // The SAME pipeline as sample_next_token, returning the distribution instead of a
+    // draw. Kept as a sibling (not a shared refactor) so sample_next_token's byte-exact
+    // draw — and thus generate()'s seeded output — is untouched; the shared apply_*
+    // warpers are the single source of truth for the shape.
+    apply_repetition_penalty(logits, context, params.repetition_penalty);
+
+    std::vector<float> probs(logits.size(), 0.0f);
+    if (params.greedy()) {                 // one-hot argmax -> sampling from it IS greedy
+        probs[static_cast<size_t>(argmax(logits))] = 1.0f;
+        return probs;
+    }
+
+    apply_temperature(logits, params.temperature);
+    apply_top_k(logits, params.top_k);
+    apply_top_p(logits, params.top_p);
+
+    // softmax (masked -inf logits -> weight 0), then normalize. Double accumulation for
+    // the denominator, matching sample_next_token's discrete_distribution weights.
+    const float maxv = *std::max_element(logits.begin(), logits.end());
+    std::vector<double> w(logits.size());
+    double denom = 0.0;
+    for (size_t i = 0; i < logits.size(); ++i) { w[i] = std::exp(double(logits[i]) - maxv); denom += w[i]; }
+    for (size_t i = 0; i < logits.size(); ++i) probs[i] = static_cast<float>(w[i] / denom);
+    return probs;
+}
+
 }  // namespace ni

@@ -636,8 +636,46 @@ extends unchanged (1.5B fits the ~1.7B fp32 CPU-oracle RAM ceiling).
       **Verdict — S4 delivers the lever S2 named:** on copy-heavy text (RAG / summarize / code-edit /
       repetitive) it reaches 2.8–3.4×, well past the draft pair's 1.24× ceiling, *because the draft cost
       is gone* — and it needs no second model and no extra memory. Not universal (open-ended is a ~1×
-      no-op), but it never meaningfully regresses. The open S0 tail (sampling-parity rejection-sampling
-      accept) is unchanged; batched integration is S3.
+      no-op), but it never meaningfully regresses. Batched integration is S3; the sampling-parity
+      accept tail is S5.
+- [x] **S5** ✅ landed — **sampling-parity accept: speculative *sampling* (rejection sampling)**, the
+      "open S0 tail" every prior S-stage deferred. The greedy track rests on token-IDENTITY (every
+      emitted token is the target's argmax); sampling is random, so the invariant becomes
+      DISTRIBUTIONAL: every emitted token's marginal is EXACTLY the target's own shaped distribution p,
+      for ANY proposer (Leviathan et al. / Chen et al.). **Same verify + rollback machinery, a different
+      accept rule** — realized as the sibling of the greedy loop: `_sample_spec_core` mirrors
+      `_greedy_spec_core`, and `rejection_accept` is the distribution analog of `accept_prefix`. Accept
+      draft d_i with prob min(1, p_i(d_i)/q_i(d_i)); on the first reject resample a correction from the
+      normalized residual (p_i − q_i)₊ and STOP; if all k accept, sample a bonus from p_k. The draft
+      proposer now SAMPLES its k tokens from its own shaped q (not argmax) and returns those q's;
+      prompt-lookup is a point-mass proposal (q_i(d_i)=1 → accept prob p_i(d_i), residual = p with d_i
+      zeroed) — a free proposer that still preserves the target distribution.
+  - **Single source of truth:** the distribution BOTH plain sampling and the accept rule use is ONE C++
+    function, `token_probs` (the exact normalized categorical `sample_next_token` draws from: rep-penalty
+    → temperature → top-k → top-p → softmax; greedy → one-hot argmax), exposed via the binding — NOT a
+    Python re-implementation (the repo's trust-parity discipline). `sample_next_token`'s byte-exact draw
+    is untouched, so plain `generate()`'s seeded output is unchanged. Because greedy is a one-hot, min(1,
+    p/q) is 0/1 and the residual is a one-hot correction, so **rejection_accept reduces EXACTLY to
+    accept_prefix at temperature 0** — the greedy floor is the temp→0 limit, tested bit-identically.
+  - **Scheduler (S3):** folded into `SpecScheduler` — a request carries a SamplingParams + seed,
+    `_verify` returns per-seq LOGITS (the argmax moves into `_commit`, one verify for both paths), and
+    each sequence owns a seeded RNG so its draw stream is independent of interleaving. A scheduled
+    sampling sequence is **token-identical to standalone at the same seed, batch-invariant** (the S3a
+    discipline extended to sampling).
+  - **Done-when gate** (`tests/run_spec_sample.py`), tiers strongest→cheapest: **U1** the accept rule
+    pinned exactly with a scripted RNG (accept / reject-correction / all-accept-bonus / point-mass /
+    q(x)=0 short-circuit); **D-alg** the theorem itself, model-free — over random (q,p) on a tiny vocab
+    the emitted token's empirical marginal == p (TVD ≤ 0.009, tol 0.02) for a real q AND a point mass at
+    k∈{1,3}; **E1** the temp→0 bridge — sample core == greedy core == plain greedy, TOKEN-identical on
+    BOTH the 0.5B and the 1.5B/0.5B pair, draft k∈{1,2,4,8} + lookup; **I1** draft==target → 100% accept
+    (q==p); **D2** single source of truth — plain C++ `generate`'s first-token empirical == `token_probs`
+    (TVD 0.043, tol 0.06, support 40); **D3** the real 1.5B/0.5B pair — the emitted marginal == p (TVD
+    0.057, tol 0.08); **S** the scheduler — sampling token-identical to standalone across per-seq /
+    ragged-batched / paged and every batch size. No regression (run_spec, run_spec_serve, run_serve,
+    generate greedy golden). **Verdict:** speculative decoding now runs under sampling, not just greedy,
+    with a *provable* distribution guarantee — closing the tail named since S0. Speed is still S2's story
+    (r-cap for the draft pair, r→0 for prompt-lookup); sampling changes the OUTPUT contract
+    (distribution-identical), not the economics.
 
 ## Perf retune for 1.5B (P-track) — harvest the un-muted levers
 Not new algorithms — **collect** existing G-track levers on a model that finally pays for them.

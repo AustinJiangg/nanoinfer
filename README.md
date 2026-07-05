@@ -94,15 +94,31 @@ CLAUDE.md       how we develop here: the golden rule, conventions, sharp edges
 
 ## Status & roadmap
 
-Stages 0–2 are complete and verified against Hugging Face. See
-[ROADMAP.md](ROADMAP.md) for the full plan.
+The **Python engine** (`nanoinfer/`) is stages 0–2 — forward pass, KV cache, sampling — all
+verified bit-for-bit against Hugging Face. It is now **frozen as the reference oracle**. The
+work continues in a second, from-scratch **C++/CUDA engine** (`cpp/`): the vLLM shape (Python
+orchestration over hand-written kernels), parity-locked to the Python oracle at every step
+(the same discipline as Python-vs-HuggingFace). See [ROADMAP.md](ROADMAP.md) for the staged
+plan and the "done when" bar for each stage.
+
+Python engine — the oracle:
 
 - [x] **Stage 0** — naive forward pass + greedy decoding (full recompute, no cache)
 - [x] **Stage 1** — KV cache (prefill / decode split); ~2.4× faster, same tokens
 - [x] **Stage 2** — sampling: temperature, top-k, top-p, repetition penalty (seeded)
-- [ ] **Stage 3** — continuous batching
-- [ ] **Stage 4** — paged attention (vLLM-style block KV cache)
-- [ ] **Stage 5** — quantization / custom kernels (stretch)
+
+C++/CUDA engine — built on our own kernels:
+
+- [x] **C0–C5** — pure C++ core: forward pass, sampling, KV cache, int8/int4 weight quant, AVX2+OpenMP
+- [x] **F6–F8c** — mini-vLLM: pybind11 bindings, continuous-batching scheduler, batched decode,
+      paged attention, prefix sharing (RadixAttention)
+- [x] **G0–G6** — CUDA backend: full GPU forward, paged attention, tuned GEMM / FlashAttention /
+      Flash-Decoding kernels, CUDA graphs
+- [x] **S0–S5** — speculative decoding: draft-model + prompt-lookup proposers, KV rollback,
+      continuous-batching integration, and sampling-parity (rejection sampling)
+- [x] **NEON** — the CPU backend cross-compiles and runs on Apple ARM (op-level parity)
+- [ ] **P-track** — perf retune for Qwen2.5-1.5B (flip the GPU levers that pay at scale)
+- [ ] **Metal** — a third backend on the M4 GPU (deferred; structurally prepped)
 
 ## Development
 

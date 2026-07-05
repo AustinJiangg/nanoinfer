@@ -41,9 +41,23 @@ CPU-oracle-locked: over the CPU backend, `tokens == model.generate(...)` for the
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build"))  # nicpp.*.so
+import nicpp  # noqa: E402
+
+
+def _draw(probs, rng) -> int:
+    """Categorical draw from a `[vocab]` probability vector by inverse-CDF. A float64
+    cumsum makes it robust to the tiny normalization error a float32 `token_probs` row
+    can carry (so it never trips a strict sum-to-1 check), and `searchsorted(side=right)`
+    can never land on a masked (zero-prob) token. `rng` is a numpy Generator."""
+    c = np.cumsum(np.asarray(probs, dtype=np.float64))
+    return int(np.searchsorted(c, rng.random() * c[-1], side="right"))
 
 
 @dataclass
@@ -117,6 +131,28 @@ class DraftModelProposer:
         self.draft.forward([d[-1]], self.dcache)   # k+1-th feed; keeps dcache == tcache length
         return d
 
+    def propose_sampling(self, cur: int, context: list[int], params, rng):
+        """S5 (sampling): SAMPLE k tokens from the draft's own shaped distribution q_i =
+        token_probs(draft_logits_i, params) instead of taking its argmax, and return both
+        the tokens and those q distributions (rejection sampling needs q to accept/reject
+        against the target's p). Same lock-step cache bookkeeping as `propose` (the k+1-th
+        feed keeps the draft cache length == the target's), so ONE truncate rolls back
+        both. `ctx` grows with the sampled tokens so the draft's rep-penalty conditions
+        the same way plain draft sampling would."""
+        d: list[int] = []
+        qs: list[np.ndarray] = []
+        x = cur
+        ctx = list(context)
+        for _ in range(self.max_k):
+            dl = self.draft.forward([x], self.dcache)
+            q = nicpp.token_probs(dl[-1], params, ctx)
+            x = _draw(q, rng)
+            d.append(x)
+            qs.append(q)
+            ctx.append(x)
+        self.draft.forward([d[-1]], self.dcache)   # k+1-th feed; keeps dcache == tcache length
+        return d, qs
+
     def rollback(self, keep: int) -> None:
         self.dcache.truncate(keep)
 
@@ -136,6 +172,15 @@ class PromptLookupProposer:
 
     def propose(self, cur: int, context: list[int]) -> list[int]:
         return prompt_lookup(context, self.ngram, self.max_k)
+
+    def propose_sampling(self, cur: int, context: list[int], params, rng):
+        """S5 (sampling): the n-gram copy is DETERMINISTIC, so each proposed token's
+        proposal distribution q_i is a point mass (q_i(d_i) = 1). We signal that with
+        `None` per token — rejection_accept reads a point mass as accept-prob p(d_i) and,
+        on a reject, resamples from p with the proposed token zeroed out. A free draft
+        (r->0) with no sampling of its own, exactly as in the greedy path."""
+        d = prompt_lookup(context, self.ngram, self.max_k)
+        return d, [None] * len(d)
 
     def rollback(self, keep: int) -> None:
         pass
@@ -165,6 +210,52 @@ def accept_prefix(d: list[int], target_argmax) -> tuple[int, list[int]]:
     while a < k and int(target_argmax[a]) == d[a]:
         a += 1
     return a, d[:a] + [int(target_argmax[a])]
+
+
+def rejection_accept(d: list[int], q_list, p_list, rng) -> tuple[int, list[int]]:
+    """The SAMPLING accept rule (S5) — speculative / rejection sampling, the distribution
+    analog of `accept_prefix`. It's the single source of truth for what a sampled verify
+    confirms, shared by the single-sequence loop and the scheduler.
+
+    Inputs (all over the SAME k+1 verified positions):
+      * `d`      — the k proposed tokens.
+      * `q_list` — q_list[i] is the distribution `[vocab]` that d[i] was proposed from, or
+        `None` for a deterministic point-mass proposer (prompt-lookup: q_i(d_i)=1).
+      * `p_list` — p_list[i] is the TARGET's shaped distribution `[vocab]` at position i
+        (from `token_probs` on the verify logits); length k+1 (row k is the bonus position).
+
+    Draft token d[i] is accepted with probability min(1, p_i(d_i) / q_i(d_i)); on the first
+    rejection we resample a correction from the normalized residual (p_i - q_i)_+ and STOP
+    (discard the rest). If all k are accepted we sample a bonus from p_k. Returns
+    `(a, emitted)` with `emitted = d[:a] + [one token]` — the same shape as `accept_prefix`.
+
+    The theorem (Leviathan et al. / Chen et al.): every emitted token's marginal is exactly
+    p_i, for ANY proposal q — so a sampled speculative decode is *distribution-identical* to
+    plain target sampling, the sampling analog of the greedy token-identity. At temperature
+    0, `token_probs` is a one-hot argmax, so min(1, p/q) is 0/1 and the residual is a one-hot
+    correction: this reduces EXACTLY to `accept_prefix` (the greedy floor is the temp->0
+    limit, tested bit-identically)."""
+    k = len(d)
+    for i in range(k):
+        x = d[i]
+        p = p_list[i]
+        px = float(p[x])
+        qx = 1.0 if q_list[i] is None else float(q_list[i][x])
+        # Accept with prob min(1, p(x)/q(x)); qx==0 (draft gave x zero mass) -> always accept
+        # (p/0 -> inf). rng.random() is in [0,1), so a ratio >= 1 always accepts.
+        if qx <= 0.0 or rng.random() < px / qx:
+            continue
+        # Reject: correction ~ normalized (p - q)_+ , then stop. A point mass just zeros d[i].
+        if q_list[i] is None:
+            resid = p.astype(np.float64).copy()
+            resid[x] = 0.0
+        else:
+            resid = np.maximum(p.astype(np.float64) - q_list[i].astype(np.float64), 0.0)
+        s = resid.sum()
+        corr = _draw(resid / s, rng) if s > 0.0 else int(np.argmax(p))
+        return i, d[:i] + [corr]
+    # All k accepted -> a bonus token sampled from the target dist at the (k+1)-th position.
+    return k, d[:k] + [_draw(p_list[k], rng)]
 
 
 def prompt_lookup(context: list[int], ngram: int, max_k: int) -> list[int]:
@@ -288,3 +379,111 @@ def greedy_prompt_lookup(target, prompt_ids: list[int], max_tokens: int,
     if max_tokens <= 0 or not prompt_ids:
         return [], SpecStats()
     return _greedy_spec_core(target, prompt_ids, max_tokens, PromptLookupProposer(ngram, k), eos_id)
+
+
+# ---------------------------------------------------------------------------
+# The SAMPLING speculative loop (S5) — the sibling of _greedy_spec_core.
+# Same verify + rollback machinery; the accept rule is rejection_accept (which reduces to
+# accept_prefix at temperature 0), and every draw goes through token_probs so the output
+# is distribution-identical to plain target sampling.
+# ---------------------------------------------------------------------------
+
+
+def _sample_spec_core(target, prompt_ids: list[int], max_tokens: int, proposer, params,
+                      rng, eos_id: int) -> tuple[list[int], SpecStats]:
+    """Core SAMPLING speculative decode. Returns (generated_ids, stats). Every emitted
+    token is drawn from the target's own shaped distribution p at its position (an accepted
+    draft has marginal p by the rejection-sampling theorem, a correction/bonus is drawn from
+    p directly), so the output is distribution-identical to plain target sampling — the
+    sampling analog of _greedy_spec_core's token-identity. `params` is a nicpp.SamplingParams
+    (temperature 0 makes this reduce to the greedy core); `rng` is a numpy Generator."""
+    cap = len(prompt_ids) + max_tokens + proposer.max_k + 1
+    tcache = target.make_cache(cap)
+    proposer.prefill(prompt_ids, cap)
+
+    # Prefill the target; the first token is a draw from its shaped last-row distribution —
+    # the SAME conditional plain sampling draws its first token from.
+    tlog = target.forward(prompt_ids, tcache)
+    cur = _draw(nicpp.token_probs(tlog[-1], params, prompt_ids), rng)
+
+    generated: list[int] = []
+    stats = SpecStats()
+    context = list(prompt_ids)
+
+    def emit(tok: int) -> bool:
+        if eos_id >= 0 and tok == eos_id:
+            return False
+        generated.append(tok)
+        context.append(tok)
+        stats.emitted += 1
+        return len(generated) < max_tokens
+
+    if not emit(cur):
+        return generated, stats
+
+    while True:
+        L = tcache.length
+
+        # --- Propose: k candidates + the distribution q each was drawn from (None = point
+        # mass for a deterministic proposer). k may be 0 (prompt-lookup miss -> plain draw). ---
+        d, qs = proposer.propose_sampling(cur, context, params, rng)
+        k = len(d)
+
+        # --- Verify: ONE target forward over [cur, d0..d_{k-1}] -> k+1 logit rows; shape
+        # each into the target's distribution p_i at that position (position i conditions on
+        # context + d[:i], matching what plain sampling would condition on there). ---
+        tl = target.forward([cur] + d, tcache)
+        p_list = [nicpp.token_probs(tl[i], params, context + d[:i]) for i in range(k + 1)]
+
+        # --- Accept by rejection sampling (the shared rule); marginal of each emitted token
+        # is exactly p_i. ---
+        a, new = rejection_accept(d, qs, p_list, rng)
+        stats.verifies += 1
+        stats.proposals += 1 if k else 0
+        stats.drafted += k
+        stats.accepted += a
+        stats.accept_lengths.append(a)
+
+        keep = L + a + 1
+        tcache.truncate(keep)
+        proposer.rollback(keep)
+
+        for tok in new:
+            cur = tok
+            if not emit(tok):
+                return generated, stats
+
+
+def sample_speculative(target, draft, prompt_ids: list[int], max_tokens: int, params,
+                       k: int = 4, seed: int = 0, eos_id: int = -1
+                       ) -> tuple[list[int], SpecStats]:
+    """Speculative decode with SAMPLING and a DRAFT MODEL (S5). The draft samples k tokens
+    from its own shaped distribution; the target verifies by rejection sampling. Returns
+    (generated_ids, stats), distribution-identical to plain target sampling with `params`.
+    At params.temperature == 0 it's token-identical to `greedy_speculative` (the greedy
+    floor is the temp->0 limit). `params` is a nicpp.SamplingParams; `seed` seeds the draws."""
+    if k < 1:
+        raise ValueError("k (draft length) must be >= 1")
+    if max_tokens <= 0 or not prompt_ids:
+        return [], SpecStats()
+    rng = np.random.default_rng(seed)
+    return _sample_spec_core(target, prompt_ids, max_tokens, DraftModelProposer(draft, k),
+                             params, rng, eos_id)
+
+
+def sample_prompt_lookup(target, prompt_ids: list[int], max_tokens: int, params,
+                         ngram: int = 3, k: int = 10, seed: int = 0, eos_id: int = -1
+                         ) -> tuple[list[int], SpecStats]:
+    """Speculative decode with SAMPLING and PROMPT-LOOKUP (S5) — no draft model. The n-gram
+    copy is a point-mass proposal; the target verifies by rejection sampling. Returns
+    (generated_ids, stats), distribution-identical to plain target sampling with `params`,
+    and token-identical to `greedy_prompt_lookup` at params.temperature == 0."""
+    if ngram < 1:
+        raise ValueError("ngram must be >= 1")
+    if k < 1:
+        raise ValueError("k (max proposal length) must be >= 1")
+    if max_tokens <= 0 or not prompt_ids:
+        return [], SpecStats()
+    rng = np.random.default_rng(seed)
+    return _sample_spec_core(target, prompt_ids, max_tokens, PromptLookupProposer(ngram, k),
+                             params, rng, eos_id)

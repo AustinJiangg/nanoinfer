@@ -117,6 +117,28 @@ PYBIND11_MODULE(nicpp, m) {
                    ", repetition_penalty=" + std::to_string(p.repetition_penalty) + ")";
         });
 
+    // The next-token distribution the sampler draws from (S5: speculative sampling needs
+    // the probability vectors p and q for rejection sampling). Same shape as a plain
+    // sampling draw — greedy (temperature 0) returns a one-hot argmax — so the spec accept
+    // built on this is distribution-identical to plain sampling. Takes a [vocab] logit row
+    // (numpy, from forward()); `context` (prompt + generated) only matters when
+    // repetition_penalty != 1. Returns a [vocab] numpy probability vector.
+    m.def(
+        "token_probs",
+        [](py::array_t<float, py::array::c_style | py::array::forcecast> logits,
+           const SamplingParams& params, const std::vector<int64_t>& context) {
+            const auto buf = logits.request();
+            const float* p = static_cast<const float*>(buf.ptr);
+            std::vector<float> v(p, p + buf.size);
+            std::vector<float> probs = token_probs(std::move(v), params, context);
+            py::array_t<float> out(static_cast<py::ssize_t>(probs.size()));
+            std::memcpy(out.mutable_data(), probs.data(), probs.size() * sizeof(float));
+            return out;
+        },
+        py::arg("logits"), py::arg("params"), py::arg("context") = std::vector<int64_t>{},
+        "Normalized next-token distribution for a [vocab] logit row (S5): the exact "
+        "distribution plain sampling draws from; greedy -> one-hot argmax.");
+
     // KV cache interface: forward()/forward_batch() accept any subclass, so the same
     // pass runs over the contiguous (C3) or paged (F8b) cache. Abstract — no init.
     py::class_<KVCacheBase>(m, "KVCacheBase")

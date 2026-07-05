@@ -44,4 +44,16 @@ void apply_top_p(std::vector<float>& logits, float p);
 int64_t sample_next_token(std::vector<float> logits, const SamplingParams& params,
                           const std::vector<int64_t>& context, std::mt19937_64& rng);
 
+// The normalized categorical distribution `sample_next_token` draws from — the SAME
+// warper pipeline (rep penalty -> temperature -> top-k -> top-p -> softmax), returned
+// as a [vocab] probability vector instead of a single draw. Greedy (temperature 0) is a
+// one-hot on the argmax, so a caller that samples from this vector reduces EXACTLY to
+// greedy. This is the single definition of "the next-token distribution": speculative
+// sampling (S5) needs the probs p (target) and q (proposer) to run rejection sampling,
+// and getting them from here — not a re-implementation — keeps spec's accept identical
+// in shape to plain sampling's draw (the repo's trust-parity discipline). Masked (top-k/
+// top-p dropped) tokens get exactly 0.
+std::vector<float> token_probs(std::vector<float> logits, const SamplingParams& params,
+                               const std::vector<int64_t>& context);
+
 }  // namespace ni

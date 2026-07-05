@@ -17,15 +17,18 @@ The scheduler drives the running set in three phases per step:
      these into ONE ragged forward_spec_batch — the projection GEMMs run over Sigma(k_s+1)
      rows (the F8a-analog: the throughput win); batched=False (S3a) runs one forward() per
      sequence (the F7-analog: the scheduling win alone). The two are token-identical.
-  3. commit  — per sequence: accept the longest prefix (the shared `accept_prefix` rule),
+  3. commit  — per sequence: accept the longest prefix (greedy: the `accept_prefix` argmax
+     rule; S5 sampling: the `rejection_accept` rule over the target's shaped distributions),
      truncate() both caches to discard rejects, emit the confirmed tokens, stop on eos /
      max_tokens.
 
-Correctness (the S0 gate, batch-invariant): with greedy decoding every emitted token is
-the target's own argmax at its position, so a sequence's output is token-identical to plain
-target greedy whether it runs alone or interleaved with others — exactly the guarantee
-`Scheduler` gives for plain decode, and what `tests/run_spec_serve.py` asserts against
-standalone generate at every batch size and proposer mix.
+Correctness (batch-invariant): with GREEDY decoding every emitted token is the target's own
+argmax, so a sequence's output is token-identical to plain target greedy whether it runs
+alone or interleaved (the S0 gate, `tests/run_spec_serve.py`). With SAMPLING (S5) each
+sequence carries its own seeded RNG, so the draw stream is independent of interleaving: its
+output is distribution-identical to plain sampling and, at a fixed seed, token-identical to
+standalone sample_speculative / sample_prompt_lookup (`tests/run_spec_sample.py`). Either
+way, folding spec into continuous batching changes throughput, never a sequence's output.
 """
 
 from __future__ import annotations
@@ -47,20 +50,27 @@ from speculative import (  # noqa: E402
     DraftModelProposer,
     PromptLookupProposer,
     SpecStats,
+    _draw,
     accept_prefix,
+    rejection_accept,
 )
 
 
 @dataclass
 class SpecRequest:
-    """A speculative-decoding request. Greedy only for now — token-identity to plain
-    greedy is the S0 invariant this whole track rests on; sampling-parity (rejection
-    sampling) is the open S0 tail. `proposer` picks how the k candidates are produced:
+    """A speculative-decoding request. `proposer` picks how the k candidates are produced:
 
       * "draft"  — a draft model runs k forwards (needs a draft Model on the scheduler).
       * "lookup" — prompt-lookup / n-gram: match the recent context against an earlier
         occurrence and copy what followed. No model; `ngram` sets the match length.
-    """
+
+    Decoding is greedy by default (`params` None or temperature 0): every emitted token is
+    the target's argmax, so the output is TOKEN-identical to plain greedy (the S0 invariant).
+    Pass a sampling `params` (temperature > 0) to switch to speculative *sampling* (S5): the
+    accept rule becomes rejection sampling and each emitted token is drawn from the target's
+    own shaped distribution, so the output is DISTRIBUTION-identical to plain sampling — and,
+    with `seed` fixed, TOKEN-identical to standalone sample_speculative/sample_prompt_lookup
+    (the per-sequence RNG makes the draw sequence batch-invariant)."""
 
     request_id: str
     prompt_ids: list[int]
@@ -69,11 +79,18 @@ class SpecRequest:
     proposer: str = "draft"   # "draft" | "lookup"
     k: int = 4                # draft length / max proposal length
     ngram: int = 3            # prompt-lookup match length (ignored for "draft")
+    params: object = None     # None -> greedy; a nicpp.SamplingParams enables S5 sampling
+    seed: int = 0             # seeds this sequence's sampling draws (per-sequence RNG)
 
     @property
     def max_k(self) -> int:
         # Longest tentative tail a verify writes before rollback — sizes the cache slack.
         return self.k
+
+    @property
+    def sampling(self) -> bool:
+        # Greedy unless a non-greedy SamplingParams was supplied (temperature > 0).
+        return self.params is not None and not self.params.greedy()
 
 
 class State(Enum):
@@ -97,6 +114,12 @@ class SpecSequence:
         self.cur: int = -1                # set from the prefill logits at admission
         self.verify_L: int = 0            # tcache length captured just before a verify
         self.reserved_blocks = 0          # target KV blocks reserved for it (paged mode)
+        # Sampling (S5): a per-sequence numpy Generator seeded from the request, so the draw
+        # sequence is independent of every other sequence — that's what makes a sampled
+        # sequence token-identical to standalone at the same seed, batch-invariant.
+        self.sampling = req.sampling
+        self.params = req.params
+        self.rng = np.random.default_rng(req.seed) if self.sampling else None
         self.state = State.WAITING
 
 
@@ -105,8 +128,9 @@ class SpecScheduler:
 
     Usage: construct with a target model (and a draft model if any request uses the "draft"
     proposer), add() requests, then run(). Mirrors `Scheduler`: add/evict/admit keep the
-    batch full while there's work, and each finished sequence's output is token-identical to
-    standalone greedy.
+    batch full while there's work, and each finished sequence's output is identical to
+    standalone — token-for-token for greedy requests, and (at a fixed per-request seed)
+    token-for-token for sampling requests too (S5), invariant to how they were batched.
     """
 
     def __init__(self, target, draft=None, max_batch: int = 8, batched: bool = True,
@@ -183,8 +207,10 @@ class SpecScheduler:
 
     def _verify(self, seqs: list[SpecSequence], proposals: list[list[int]]) -> list[np.ndarray]:
         """Verify each sequence's [cur_s, d_s..] (k_s+1 tokens) against the target, returning
-        the target's own argmax at each of the k_s+1 positions per sequence. Two backings,
-        token-identical (S3b is bit-identical to S3a per block):
+        the target's [k_s+1, vocab] LOGITS block per sequence. `_commit` reduces those to the
+        accept decision — argmax for greedy, token_probs + rejection sampling for S5 — so one
+        verify serves both. Two backings, token-identical (S3b is bit-identical to S3a per
+        block):
           * batched (S3b): ONE ragged forward_spec_batch over the concatenated verify blocks —
             the projection GEMMs fuse over Sigma(k_s+1) rows.
           * per-seq (S3a): one forward() per sequence.
@@ -207,20 +233,31 @@ class SpecScheduler:
             out: list[np.ndarray] = []
             off = 0
             for c in counts:                            # slice each sequence's block back out
-                out.append(np.argmax(logits[off:off + c], axis=1).astype(np.int64))
+                out.append(logits[off:off + c])
                 off += c
             return out
 
         out = []
         for seq, d in zip(seqs, proposals):
-            tl = self.model.forward([seq.cur] + d, seq.tcache)
-            out.append(np.argmax(tl, axis=1).astype(np.int64))
+            out.append(self.model.forward([seq.cur] + d, seq.tcache))
         return out
 
-    def _commit(self, seq: SpecSequence, d: list[int], tv: np.ndarray) -> None:
-        """Accept the longest agreed prefix, roll BOTH caches back to it, emit the confirmed
-        tokens. `tv` has len(d)+1 rows (the verify's per-position argmax)."""
-        a, new = accept_prefix(d, tv)
+    def _commit(self, seq: SpecSequence, d: list[int], qs, logits: np.ndarray) -> None:
+        """Reduce the verify's [k+1, vocab] LOGITS to an accept decision, roll BOTH caches
+        back to the confirmed prefix, and emit. Greedy uses `accept_prefix` on the argmax;
+        sampling (S5) uses `rejection_accept` on the target's shaped distributions p_i =
+        token_probs(logits_i, params) against the proposal q's in `qs` — position i conditions
+        on context + d[:i], the same shape plain sampling would draw from. Either way every
+        emitted token matches what the single-sequence loop would emit (argmax, or a draw from
+        this sequence's own RNG), so a scheduled sequence is identical to standalone."""
+        if seq.sampling:
+            ctx = seq.context                            # confirmed context (includes cur)
+            p_list = [nicpp.token_probs(logits[i], seq.params, ctx + d[:i])
+                      for i in range(len(d) + 1)]
+            a, new = rejection_accept(d, qs, p_list, seq.rng)
+        else:
+            tv = np.argmax(logits, axis=1).astype(np.int64)
+            a, new = accept_prefix(d, tv)
         k = len(d)
         self.stats.verifies += 1
         self.stats.proposals += 1 if k else 0
@@ -281,7 +318,11 @@ class SpecScheduler:
             seq.reserved_blocks = reserved
 
             tlog = self.model.forward(req.prompt_ids, seq.tcache)
-            seq.cur = int(np.argmax(tlog[-1]))           # first token (its K/V fed fresh next step)
+            if seq.sampling:                             # first token: a draw from the shaped
+                seq.cur = _draw(nicpp.token_probs(tlog[-1], seq.params, req.prompt_ids), seq.rng)
+            else:                                        # dist (== plain), or the argmax (greedy)
+                seq.cur = int(np.argmax(tlog[-1]))       # its K/V is fed fresh next step
+
             seq.state = State.RUNNING
             if req.max_tokens <= 0 or self._emit(seq, seq.cur):
                 self._finish(seq)
@@ -291,10 +332,18 @@ class SpecScheduler:
     def step(self) -> None:
         # 1-3. Advance the running set by a full spec step: propose, verify, commit.
         if self.running:
-            proposals = [s.proposer.propose(s.cur, s.context) for s in self.running]
+            proposals: list[list[int]] = []
+            qlists: list = []                            # per-seq proposal dists (None = greedy)
+            for s in self.running:
+                if s.sampling:                           # sample d from q; keep q for the accept
+                    d, qs = s.proposer.propose_sampling(s.cur, s.context, s.params, s.rng)
+                else:
+                    d, qs = s.proposer.propose(s.cur, s.context), None
+                proposals.append(d)
+                qlists.append(qs)
             verifies = self._verify(self.running, proposals)
-            for seq, d, tv in zip(self.running, proposals, verifies):
-                self._commit(seq, d, tv)
+            for seq, d, qs, lg in zip(self.running, proposals, qlists, verifies):
+                self._commit(seq, d, qs, lg)
             # 4. Evict the finished, freeing their slots.
             self.running = [s for s in self.running if s.state is State.RUNNING]
 
