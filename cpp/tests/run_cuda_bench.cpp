@@ -11,8 +11,14 @@
 // cuBLAS is the YARDSTICK only — the engine's forward never calls it; the golden rule is
 // that we run our own kernels. This bench is the one place the comparison lives.
 //
+// Shapes are selectable (P0, the 1.5B perf-retune): `run_cuda_bench [0.5b|1.5b]` sweeps that
+// model's projection shapes — the GEMM analog of run_cuda_attn_bench's `<H> <D>` parameterization,
+// so the wmma/dbuf/int8 A/Bs can be re-measured on the bigger model's ~3× matrices (head_dim 128,
+// hidden 1536, intermediate 8960) that the roadmap predicted would wake the parked GEMM levers.
+//
 //   cmake -S . -B build -DNI_CUDA=ON && cmake --build build -j --target run_cuda_bench
-//   ./build/run_cuda_bench
+//   ./build/run_cuda_bench            # 0.5B shapes (default)
+//   ./build/run_cuda_bench 1.5b       # 1.5B shapes
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
@@ -75,11 +81,12 @@ struct Shape {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (!cuda_available()) {
         std::printf("run_cuda_bench: no CUDA device visible — skipping\n");
         return 0;
     }
+    const std::string model = (argc > 1) ? argv[1] : "0.5b";  // "0.5b" (default) | "1.5b"
 
     cublasHandle_t handle;
     cublas_check(cublasCreate(&handle), "cublasCreate");
@@ -95,11 +102,20 @@ int main() {
                       : (cuda_policy().use_wmma ? "wmma (fp32 weights, fp16 staged)"
                                                 : "tiled (fp32)"));
 
-    // Qwen2.5-0.5B linears (hidden=896, intermediate=4864, kv=128, vocab=151936).
-    const std::vector<Shape> shapes = {
+    // Projection shapes {label, n, k} = y[m,n] = x[m,k] @ w[n,k]ᵀ, per model.
+    //   0.5B: hidden=896,  intermediate=4864, n_heads=14, head_dim=64  (q/o n=896,  kv n=128)
+    //   1.5B: hidden=1536, intermediate=8960, n_heads=12, head_dim=128 (q/o n=1536, kv n=256)
+    // both share vocab=151936. The 1.5B shapes are the P0 target — bigger n/k, so the tensor-core
+    // (wmma) and double-buffer levers that TIED on 0.5B get their predicted headroom re-measured.
+    const std::vector<Shape> shapes_05 = {
         {"q/o_proj", 896, 896},   {"k/v_proj", 128, 896},     {"gate/up", 4864, 896},
         {"down", 896, 4864},      {"lm_head", 151936, 896},
     };
+    const std::vector<Shape> shapes_15 = {
+        {"q/o_proj", 1536, 1536}, {"k/v_proj", 256, 1536},    {"gate/up", 8960, 1536},
+        {"down", 1536, 8960},     {"lm_head", 151936, 1536},
+    };
+    const std::vector<Shape>& shapes = (model == "1.5b") ? shapes_15 : shapes_05;
     const std::vector<int64_t> batch = {1, 16, 128};  // decode / batched-decode / prefill
 
     std::mt19937 rng(1234);  // fixed seed: deterministic, per CLAUDE.md
@@ -107,7 +123,7 @@ int main() {
     CudaBackend gpu;
     const float alpha = 1.0f, beta = 0.0f;
 
-    std::printf("run_cuda_bench: naive linear() vs cuBLAS sgemm, Qwen2.5-0.5B shapes\n");
+    std::printf("run_cuda_bench: linear() vs cuBLAS sgemm, Qwen2.5-%s shapes\n", model.c_str());
     std::printf("roofline (RTX 4070 SUPER): %.1f TFLOP/s fp32, %.0f GB/s\n", kPeakFp32 / 1e12,
                 kPeakBW / 1e9);
     std::printf("(m=1 decode, m=16 batched decode, m=128 prefill; ovhd = per-op alloc/free)\n\n");
@@ -268,7 +284,7 @@ int main() {
     std::printf("%-9s %4s | %10s %5s | %10s %5s | %8s | %9s\n", "shape", "m", "GEMV GB/s", "%BW",
                 "tiled GB/s", "%BW", "speedup", "GEMV-tiled");
     {
-        const Shape lm = {"lm_head", 151936, 896};
+        const Shape lm = shapes.back();  // lm_head (151936 × hidden), per the selected model
         for (int64_t m : {int64_t(1), int64_t(16)}) {  // decode, batched decode
             const int64_t n = lm.n, k = lm.k;
             Tensor x({m, k}), w({n, k});

@@ -729,11 +729,21 @@ extends unchanged (1.5B fits the ~1.7B fp32 CPU-oracle RAM ceiling).
 Not new algorithms — **collect** existing G-track levers on a model that finally pays for them.
 Pulled in alongside S whenever the target (1.5B) forward is the bottleneck. Same parity spine
 (CPU-oracle `max|diff|` + golden tokens).
-- [ ] **P0** — re-bench the opt-in flags on 1.5B; flip the defaults that now win.
-      `g_cuda_use_tiled_attn` (head_dim 64→128 doubles per-tile K/V reuse — the real lever, not
-      KV-outgrows-L2), `g_cuda_use_dbuf` (bigger GEMMs → more blocks → the occupancy-bound
-      down/q-o unstick), wmma (bigger tiles feed the tensor cores), CUDA graphs (28 vs 24 layers).
-      The `head_dim>=128` prefill-attention flip (commit e76b69a) was the first — find the rest.
+- [x] **P0** ✅ landed — re-benched the opt-in flags on 1.5B; **tiling was the one real default flip,
+      and there is no second.** Two commits: (1) e76b69a flipped shared-mem attention TILING to the
+      `head_dim >= 128` default (the L2-pressure tie woke up at 1.5B — 1.03–1.26× isolated, ~2.7% e2e
+      prefill, bit-identical). (2) The **wmma** re-bench (the one lever the port hadn't measured):
+      parameterized `run_cuda_bench` to sweep 1.5B GEMM shapes (`run_cuda_bench 1.5b`, the analog of
+      the attn bench's `<H> <D>`) + wired `NI_WMMA` into `run_cuda_decode_bench`. **Finding:** wmma-h
+      (fp16-weight tensor cores) WINS isolated on 1.5B's wide MLP GEMMs — gate/up **1.61×** (103% of
+      cuBLAS), down **1.25×** — where it lost on every 0.5B projection (the roadmap's "bigger tiles feed
+      the tensor cores," confirmed). **But e2e prefill is a WASH** (fp16-tiled vs fp16-wmma ~0.98×):
+      Amdahl-diluted, the same shape as G5c+ warp-tiling and G5h dbuf (the projection GEMMs are a
+      minority of the prefill step — attention ×28 + lm_head + launch overhead dominate; and wmma loses
+      on q/o). So **wmma-h stays opt-in** (`use_wmma`), joining dbuf (isolated 1.01–1.07× on 1.5B narrow
+      projections but e2e 0.91× — occupancy trade) and graphs (1.03×). **Verdict: tiling was the only G5
+      lever a bigger model promoted to a default; the rest win-or-tie isolated but not end-to-end.** The
+      honest-tie discipline held. (BASELINE-1.5b.md has the tables.)
 - [ ] **P1** — quantization ROI on 1.5B. fp32 is 5.8 GB; on the 12 GB 4070S, keeping target +
       draft resident (S3) + longer context needs int8 W8A8 / fp16 — now the *enabler*, not just
       speed. The 4:1-MAC and ½-byte levers pay more on the ~3× matrices. Measure memory headroom +

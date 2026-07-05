@@ -120,12 +120,47 @@ split-vs-non-tiled (`notl/spl`), 30-iter timings:
   measures the non-tiled column now that tiling is the default). 0.5B (D=64) stays non-tiled, unchanged
   (ctest 23/23); 1.5B logits bit-identical (`3.83854e-05`), all golden/max|diff|=0 gates hold.
 
+### wmma tensor cores (P0, `run_cuda_bench 1.5b` — the GEMM analog of the attn bench's `<H> <D>`)
+
+The one P0 lever the port hadn't re-benched. `run_cuda_bench` now takes a model arg (`0.5b` default /
+`1.5b`), sweeping that model's projection shapes, so the wmma-h (fp16-weight tensor-core) kernel can be
+A/B'd against the fp32 tiled default on 1.5B's ~3× matrices. **Isolated GEMM, m=128 prefill (GFLOP/s):**
+
+| shape (n×k) | wmma-h | tiled | wmma/tiled | note |
+|---|---|---|---|---|
+| q/o (1536×1536)         |  8991 |  9297 | **0.97×** | loses (narrow n) |
+| k/v (256×1536)          |  1255 |  1304 | ~1.0× | tiny |
+| **gate/up (8960×1536)** | 16252 | 10110 | **1.61×** | wins big (103% of cuBLAS) |
+| **down (1536×8960)**    |  8566 |  6851 | **1.25×** | wins |
+| lm_head (151936×1536)   | 12108 | 11847 | ~1.02× | tie (tiled already fast) |
+
+**The tie WOKE UP on the wide MLP GEMMs.** At 0.5B wmma-h lost on every projection (feeding-bound — small
+n starves the tensor cores, G5d). At 1.5B the two 8960-dim GEMMs (gate/up, down — the prefill FLOP bulk)
+win 1.25–1.61×, exactly the roadmap's "bigger tiles feed the tensor cores." wmma-h is lossy (fp16-
+accumulate, max|diff| ~1–3e-2 vs tiled's ~1e-4) and needs fp16 weight STORAGE (fp32-weight wmma with a
+per-tile convert still loses, G5d).
+
+**But e2e prefill is a WASH** (`run_cuda_decode_bench`, `NI_FP16W` vs `NI_FP16W NI_WMMA` — isolating wmma
+on top of fp16): prefill 128 ~1675→1638 tok/s (**0.98×**), prefill 512 ~1910→1885 (**0.99×**). The isolated
+1.61× on gate/up is Amdahl-diluted to a slight regression — the projection GEMMs are a minority of the
+prefill step (attention ×28 tiled + lm_head + ~per-op launch dominate), and wmma loses on q/o. **Same shape
+as G5c+ warp-tiling** (lm_head 90% of cuBLAS yet e2e prefill flat) and G5h dbuf: an isolated kernel win the
+full step never exposes. **So wmma-h stays OPT-IN (`use_wmma`) — no default flip.**
+
+**dbuf re-benched on 1.5B** (`run_cuda_bench 1.5b`, bit-identical, min-of-8): q/o 1.04×, k/v 1.07×, down
+1.01× — small isolated wins on the narrow projections (up from 0.5B's tie; gate/up is now excluded as
+wide-n), but the baseline's e2e **0.91×** (the occupancy trade in the full forward) holds, so dbuf stays
+opt-in too.
+
 ### Verdict
 
 The port validated the G5 "ties on this model" calls precisely: **tiling** (the one gated on L2
 pressure) turned into a real win at head_dim=128, while **dbuf** and **graphs** (gated on occupancy
 and launch-overhead-fraction, which the bigger model doesn't relieve) stayed ties. **fp16** and
-**split-KV** grew as predicted. Every parked lever behaved as the roadmap's roofline reasoning said
-it would — the honest-tie discipline paid off. And tiling flipped from parked-opt-in to the
-`head_dim >= 128` **default** — the first G5 lever a bigger model promoted from tie to shipped win.
+**split-KV** grew as predicted. **wmma** (P0, newly re-benched) joins the honest-tie set: it WINS
+isolated on 1.5B's wide MLP GEMMs (gate/up 1.61×, down 1.25× — the prediction confirmed) but WASHES
+OUT e2e prefill (~0.98×, Amdahl), so it stays opt-in. Every parked lever behaved as the roadmap's
+roofline reasoning said it would — the honest-tie discipline paid off. **P0 conclusion: tiling was the
+one G5 lever a bigger model promoted from tie to a shipped default; wmma/dbuf/graphs all win-or-tie
+isolated but not end-to-end, so they remain opt-in.**
 

@@ -104,6 +104,10 @@ int main(int argc, char** argv) {
         // is built, since the conversion happens at the once-per-load upload.
         BackendConfig cfg;
         if (const char* e = std::getenv("NI_FP16W")) cfg.fp16_weights = (e[0] == '1');
+        // NI_WMMA=1 routes the prefill (m>16) projection GEMMs through the tensor-core wmma-h kernel
+        // (P0: it TIED on 0.5B but wins on 1.5B's wide MLP GEMMs — gate/up 1.61×, down 1.25× isolated).
+        // Pairs with NI_FP16W (wmma only wins reading fp16 weight storage, not fp32+per-tile convert).
+        if (const char* e = std::getenv("NI_WMMA")) cuda_policy().use_wmma = (e[0] == '1');
         // NI_NAIVE_ATTN=1 forces the naive one-thread-per-query attention (G5e A/B): hold the GEMM
         // path fixed and toggle only attention to isolate its prefill/decode contribution.
         if (const char* e = std::getenv("NI_NAIVE_ATTN")) cuda_policy().force_naive_attn = (e[0] == '1');
