@@ -164,3 +164,57 @@ roofline reasoning said it would — the honest-tie discipline paid off. **P0 co
 one G5 lever a bigger model promoted from tie to a shipped default; wmma/dbuf/graphs all win-or-tie
 isolated but not end-to-end, so they remain opt-in.**
 
+## P1 — quantization ROI (memory ENABLER + e2e speed, 2026-07-05)
+
+At 1.5B, quant flips from a speed knob to the **enabler** of the S3 two-model scenario: keeping the
+1.5B target + 0.5B draft BOTH resident on the 12 GB 4070S (+ KV for real context) is where fp32 runs
+out of room. Measured e2e (`run_cuda_decode_bench weights/qwen2.5-1.5b 128 64`, warm phase — `NI_FP16W`
+/ `NI_W8A8` / `NI_W8A8 NI_QEMBED`) + the resident pair (scratch `resident_pair.py`, `nvidia-smi`, ONE
+mode per process — the caching device pool doesn't release freed buffers, so modes can't share one).
+
+### e2e speed (1.5B, warm prefill 128 / decode 64)
+
+| mode | prefill tok/s | vs fp32 | decode tok/s | vs fp32 | weights | golden |
+|---|---|---|---|---|---|---|
+| fp32       | 1598 | 1.00× | 37.3 | 1.00× | 6178 MB | 0/12 |
+| **fp16**   | 1670 | 1.05× | **48.7** | **1.31×** | 3091 MB (2.0×) | 0/12 (lossless) |
+| W8A8       | **1761** | **1.10×** | 23.8 | **0.64×** | 2250 MB (2.75×) | 5/12, next-tok kept |
+| full-int8  | 1561 | 0.98× | 24.4 | 0.65× | 1550 MB (3.98×) | 11/12, next-tok kept |
+
+- **fp16 is the sweet spot** — the only mode that wins BOTH phases (prefill 1.05×, decode **1.31×**) and
+  is lossless (golden 0/12). Decode is memory-bound, so halving the weight bytes is a direct 1.31×.
+- **W8A8's int8 COMPUTE lever delivers the e2e PREFILL win (1.10×) that wmma couldn't** (P0: wmma's byte
+  lever washed to 0.98×). Cutting the MACs 4:1 beats cutting the bytes when prefill is compute-bound —
+  the clean P0→P1 contrast (byte lever vs compute lever).
+- **But W8A8 DECODE regresses to 0.64×**: there is no int8×int8 decode-GEMV, so at m=1 it runs the
+  prefill-tuned DP4A tile (~63/64 warps idle) PLUS a per-row activation-quant every step. Decode dominates
+  generation, so W8A8 is a net throughput LOSS despite the prefill win — its value is memory + prefill-
+  heavy (long-prompt / short-gen) loads. **The fix is a W8A8 decode-GEMV** (the analog of the shipped
+  weight-only q8 one, `cuda_linear_q8` → `linear_q8_gemv_kernel`) — the identified lever, backlog.
+
+### resident pair (1.5B target + 0.5B draft on the 12 GB card — the S3 scenario)
+
+WSL2/display holds ~1.4–1.8 GB at idle, so the real budget is ~10.5 GB. KV is fp32 (the oracle
+discipline): 56 KB/tok (1.5B) + 24 KB/tok (0.5B) = **80 KB/tok** for the pair.
+
+| pair mode | weights (tgt+drf) | VRAM free | pair-KV budget | e.g. serving |
+|---|---|---|---|---|
+| fp32      | 6178+1979 = 8157 MB | **2132 MB** (measured) | ~27k tok | batch 16 @ 1.7k ctx (TIGHT) |
+| fp16      | 3091+990 = 4081 MB  | ~6.5 GB (calc)         | ~83k tok | batch 16 @ ~5.2k ctx |
+| W8A8      | 2250+907 = 3157 MB  | **6924 MB** (measured) | ~89k tok | batch 16 @ 5.5k ctx |
+| full-int8 | 1550+499 = 2049 MB  | ~8.5 GB (calc)         | ~109k tok | batch 16 @ ~6.8k ctx |
+
+The fp32 pair FITS but leaves only ~2 GB — fine for single-sequence short context, but a server
+(batch × context) runs out fast. **Quant roughly TRIPLES the KV budget** (fp16/W8A8 ~83–89k vs fp32's
+27k pair-tokens), and fp16 does it while winning decode 1.31× losslessly.
+
+### Verdict (P1)
+
+**fp16 is the 1.5B default of choice for the two-model resident scenario:** lossless, wins both phases,
+halves the memory — strictly better than fp32 on every axis that matters here. The int8 modes are the
+memory-extreme enablers (2.75–3.98×), valuable when VRAM is the hard wall (more concurrent sequences /
+longer context) or for prefill-heavy loads, but their decode regresses until a W8A8 decode-GEMV lands.
+The **P0→P1 lesson**: on memory-bound **decode**, cut BYTES (fp16); on compute-bound **prefill**, cut
+FLOPs (int8) — wmma was a byte lever aimed at compute-bound prefill (wrong tool → washed out), while
+W8A8 is the FLOP lever that actually moves prefill.
+

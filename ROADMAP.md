@@ -744,10 +744,20 @@ Pulled in alongside S whenever the target (1.5B) forward is the bottleneck. Same
       projections but e2e 0.91× — occupancy trade) and graphs (1.03×). **Verdict: tiling was the only G5
       lever a bigger model promoted to a default; the rest win-or-tie isolated but not end-to-end.** The
       honest-tie discipline held. (BASELINE-1.5b.md has the tables.)
-- [ ] **P1** — quantization ROI on 1.5B. fp32 is 5.8 GB; on the 12 GB 4070S, keeping target +
-      draft resident (S3) + longer context needs int8 W8A8 / fp16 — now the *enabler*, not just
-      speed. The 4:1-MAC and ½-byte levers pay more on the ~3× matrices. Measure memory headroom +
-      prefill/decode deltas at 1.5B scale.
+- [x] **P1** ✅ landed — quantization ROI on 1.5B, measured e2e + as the resident-pair ENABLER.
+      Wired `NI_W8A8` into `run_cuda_decode_bench` (the int8×int8 compute path e2e) and measured the
+      12 GB resident pair (1.5B target + 0.5B draft) via `nvidia-smi`. **e2e speed (warm, vs fp32):**
+      **fp16** prefill 1.05× / decode **1.31×** (lossless, golden 0/12) — the sweet spot, the only mode
+      that wins BOTH phases; **W8A8** prefill **1.10×** (the int8 COMPUTE lever delivers the e2e prefill
+      win wmma's byte lever couldn't — P0 washed to 0.98×) but decode **0.64×** (no int8×int8 decode-GEMV
+      → prefill-tiled DP4A at m=1 + per-row activation quant); **full-int8** decode 0.65×, prefill 0.98×.
+      **Memory enabler:** the fp32 pair (8157 MB weights) leaves only ~2.1 GB free → ~27k pair-KV tokens
+      (batch 16 @ 1.7k ctx — TIGHT); fp16/W8A8 free ~6.5–6.9 GB → ~83–89k pair-KV tokens (~3.3× the KV
+      budget), fp16 doing it losslessly + decode 1.31×. **Verdict: fp16 is the 1.5B default of choice**
+      (strictly better than fp32 on every axis here); int8 modes are the memory-extreme enablers, decode-
+      capped until a W8A8 decode-GEMV (the shipped q8-GEMV analog — backlog). **P0→P1 lesson: cut BYTES
+      (fp16) for memory-bound decode, cut FLOPs (int8) for compute-bound prefill; wmma was a byte lever on
+      compute-bound prefill (wrong tool).** (BASELINE-1.5b.md §P1 has the tables.)
 - [ ] **P2** — long context on 1.5B. KV ~2.3×/token → Flash-Decoding (G5g) + paged wins grow and
       the "muted by L2" ceiling lifts; re-run the ctx sweep, find where paged+split now dominates.
 

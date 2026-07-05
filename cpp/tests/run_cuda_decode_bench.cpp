@@ -128,10 +128,18 @@ int main(int argc, char** argv) {
             g_ab_int8_lmhead = (e[0] == '1');
             cfg.quantize_embed = g_ab_int8_lmhead;
         }
-        Model model(dir, QuantMode::None, Device::CUDA, cfg);
+        // NI_W8A8=1 runs the layer projections as int8×int8 DP4A (P1, the COMPUTE lever, 4:1 MACs):
+        // it won isolated on 1.5B's wide GEMMs (gate/up 1.94×, lm_head 2.16× — run_cuda_bench 1.5b),
+        // and unlike fp16/wmma (byte levers) it also cuts the projection FLOPs — does it translate
+        // e2e where wmma washed out? Combine with NI_QEMBED for the full-int8 model. Must precede the
+        // Model build (the quantize happens at the once-per-load upload, like fp16).
+        QuantMode qmode = QuantMode::None;
+        if (const char* e = std::getenv("NI_W8A8"); e && e[0] == '1') qmode = QuantMode::W8A8;
+        Model model(dir, qmode, Device::CUDA, cfg);
         const int64_t vocab = model.config().vocab_size;
-        std::printf("layer weights: %s; KV cache: %s; A/B: %s\n",
-                    cfg.fp16_weights ? "fp16 (G5d)" : "fp32",
+        std::printf("layer weights: %s%s; KV cache: %s; A/B: %s\n",
+                    qmode == QuantMode::W8A8 ? "int8 W8A8 (DP4A)" : (cfg.fp16_weights ? "fp16 (G5d)" : "fp32"),
+                    cfg.quantize_embed ? " + int8 embed/lm_head" : "",
                     use_paged ? "paged (G4b)" : "contiguous (G3)",
                     g_ab_int8_lmhead ? "int8 lm_head tiled vs GEMV" : "layer GEMM naive vs GEMV");
 
