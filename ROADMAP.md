@@ -630,6 +630,31 @@ extends unchanged (1.5B fits the ~1.7B fp32 CPU-oracle RAM ceiling).
         (`pool_free == dpool_free == num_blocks`, no leak on either). **Honest scope:** removes the last
         per-sequence worst-case preallocation in the spec scheduler (the draft cache) — a memory/packing
         win, not a tok/s one; realized speedup is still S2's r-cap.
+  - [x] **S3e** ✅ landed — **spec prefix-sharing (RadixAttention)**, the F8c analog and the last named
+        spec follow-up. Spec requests with a common block-aligned prompt prefix reuse its TARGET KV
+        blocks instead of re-prefilling them, each prefilling only its suffix — realized by REUSING the
+        Scheduler's `PrefixCache` verbatim (`SpecScheduler(prefix_sharing=True)`): the shared KV is causal
+        (a token's K/V depends only on its prefix), so it's bit-identical to recomputing it and every
+        request stays token-identical to standalone spec (the S0 invariant) AND to plain greedy. `_admit`
+        matches the prompt against the cache, `share_prefix`es the matched blocks onto the sequence's
+        paged target cache, prefills only `prompt[shared_len:]` (whose last row is still the prompt's last
+        token → seq.cur unchanged), then registers the prompt's blocks for the next request. Admission
+        gates on the held (pinned) blocks too, the same formula the proven Scheduler uses. **Target-only:**
+        prefix sharing is on the memory-dominant target cache and works for ANY proposer (a mixed
+        draft/lookup batch shares the same prefix — the proposer is orthogonal); the draft's small prompt
+        prefill isn't shared (a symmetric follow-up over the draft pool). **No new kernel** —
+        `share_prefix`/`register`/`truncate` are the F8b/F8c/S1 primitives; the spec-specific safety is
+        that verify writes and rollback only ever touch positions ≥ prompt_len > the shared prefix, so a
+        borrowed block is never written or freed by a sharing sequence (refcounted anyway). **Gate**
+        (`tests/run_spec_serve.py`): 3 mixed draft/lookup requests sharing a 24-tok prefix (bs=4) are
+        token-identical to standalone spec and plain greedy on BOTH pairs (0.5B/0.5B and the real
+        1.5B/0.5B), skip 48 prompt tok of re-prefill (sharing isn't a silent no-op), and every block
+        returns after `clear_prefix_cache()` — target pool AND draft pool
+        (`pool_free == dpool_free == num_blocks`). **Honest scope:** skips re-prefill of shared target
+        prefixes (the RAG / few-shot / shared-system-prompt win) + shares the blocks — a prefill/memory
+        win, not a change to spec's per-sequence r-cap economics (S2). **With S3e the S-track's named
+        remaining work is done** — spec is fully folded into continuous batching (mixed proposers,
+        batched ragged verify, paged target + draft caches, prefix sharing) under greedy AND sampling.
 - [x] **S4** ✅ landed — draft *without* a second model: **prompt-lookup / n-gram decoding**, the r→0
       ratio lever S2 named as the point (the 0.5B/1.5B pair's r ≈ 0.45 caps it at 1.24×; a free draft
       doesn't). **Same verify + rollback machinery, a different proposer** — realized literally: the S0

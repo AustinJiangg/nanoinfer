@@ -120,6 +120,47 @@ def build_requests(base: list[int]) -> list[SpecRequest]:
     ]
 
 
+def check_prefix_sharing(label, target, draft, base: list[int]) -> bool:
+    """S3e — spec prefix sharing (RadixAttention on the TARGET cache). Several spec requests
+    share a long common prompt prefix; the scheduler reuses its KV blocks (skipping re-prefill)
+    instead of recomputing them. The shared KV is causal (a token's K/V depends only on its
+    prefix), so sharing is bit-exact and every request stays token-identical to standalone spec
+    (the S0 invariant) — AND to plain greedy. Prefix sharing is on the target cache, independent
+    of the proposer, so a MIXED draft/lookup batch shares the same prefix. Blocks must all free
+    on clear (the prefix cache holds the shared blocks until then; the draft cache is never
+    shared, so its pool frees as sequences finish)."""
+    shared = [base[i % len(base)] for i in range(24)]        # 24-tok common prefix (6 blocks @ bs=4)
+    pre_reqs = [
+        SpecRequest("s0", shared + [11],        max_tokens=8, proposer="draft",  k=4),
+        SpecRequest("s1", shared + [785],       max_tokens=8, proposer="lookup", ngram=3, k=8),
+        SpecRequest("s2", shared + [11, 1933],  max_tokens=6, proposer="draft",  k=2),
+    ]
+    ref_spec = {r.request_id: standalone_spec(target, draft, r) for r in pre_reqs}
+    ref_plain = {r.request_id: plain_greedy(target, r.prompt_ids, r.max_tokens, r.eos_id)
+                 for r in pre_reqs}
+    base_ok = all(ref_spec[r.request_id] == ref_plain[r.request_id] for r in pre_reqs)
+
+    sched = SpecScheduler(target, draft=draft, max_batch=4, batched=True,
+                          block_size=4, num_blocks=128, prefix_sharing=True)
+    for r in pre_reqs:
+        sched.add(r)
+    out = sched.run()
+    share_match = all(out[r.request_id] == ref_spec[r.request_id] for r in pre_reqs)
+    shared_tok = sched.shared_prefill_tokens                 # >0 proves sharing wasn't a no-op
+    held = sched.prefix_cache.held_blocks
+    sched.clear_prefix_cache()                               # release the held prefix blocks
+    freed = sched.pool.free_blocks == sched.pool.num_blocks
+    dfreed = sched.dpool is None or sched.dpool.free_blocks == sched.dpool.num_blocks
+    ok = base_ok and share_match and shared_tok > 0 and freed and dfreed
+    dpf = f"{sched.dpool.free_blocks}/{sched.dpool.num_blocks}" if sched.dpool else "-"
+    print(f"{label}: 3 reqs share {len(shared)}-tok prefix (mixed draft/lookup) -> "
+          f"{'MATCH' if share_match else 'MISMATCH'} (==plain:{base_ok}); "
+          f"shared_prefill={shared_tok} tok, held={held} blk; "
+          f"pool_free={sched.pool.free_blocks}/{sched.pool.num_blocks} dpool_free={dpf} "
+          f"-> {'OK' if ok else 'FAIL'}")
+    return ok
+
+
 def run_configs(label, target, draft, reqs, batch_sizes) -> bool:
     # References computed once (batch-invariant): standalone spec AND plain greedy.
     ref_spec = {r.request_id: standalone_spec(target, draft, r) for r in reqs}
@@ -186,6 +227,9 @@ def main() -> int:
     print("A. target=draft=0.5B (draft reqs ~100% accept) + prompt-lookup, mixed batch")
     ok &= run_configs("  0.5B/0.5B", m05, m05, build_requests(read_ids(d05 / "ref_ids.txt")),
                       batch_sizes=(1, 2, 8))
+    # A'. S3e: prefix sharing (RadixAttention) — mixed draft/lookup reqs sharing a long prefix.
+    print("A'. prefix sharing (S3e):")
+    ok &= check_prefix_sharing("  0.5B/0.5B", m05, m05, read_ids(d05 / "ref_ids.txt"))
 
     # B. the real pair: target=1.5B, draft=0.5B — genuine (<100%) accept, still token-identical.
     if d15.exists():
@@ -193,6 +237,8 @@ def main() -> int:
         m15 = nicpp.Model(str(d15), device=device)
         ok &= run_configs("  0.5B->1.5B", m15, m05, build_requests(read_ids(d15 / "ref_ids.txt")),
                           batch_sizes=(1, 2, 8))
+        print("B'. prefix sharing (S3e):")
+        ok &= check_prefix_sharing("  0.5B->1.5B", m15, m05, read_ids(d15 / "ref_ids.txt"))
     else:
         print(f"\nB. skipped — no 1.5B weights at {d15}")
 

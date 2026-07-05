@@ -46,6 +46,7 @@ sys.path.insert(0, str(CPP / "build"))  # nicpp.*.so
 
 import nicpp  # noqa: E402
 
+from scheduler import PrefixCache  # noqa: E402  (F8c: reuse it verbatim — spec shares the TARGET cache)
 from speculative import (  # noqa: E402
     DraftModelProposer,
     PromptLookupProposer,
@@ -135,7 +136,7 @@ class SpecScheduler:
     """
 
     def __init__(self, target, draft=None, max_batch: int = 8, batched: bool = True,
-                 block_size: int = 0, num_blocks: int = 0):
+                 block_size: int = 0, num_blocks: int = 0, prefix_sharing: bool = False):
         self.model = target
         self.draft = draft
         self.max_batch = max_batch
@@ -165,6 +166,17 @@ class SpecScheduler:
         self.dpool = (draft.make_block_pool(block_size, num_blocks)
                       if self.paged and draft is not None else None)
         self.reserved_draft = 0        # draft KV blocks reserved by running draft sequences
+        # S3e (the F8c analog): prefix sharing on the TARGET cache — spec requests with a
+        # common block-aligned prompt prefix reuse its KV blocks (RadixAttention) instead of
+        # re-prefilling them, each sequence prefilling only its suffix. Reuses the Scheduler's
+        # PrefixCache verbatim: the shared blocks are causal (a token's KV depends only on its
+        # prefix), so sharing is bit-exact and output stays token-identical to standalone spec
+        # (the S0 invariant). Target-only — the draft's small prompt prefill isn't shared (a
+        # symmetric follow-up over the draft pool). Paged only, like Scheduler.
+        if prefix_sharing and not self.paged:
+            raise ValueError("prefix_sharing requires paged mode (block_size > 0)")
+        self.prefix_cache = PrefixCache(self.pool, block_size) if prefix_sharing else None
+        self.shared_prefill_tokens = 0  # prompt tokens skipped via prefix sharing (target)
         self.waiting: deque[SpecRequest] = deque()
         self.running: list[SpecSequence] = []
         self.finished: dict[str, list[int]] = {}
@@ -294,8 +306,9 @@ class SpecScheduler:
         proposer, emit the first token from the prefill logits (so an admitted sequence has
         produced one token by the end of its admission step — same as the single-sequence
         loop and as Scheduler's prefill-then-emit). In paged mode admission is also gated on
-        target KV blocks (FCFS: if the head request can't be reserved yet, wait rather than
-        skip ahead — no starvation)."""
+        target (and draft, S3d) KV blocks (FCFS: if the head request can't be reserved yet, wait
+        rather than skip ahead — no starvation), and with prefix sharing (S3e) a matching prompt
+        prefix reuses cached TARGET blocks so only the suffix is reserved and prefilled."""
         while len(self.running) < self.max_batch and self.waiting:
             req = self.waiting[0]                        # peek: FCFS block gating may make us wait
             if not req.prompt_ids:                       # nothing to condition on
@@ -308,26 +321,40 @@ class SpecScheduler:
             cap = len(req.prompt_ids) + req.max_tokens + req.max_k + 1
             reserved = 0
             reserved_draft = 0
+            shared_blocks: list[int] = []
+            shared_len = 0
             if self.paged:
                 bs = self.pool.block_size
                 worst = (cap + bs - 1) // bs             # worst-case blocks (incl. tentative tail)
+                # Prefix sharing (S3e): reuse a cached prefix's TARGET blocks if one matches, so
+                # we prefill (and reserve) only the suffix past it. match() returns block-aligned
+                # blocks and shared_len < len(prompt) (a suffix always remains to prefill).
+                if self.prefix_cache is not None:
+                    shared_blocks, shared_len = self.prefix_cache.match(req.prompt_ids)
                 # A "draft" request also draws `worst` DRAFT blocks (its draft cache grows
                 # lock-step with the target, same cap/block_size — S3d); "lookup" draws none.
+                # The draft prefill isn't prefix-shared, so it reserves the full worst.
                 dworst = worst if req.proposer == "draft" and self.dpool is not None else 0
                 if worst > self.pool.num_blocks or dworst > (self.dpool.num_blocks if self.dpool else 0):
                     raise ValueError(
                         f"request {req.request_id} needs {worst} target / {dworst} draft blocks; "
                         f"pool has {self.pool.num_blocks} (raise num_blocks or block_size)")
+                # Reserve only the non-shared target blocks (shared ones are already allocated).
+                reserved = worst - len(shared_blocks)
                 # Gate on BOTH pools (FCFS): keep the head request queued unless target AND draft
-                # blocks are free. Target pressure >= draft pressure (lookups reserve only target),
-                # so the target check usually binds — but check both so paging is self-evidently
-                # safe regardless of pool sizing.
-                if (self.reserved + worst > self.pool.num_blocks
+                # blocks are free. Blocks the prefix cache holds count against the target pool
+                # (conservatively — never over-commits). Target pressure >= draft pressure (lookups
+                # reserve only target), so the target check usually binds — but check both so
+                # paging is self-evidently safe regardless of pool sizing.
+                held = self.prefix_cache.held_blocks if self.prefix_cache else 0
+                if (self.reserved + held + reserved > self.pool.num_blocks
                         or (dworst and self.reserved_draft + dworst > self.dpool.num_blocks)):
                     break                                # not enough free blocks now; keep it queued
-                reserved = worst
                 reserved_draft = dworst
                 tcache = self.pool.make_cache()          # PagedKVCache / CudaPagedKVCache by device
+                if shared_blocks:
+                    tcache.share_prefix(shared_blocks, shared_len)  # borrow the prefix's KV blocks
+                    self.shared_prefill_tokens += shared_len
                 self.reserved += reserved
                 self.reserved_draft += reserved_draft
             else:
@@ -340,7 +367,12 @@ class SpecScheduler:
             seq.reserved_blocks = reserved
             seq.reserved_draft_blocks = reserved_draft
 
-            tlog = self.model.forward(req.prompt_ids, seq.tcache)
+            # Prefill only the suffix past the shared prefix (shared_len=0 if none); its last
+            # position is still the prompt's last token, so seq.cur (and the target's first-token
+            # logits) is identical to a full prefill. Then cache this prompt's blocks for reuse.
+            tlog = self.model.forward(req.prompt_ids[shared_len:], seq.tcache)
+            if self.prefix_cache is not None:
+                self.prefix_cache.register(req.prompt_ids, seq.tcache.block_table)
             if seq.sampling:                             # first token: a draw from the shaped
                 seq.cur = _draw(nicpp.token_probs(tlog[-1], seq.params, req.prompt_ids), seq.rng)
             else:                                        # dist (== plain), or the argmax (greedy)
@@ -381,3 +413,9 @@ class SpecScheduler:
         while self.has_work():
             self.step()
         return self.finished
+
+    def clear_prefix_cache(self) -> None:
+        """Release every target block the prefix cache holds, returning them to the pool
+        (e.g. between batches, or to reclaim KV memory). No-op without prefix sharing."""
+        if self.prefix_cache is not None:
+            self.prefix_cache.clear()

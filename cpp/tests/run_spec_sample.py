@@ -310,6 +310,46 @@ def check_scheduler_sampling(target, draft, base, params) -> bool:
     return ok
 
 
+def check_prefix_sharing_sampling(target, draft, base, params) -> bool:
+    """S3e under SAMPLING — prefix sharing must not perturb the sampled draws. Sharing only moves
+    WHERE the prefix KV lives (bit-identical, causal), so token_probs and each sequence's seeded
+    draw stream are unchanged: a sampled sequence stays TOKEN-identical to standalone at the same
+    seed even when it reuses a shared prefix (the S5 batch-invariance property extended to prefix
+    sharing). Mixed draft/lookup share a long prefix; all blocks free on clear (both pools)."""
+    from spec_scheduler import SpecRequest, SpecScheduler  # local import: only this check
+
+    shared = [base[i % len(base)] for i in range(24)]        # 24-tok common prefix (6 blocks @ bs=4)
+    reqs = [
+        SpecRequest("s0", shared + [11],       max_tokens=8, proposer="draft",  k=4, params=params, seed=1),
+        SpecRequest("s1", shared + [785],      max_tokens=8, proposer="lookup", ngram=3, k=8, params=params, seed=2),
+        SpecRequest("s2", shared + [11, 1933], max_tokens=6, proposer="draft",  k=2, params=params, seed=3),
+    ]
+    ref = {}                                                 # standalone at each request's own seed
+    for r in reqs:
+        if r.proposer == "draft":
+            out, _ = sample_speculative(target, draft, r.prompt_ids, r.max_tokens, r.params,
+                                        k=r.k, seed=r.seed, eos_id=r.eos_id)
+        else:
+            out, _ = sample_prompt_lookup(target, r.prompt_ids, r.max_tokens, r.params,
+                                          ngram=r.ngram, k=r.k, seed=r.seed, eos_id=r.eos_id)
+        ref[r.request_id] = out
+
+    sched = SpecScheduler(target, draft=draft, max_batch=4, batched=True,
+                          block_size=4, num_blocks=128, prefix_sharing=True)
+    for r in reqs:
+        sched.add(r)
+    out = sched.run()
+    mism = [rid for rid in ref if out.get(rid) != ref[rid]]
+    shared_tok = sched.shared_prefill_tokens
+    sched.clear_prefix_cache()
+    freed = (sched.pool.free_blocks == sched.pool.num_blocks
+             and (sched.dpool is None or sched.dpool.free_blocks == sched.dpool.num_blocks))
+    ok = not mism and len(out) == len(reqs) and shared_tok > 0 and freed
+    print(f"  prefix-sharing sampling: shared_prefill={shared_tok} tok, freed={freed} "
+          f"-> {'MATCH' if not mism else 'MISMATCH ' + str(mism)}")
+    return ok
+
+
 def main() -> int:
     d05 = Path(sys.argv[1] if len(sys.argv) > 1 else "weights/qwen2.5-0.5b")
     d15 = Path(sys.argv[2] if len(sys.argv) > 2 else "weights/qwen2.5-1.5b")
@@ -336,6 +376,7 @@ def main() -> int:
 
     print("\nS. scheduler sampling == standalone (token-identical, batch-invariant):")
     ok &= check_scheduler_sampling(m05, m05, prompt05, sp)
+    ok &= check_prefix_sharing_sampling(m05, m05, prompt05, sp)  # S3e under sampling
 
     if d15.exists():
         m15 = nicpp.Model(str(d15))
