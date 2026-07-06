@@ -199,6 +199,12 @@ if(NI_CUDA)
   add_executable(run_cuda_attn_bench tests/run_cuda_attn_bench.cpp)
   target_link_libraries(run_cuda_attn_bench PRIVATE nicore)
   target_include_directories(run_cuda_attn_bench PRIVATE tests)
+
+  # P2: long-context decode sweep — end-to-end decode tok/s over context x {contiguous, paged} x
+  # {split off, on} in one process, to find where Flash-Decoding (G5g) + paging dominate on 1.5B.
+  add_executable(run_cuda_ctx_sweep tests/run_cuda_ctx_sweep.cpp)
+  target_link_libraries(run_cuda_ctx_sweep PRIVATE nicore)
+  target_include_directories(run_cuda_ctx_sweep PRIVATE tests)
 endif()
 
 # R0/R1: the weight-dependent parity/golden binaries as a labelled `weights` ctest suite, so the

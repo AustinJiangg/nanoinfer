@@ -758,8 +758,23 @@ Pulled in alongside S whenever the target (1.5B) forward is the bottleneck. Same
       capped until a W8A8 decode-GEMV (the shipped q8-GEMV analog — backlog). **P0→P1 lesson: cut BYTES
       (fp16) for memory-bound decode, cut FLOPs (int8) for compute-bound prefill; wmma was a byte lever on
       compute-bound prefill (wrong tool).** (BASELINE-1.5b.md §P1 has the tables.)
-- [ ] **P2** — long context on 1.5B. KV ~2.3×/token → Flash-Decoding (G5g) + paged wins grow and
-      the "muted by L2" ceiling lifts; re-run the ctx sweep, find where paged+split now dominates.
+- [x] **P2** ✅ landed — long context on 1.5B: **Flash-Decoding + paging un-muted, and paging is a hard
+      ENABLER.** New harness `run_cuda_ctx_sweep` (loads 1.5B once; per context C times a 32-step decode
+      window at a length-C KV under {contiguous, paged} × {split off, on}; pool-trims between configs,
+      catches OOM, greedy-token-gates every config vs the paged split-off reference). Measured fp16
+      (the P1 1.5B default — KV stays fp32, so the ratios are dtype-independent), decode tok/s vs ctx:
+      - **paged+split is context-FLAT to ~5k then decays gracefully** (56→55→54 @512→4096, 40.5 @8192,
+        24.9 @16384), while the pre-P2 contiguous-no-split default COLLAPSES (34.6→2.9 @512→4096) and
+        **OOMs at ctx ≥ 8192** (the CUDA contiguous cache's un-reusing O(ctx) cat_seq). Combined
+        paged+split vs that baseline: **1.62× @512 → 9.70× @2048 → 18.88× @4096 → contiguous non-viable.**
+      - **Two levers decompose cleanly:** split-KV on the paged path (paged-on/paged-off) grows **1.48×
+        @512 → 7.94× @8192 → 9.22× @16384** — the exact un-muting G5g predicted (0.5B's L2-served ~1.3×
+        tie → ~9× once decode-attention is the dominant, un-cacheable cost at head_dim 128); paging alone
+        (paged-off/contig-off) is ~1.10× short → 3.28× @4096 → then ENABLES ctx ≥ 8192.
+      - **No crossover — paged+split dominates from the first context and pulls away monotonically**;
+        past 4096 the contiguous default doesn't just lose, it OOMs, so paged+split is the ONLY viable
+        long-context config. Parity spine held (greedy tokens MATCH every context). (BASELINE-1.5b.md §P2
+        has the tables + the reproduce line; `NI_PAGED_ONLY=1` skips the doomed contiguous crawl at ctx≥8k.)
 
 ## Cross-platform (portability proof, after the GPU is learned)
 - [x] **NEON** — `simd.hpp`'s `#elif` path now carries the three inner products on aarch64

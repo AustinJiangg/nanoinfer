@@ -218,3 +218,58 @@ The **P0→P1 lesson**: on memory-bound **decode**, cut BYTES (fp16); on compute
 FLOPs (int8) — wmma was a byte lever aimed at compute-bound prefill (wrong tool → washed out), while
 W8A8 is the FLOP lever that actually moves prefill.
 
+## P2 — long context on 1.5B (Flash-Decoding + paging un-muted, 2026-07-06)
+
+P2's question (ROADMAP): the G-track parked **Flash-Decoding (split-KV, G5g)** and the **paged cache**
+as levers that GROW with context, and 1.5B's KV is ~2.3×/token (head_dim 64→128), so re-run the ctx
+sweep and find where paged+split now dominates. New harness `run_cuda_ctx_sweep` (the P2 tool) loads the
+model ONCE and, for each context C, times a 32-step decode window at a length-C KV under the four configs
+{contiguous, paged} × {split off, on}. The device pool is trimmed between configs (the contiguous cache's
+growing cat_seq buffers can't accumulate), and an OOM on one config is caught and reported, not fatal.
+Correctness gate: every config's greedy tokens match the paged split-off reference (paged is bit-exact to
+contiguous; split reorders the reduction but greedy argmax holds — CLAUDE.md's tolerance+tokens bar).
+
+**Decode tok/s vs context** (`run_cuda_ctx_sweep weights/qwen2.5-1.5b 32`, fp16 weights — the P1 1.5B
+default; KV stays fp32, so the paged/split RATIOS below are weight-dtype-independent, fp16 only lifts every
+column's absolute tok/s uniformly). Every row token-MATCHed:
+
+| ctx | contig-off (pre-P2 default) | contig-on | paged-off | **paged-on** | pg+spl / base |
+|---|---|---|---|---|---|
+| 512   | 34.6 | 47.5 | 37.9 | **56.1** | 1.62× |
+| 1024  | 24.1 | 45.3 | 26.5 | **56.2** | 2.33× |
+| 2048  |  5.7 | 12.6 | 16.6 | **55.3** | 9.70× |
+| 4096  |  2.9 |  2.8 |  9.5 | **54.0** | 18.88× |
+| 8192  |  OOM |  OOM |  5.1 | **40.5** | ∞ (base OOM) |
+| 16384 | skip | skip |  2.7 | **24.9** | — (paged-only) |
+
+- **paged+split is context-FLAT to ~5k, then decays gracefully:** ~56 → 55 → 54 tok/s from ctx 512→4096
+  (the split fans H=12 decode warps to H·num_splits ≈ H·38, filling the 56-SM GPU so the growing KV walk
+  stays parallel), then 40.5 @8192 / 24.9 @16384 as `num_splits` saturates its cap (~38, from
+  `sm_count·8/nq`) and each split's key-chunk grows. Meanwhile the pre-P2 contiguous baseline COLLAPSES
+  (34.6 → 2.9 → OOM): the CUDA contiguous cache grows by an un-reusing cat_seq (a distinct-size buffer
+  every step → O(ctx) copy + no reuse), which both dominates the step and OOMs the card at ctx ≥ 8192.
+- **The two levers decompose cleanly:**
+  - **Split-KV (Flash-Decoding) on the paged path** (paged-on / paged-off): **1.48× @512 → 3.33× @2048 →
+    7.94× @8192 → 9.22× @16384.** THIS is the un-muting the roadmap predicted — on 0.5B (head_dim 64, KV in
+    L2) the isolated split win diluted to ~1.3× e2e; on 1.5B it grows monotonically to ~9× because the
+    decode-attention it parallelizes is now the dominant, un-L2-cacheable cost.
+  - **Paging** (paged-off / contig-off): ~1.10× at short ctx (small cat_seq) → 2.91× @2048 → 3.28× @4096
+    (cat_seq now dominates the contiguous step) → then it **ENABLES** ctx ≥ 8192, where contiguous OOMs.
+- **No "crossover point" — paged+split dominates from the first context (1.62× @512) and pulls away
+  monotonically** (1.62× → 18.88× → contiguous non-viable). The pre-P2 default (contiguous, no split) is
+  the wrong path at every length on 1.5B; past 4096 it is not merely slow but OOMs, so paged+split is the
+  ONLY viable long-context config. That is the P2 answer: the levers didn't just "wake up" — the contiguous
+  baseline they beat became unusable, and split-KV's win over the surviving paged path grows to ~9×.
+
+### Verdict (P2)
+
+**On 1.5B, long-context decode is a two-lever win that grows with context, and one of the levers is a
+hard enabler.** Paging removes the contiguous cache's O(ctx) cat_seq crawl (and its OOM at ctx ≥ 8192);
+Flash-Decoding's split-KV then keeps the paged decode parallel as the KV grows — together holding decode
+~flat at ~54–56 tok/s through 4096 and still 24.9 tok/s at 16384, versus a contiguous baseline that falls
+to 2.9 tok/s by 4096 and OOMs beyond. The G5g "muted by L2" tie is un-muted exactly as predicted (split on
+the paged path: 1.48× → 9.22×). The parity spine held at every context (greedy tokens MATCH). fp16 weights
+(the P1 default) were used to give the sweep headroom; the ratios are KV-bound and dtype-independent.
+Reproduce: `run_cuda_ctx_sweep weights/qwen2.5-1.5b 32` (add `NI_PAGED_ONLY=1` for ctx ≥ 8192, where the
+contiguous configs OOM by design and aren't worth the doomed crawl).
+

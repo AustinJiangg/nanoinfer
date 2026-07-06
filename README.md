@@ -117,7 +117,8 @@ C++/CUDA engine — built on our own kernels:
 - [x] **S0–S5** — speculative decoding: draft-model + prompt-lookup proposers, KV rollback,
       continuous-batching integration, and sampling-parity (rejection sampling)
 - [x] **NEON** — the CPU backend cross-compiles and runs on Apple ARM (op-level parity)
-- [ ] **P-track** — perf retune for Qwen2.5-1.5B (flip the GPU levers that pay at scale)
+- [x] **P-track** — perf retune for Qwen2.5-1.5B (P0 tiling default + wmma re-bench, P1 quant ROI /
+      fp16-default, P2 long-context: Flash-Decoding + paging un-muted, paged+split up to 18.9× e2e)
 - [ ] **Metal** — a third backend on the M4 GPU (deferred; structurally prepped)
 
 ## Development
