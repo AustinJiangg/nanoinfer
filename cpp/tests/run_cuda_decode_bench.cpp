@@ -29,6 +29,10 @@ static double secs(Clock::time_point a, Clock::time_point b) {
 
 // NI_QEMBED mode (set in main): A/B the weight-only int8 lm_head kernel instead of the layer GEMM.
 static bool g_ab_int8_lmhead = false;
+// NI_W8A8 mode (set in main): the layer projections are int8×int8 DP4A (CudaW8A8Weight → cuda_linear_w8a8),
+// which force_naive_gemm can't reach (that only toggles CudaBackend::linear's fp32/fp16 path). So the
+// W8A8 decode A/B is the tiled DP4A GEMM (P1's 0.64× decode regime) vs the new warp-per-output GEMV.
+static bool g_ab_w8a8 = false;
 
 // Prefill `prompt`, then greedily decode `decode_len` tokens, timing each phase. `force_slow` selects
 // the SLOW variant of the kernel under test — the only thing that differs between the two calls.
@@ -36,11 +40,14 @@ struct Timing {
     double prefill_s, decode_s;
 };
 static Timing run_one(const Model& model, const std::vector<int64_t>& prompt, int64_t decode_len,
-                      int64_t vocab, bool force_slow, bool use_paged) {
+                      int64_t vocab, bool force_slow, bool use_paged,
+                      std::vector<int64_t>* out_toks = nullptr) {
     // Default (G5b): the layer-projection GEMM (naive vs warp-GEMV). NI_QEMBED: the int8 lm_head
     // (prefill-tiled vs decode GEMV) — layers stay on the GEMV so only the lm_head kernel changes.
     if (g_ab_int8_lmhead)
         cuda_policy().force_tiled_q8 = force_slow;
+    else if (g_ab_w8a8)
+        cuda_policy().force_tiled_w8a8 = force_slow;  // W8A8 layer projections: tiled (slow) vs GEMV
     else
         cuda_policy().force_naive_gemm = force_slow;
     const int64_t max_seq = static_cast<int64_t>(prompt.size()) + decode_len + 8;
@@ -69,6 +76,7 @@ static Timing run_one(const Model& model, const std::vector<int64_t>& prompt, in
     int64_t next = argmax_row(l, l.size(0) - 1, vocab);
     Clock::time_point t2 = Clock::now();
     for (int64_t d = 0; d < decode_len; ++d) {  // decode one token at a time (m=1)
+        if (out_toks) out_toks->push_back(next);
         Tensor ld = model.forward({next}, cache);
         next = argmax_row(ld, 0, vocab);
     }
@@ -134,14 +142,18 @@ int main(int argc, char** argv) {
         // e2e where wmma washed out? Combine with NI_QEMBED for the full-int8 model. Must precede the
         // Model build (the quantize happens at the once-per-load upload, like fp16).
         QuantMode qmode = QuantMode::None;
-        if (const char* e = std::getenv("NI_W8A8"); e && e[0] == '1') qmode = QuantMode::W8A8;
+        if (const char* e = std::getenv("NI_W8A8"); e && e[0] == '1') {
+            qmode = QuantMode::W8A8;
+            g_ab_w8a8 = true;  // A/B the W8A8 layer projections: tiled DP4A (slow) vs decode GEMV
+        }
         Model model(dir, qmode, Device::CUDA, cfg);
         const int64_t vocab = model.config().vocab_size;
         std::printf("layer weights: %s%s; KV cache: %s; A/B: %s\n",
                     qmode == QuantMode::W8A8 ? "int8 W8A8 (DP4A)" : (cfg.fp16_weights ? "fp16 (G5d)" : "fp32"),
                     cfg.quantize_embed ? " + int8 embed/lm_head" : "",
                     use_paged ? "paged (G4b)" : "contiguous (G3)",
-                    g_ab_int8_lmhead ? "int8 lm_head tiled vs GEMV" : "layer GEMM naive vs GEMV");
+                    g_ab_int8_lmhead ? "int8 lm_head tiled vs GEMV"
+                                     : (g_ab_w8a8 ? "W8A8 layers tiled vs GEMV" : "layer GEMM naive vs GEMV"));
 
         // Synthesize a prompt by cycling the reference ids (any valid ids time the same).
         std::vector<int64_t> seed;
@@ -199,12 +211,27 @@ int main(int argc, char** argv) {
 
         run_one(model, prompt, 4, vocab, false, use_paged);  // warm CUDA context / reach steady state
 
-        const Timing slow = run_one(model, prompt, decode_len, vocab, true, use_paged);
-        const Timing fast = run_one(model, prompt, decode_len, vocab, false, use_paged);
+        std::vector<int64_t> slow_toks, fast_toks;
+        const Timing slow = run_one(model, prompt, decode_len, vocab, true, use_paged, &slow_toks);
+        const Timing fast = run_one(model, prompt, decode_len, vocab, false, use_paged, &fast_toks);
         cuda_policy().force_naive_gemm = false;
         cuda_policy().force_tiled_q8 = false;
+        cuda_policy().force_tiled_w8a8 = false;
 
-        const char* slow_label = g_ab_int8_lmhead ? "tiled" : "naive";  // the slow kernel under test
+        // Correctness gate for the decode A/B (previously only NI_GRAPH token-checked): the two kernels
+        // must emit the same greedy stream. For W8A8 (int32-exact GEMV) and the fp32 warp-GEMV this is
+        // BIT-IDENTICAL (max|diff|=0 → the full forward can't diverge); the weight-only q8 GEMV reorders
+        // its fp32 sum to ~1e-6, so a knife-edge argmax could differ — informational there, hard for W8A8.
+        const bool toks_match = (slow_toks == fast_toks);
+        std::printf("decode tokens slow==fast: %s (%zu tokens)\n", toks_match ? "MATCH" : "DIFFER",
+                    fast_toks.size());
+        if (g_ab_w8a8 && !toks_match) {  // W8A8 GEMV is provably bit-identical — a mismatch is a real bug
+            std::printf("run_cuda_decode_bench: FAIL (W8A8 GEMV must be bit-identical to tiled)\n");
+            return 1;
+        }
+
+        // the slow kernel under test: int8 lm_head / W8A8 layers A/B the tiled GEMM, the fp32 path the naive
+        const char* slow_label = (g_ab_int8_lmhead || g_ab_w8a8) ? "tiled" : "naive";
         auto tps = [](int64_t n, double s) { return static_cast<double>(n) / s; };
         std::printf("\n%-8s %14s %14s\n", "kernel", "prefill tok/s", "decode tok/s");
         std::printf("%-8s %14.1f %14.1f\n", slow_label, tps(prefill_len, slow.prefill_s),

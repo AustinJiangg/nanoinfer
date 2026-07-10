@@ -114,6 +114,48 @@ __global__ void linear_w8a8_kernel(const int8_t* __restrict__ xq, const int8_t* 
     }
 }
 
+// W8A8 decode GEMV (backlog, the P1-named cap): the linear_w8a8_kernel sibling for decode
+// (m<=kGemvMaxM). The tiled DP4A kernel is prefill-tuned — at m=1 its 64-row tile leaves ~63/64 of the
+// warps idle yet still streams the whole int8 weight, so the projections run far under the bandwidth
+// wall (P1 measured W8A8 decode 0.64× vs fp32 — the int8 COMPUTE win only landed at prefill). Here one
+// WARP owns output o: the 32 lanes coalesce-stride codes[o,:], packing 4 K-contiguous int8 into an int
+// for __dp4a (int8×int8→int32, 4 MACs/instr — the same integer core as linear_w8a8_kernel and the CPU
+// dot_qq), a __shfl reduction folds the 32 int32 partials, and the dual-scale dequant applies once at
+// the store. The decode memory win is the ¼-fp32 (½-fp16) weight bytes, same as linear_q8_gemv_kernel.
+//
+// Parity is STRONGER than the weight-only q8 GEMV's ~1e-6: int32 accumulation is EXACT and associative
+// (no rounding, and no overflow — |i8·i8|·k < 16129·8960 ≈ 1.4e8 « 2^31), so the warp-strided sum is
+// the SAME int32 as the tiled kernel's k-tiled sum, and the store does the identical float multiply
+// order (float(acc)·a_scale[row])·w_scale[col] + bias — so the GEMV is BIT-IDENTICAL to the tiled
+// kernel (max|diff|=0), not merely within tolerance. Requires k % 4 == 0 (the int pack; k%16==0 holds
+// for every Qwen linear, so this is always satisfied on the dispatch path). m>1 loops the rows so
+// codes[o] streams once, reused across them from L2 (the batched-decode weight reuse, as in G5b).
+__global__ void linear_w8a8_gemv_kernel(const int8_t* __restrict__ xq, const int8_t* __restrict__ wq,
+                                        const float* __restrict__ a_scale,
+                                        const float* __restrict__ w_scale,
+                                        const float* __restrict__ bias, float* __restrict__ y, int m,
+                                        int n, int k) {
+    const int o = (blockIdx.x * blockDim.x + threadIdx.x) / 32;  // one warp per output channel
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    if (o >= n) return;
+    const size_t wbase = static_cast<size_t>(o) * k;
+    const float ws = w_scale[o];
+    const float b = bias ? bias[o] : 0.0f;
+    const int kg = k / 4;  // number of 4-int8 (one __dp4a) groups
+    for (int i = 0; i < m; ++i) {
+        const size_t xbase = static_cast<size_t>(i) * k;
+        int32_t partial = 0;
+        for (int g = lane; g < kg; g += 32) {  // each lane: 4 K-contiguous int8, coalesced across lanes
+            const int aPack = *reinterpret_cast<const int*>(xq + xbase + static_cast<size_t>(g) * 4);
+            const int bPack = *reinterpret_cast<const int*>(wq + wbase + static_cast<size_t>(g) * 4);
+            partial = __dp4a(aPack, bPack, partial);
+        }
+        for (int off = 16; off > 0; off >>= 1)  // warp-reduce the 32 int32 partials (exact — int add)
+            partial += __shfl_down_sync(0xffffffff, partial, off);
+        if (lane == 0) y[static_cast<size_t>(i) * n + o] = float(partial) * a_scale[i] * ws + b;
+    }
+}
+
 // Weight-only int8 GEMM (G5d): x fp32 [m,k], codes int8 [n,k] (K-contiguous), w_scale fp32 [n].
 // y[i,o] = (sum_j x[i,j]*float(codes[o,j])) * w_scale[o] + bias[o]. fp32 accumulate (x is NOT
 // quantized — unlike linear_w8a8_kernel's int8 activations), so it matches the CPU linear_q8 oracle
@@ -216,14 +258,27 @@ Tensor cuda_linear_w8a8(const Tensor& x, const Tensor& wq, const Tensor& w_scale
     launch_check("activation_quant_kernel");
 
     Tensor y = device_alloc({m, n});
+    const int mi = static_cast<int>(m), ni = static_cast<int>(n), ki = static_cast<int>(k);
+    const int8_t* xqp = static_cast<const int8_t*>(xq.device_ptr());
+    const int8_t* wqp = static_cast<const int8_t*>(wq.device_ptr());
+    const float* bp = bias ? dptr(*bias) : nullptr;
+    // Decode (small m): memory-bound, so the warp-per-output DP4A GEMV — bit-identical to the tiled
+    // kernel (int32 exact), ¼ the fp32 weight bytes. Prefill (large m): compute-bound, the tiled DP4A
+    // GEMM (the 4:1-MAC win). Same m split as cuda_linear_q8 / CudaBackend::linear.
+    if (m <= kGemvMaxM && !cuda_policy().force_tiled_w8a8) {
+        const int threads = 128;  // 4 warps/block, one output channel per warp
+        const int blocks = static_cast<int>((n + threads / 32 - 1) / (threads / 32));
+        linear_w8a8_gemv_kernel<<<blocks, threads>>>(xqp, wqp, dptr(a_scale), dptr(w_scale), bp,
+                                                     dptr(y), mi, ni, ki);
+        launch_check("linear_w8a8_gemv_kernel");
+        return y;
+    }
     constexpr int BM = 64, BN = 64, BK = 16, TM = 4, TN = 4;
     constexpr int threads = (BM / TM) * (BN / TN);  // 256
     const dim3 grid((static_cast<unsigned>(n) + BN - 1) / BN,
                     (static_cast<unsigned>(m) + BM - 1) / BM);
     linear_w8a8_kernel<BM, BN, BK, TM, TN><<<grid, threads>>>(
-        static_cast<const int8_t*>(xq.device_ptr()), static_cast<const int8_t*>(wq.device_ptr()),
-        dptr(a_scale), dptr(w_scale), bias ? dptr(*bias) : nullptr, dptr(y), static_cast<int>(m),
-        static_cast<int>(n), static_cast<int>(k));
+        xqp, wqp, dptr(a_scale), dptr(w_scale), bp, dptr(y), mi, ni, ki);
     launch_check("linear_w8a8_kernel");
     return y;
 }

@@ -51,6 +51,10 @@ struct CudaPolicy {
     // int8 lm_head (cuda_linear_q8): force the prefill-tuned tiled kernel even at decode m, so a bench
     // can A/B the int8 decode GEMV's win on the quantized lm_head (G5d). Left false in normal use.
     bool force_tiled_q8 = false;
+    // W8A8 layer projections (cuda_linear_w8a8): the same A/B knob for the int8×int8 DP4A decode GEMV
+    // (the P1-named decode cap). GEMV is bit-identical to the tiled kernel (int32 exact), so this only
+    // trades speed, not the result. Left false in normal use.
+    bool force_tiled_w8a8 = false;
     // Attention (CudaBackend::attention + CudaPagedKVCache::attend). force_naive_attn: the naive
     // one-thread-per-query kernel, the A/B baseline (G5e). Shared-mem K/V tiling (G5f) at prefill
     // (sq>1) is bit-identical to the non-tiled kernel; it TIES on 0.5B (KV fits L2) but WINS at

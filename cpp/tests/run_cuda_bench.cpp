@@ -321,6 +321,55 @@ int main(int argc, char** argv) {
         }
     }
 
+    // --- W8A8 layer projections: decode GEMV vs the prefill-tuned tiled DP4A kernel (backlog, the
+    // P1-named decode cap). cuda_linear_w8a8 ran the tiled DP4A GEMM at every m; at decode its 64-row
+    // tile leaves ~63/64 of the warps idle yet still streams the whole int8 weight (P1 measured W8A8
+    // decode 0.64× vs fp32). The warp-per-output DP4A GEMV fixes it — and because int32 accumulation is
+    // exact, GEMV is BIT-IDENTICAL to the tiled kernel (diff column must print 0.0, unlike the q8 GEMV's
+    // ~1e-6 fp32 reorder). A/B via cuda_policy().force_tiled_w8a8; the int8 time INCLUDES the per-call
+    // activation quant. Decode is memory-bound, so effective GB/s (int8 codes = the dominant traffic). ---
+    std::printf("\nint8 W8A8 layer projections: decode GEMV vs tiled (cuda_linear_w8a8, A/B, %% of BW):\n");
+    std::printf("%-9s %4s | %10s %5s | %10s %5s | %8s | %9s\n", "shape", "m", "GEMV GB/s", "%BW",
+                "tiled GB/s", "%BW", "speedup", "GEMV-tiled");
+    for (size_t si = 0; si + 1 < shapes.size(); ++si) {  // projection shapes (skip lm_head — the q8 domain)
+        const Shape& sh = shapes[si];
+        const int64_t n = sh.n, k = sh.k;
+        if (k % 16 != 0) continue;  // DP4A tile needs k%16==0 (every Qwen linear qualifies)
+        for (int64_t m : {int64_t(1), int64_t(16)}) {  // decode, batched decode
+            Tensor x({m, k}), w({n, k});
+            for (int64_t i = 0; i < x.numel(); ++i) x[i] = dist(rng);
+            for (int64_t i = 0; i < w.numel(); ++i) w[i] = dist(rng);
+            QTensor qw = quantize_q8(w);
+            Tensor ws({n});
+            for (int64_t o = 0; o < n; ++o) ws[o] = qw.scale[static_cast<size_t>(o)];
+            Tensor xd = to_device(x);
+            Tensor wqd = to_device_i8(qw.q.data(), {n, k}), wsd = to_device(ws);
+            auto run_w8a8 = [&] { Tensor y = cuda_linear_w8a8(xd, wqd, wsd, nullptr); };
+
+            cuda_policy().force_tiled_w8a8 = false;
+            Tensor y_gemv = to_host(cuda_linear_w8a8(xd, wqd, wsd, nullptr));
+            cuda_policy().force_tiled_w8a8 = true;
+            Tensor y_tiled = to_host(cuda_linear_w8a8(xd, wqd, wsd, nullptr));
+            double diff = 0.0;
+            for (int64_t i = 0; i < y_gemv.numel(); ++i)
+                diff = std::max(diff, std::fabs((double)y_gemv[i] - y_tiled[i]));
+
+            cuda_policy().force_tiled_w8a8 = false;
+            const double gemv_ms = time_ms(run_w8a8, 50, 10);
+            cuda_policy().force_tiled_w8a8 = true;
+            const double tiled_ms = time_ms(run_w8a8, 50, 10);
+            cuda_policy().force_tiled_w8a8 = false;
+
+            // int8 codes (n·k) + int8 xq (m·k) + fp32 x read by the quant (m·k) + fp32 scales/y.
+            const double bytes = double(n) * k + double(m) * k + 4.0 * (double(m) * k + n + double(m) * n);
+            const double gemv_gbps = bytes / (gemv_ms * 1e-3) / 1e9;
+            const double tiled_gbps = bytes / (tiled_ms * 1e-3) / 1e9;
+            std::printf("%-9s %4lld | %10.0f %4.0f%% | %10.0f %4.0f%% | %7.2fx | %9.1e\n", sh.label,
+                        (long long)m, gemv_gbps, 100.0 * gemv_gbps / (kPeakBW / 1e9), tiled_gbps,
+                        100.0 * tiled_gbps / (kPeakBW / 1e9), tiled_ms / gemv_ms, diff);
+        }
+    }
+
     cublasDestroy(handle);
     std::printf("run_cuda_bench: ok\n");
     return 0;

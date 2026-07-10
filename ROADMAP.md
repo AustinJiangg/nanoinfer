@@ -755,7 +755,8 @@ Pulled in alongside S whenever the target (1.5B) forward is the bottleneck. Same
       (batch 16 @ 1.7k ctx — TIGHT); fp16/W8A8 free ~6.5–6.9 GB → ~83–89k pair-KV tokens (~3.3× the KV
       budget), fp16 doing it losslessly + decode 1.31×. **Verdict: fp16 is the 1.5B default of choice**
       (strictly better than fp32 on every axis here); int8 modes are the memory-extreme enablers, decode-
-      capped until a W8A8 decode-GEMV (the shipped q8-GEMV analog — backlog). **P0→P1 lesson: cut BYTES
+      capped until a W8A8 decode-GEMV (the shipped q8-GEMV analog — since DONE in the backlog: W8A8 decode
+      0.60× → 1.33× fp32, now matching fp16). **P0→P1 lesson: cut BYTES
       (fp16) for memory-bound decode, cut FLOPs (int8) for compute-bound prefill; wmma was a byte lever on
       compute-bound prefill (wrong tool).** (BASELINE-1.5b.md §P1 has the tables.)
 - [x] **P2** ✅ landed — long context on 1.5B: **Flash-Decoding + paging un-muted, and paging is a hard
@@ -823,7 +824,29 @@ the right moment:
   characterize the muted-by-L2 result). Mirroring it into paged_attention_warp_kernel (gather blocks
   into smem) is mechanical and would stay bit-identical; do it if/when tiling starts winning.
 - int8×int8→int32 GEMM — DONE (G5d W8A8: CPU oracle linear_w8a8 + simd::dot_qq, GPU cuda_linear_w8a8
-  DP4A, model-integrated; the compute win — gate/up 1.11×, down 1.14×, lm_head 1.36×).
+  DP4A, model-integrated; the compute win — gate/up 1.11×, down 1.14×, lm_head 1.36×). **W8A8 decode
+  GEMV — DONE** (the P1-named decode cap, the q8-GEMV analog for the int8×int8 path): cuda_linear_w8a8
+  ran the prefill-tiled DP4A GEMM at every m, so at decode (m=1) its 64-row tile left ~63/64 of the
+  warps idle yet still streamed the whole int8 weight — the layer projections ran far under the
+  bandwidth wall (P1 measured W8A8 decode 0.64× vs fp32). `linear_w8a8_gemv_kernel` gives them the G5b
+  warp-per-output treatment: one warp per output channel, the 32 lanes coalesce-stride codes[o,:]
+  (¼ the fp32 weight bytes — the decode memory win), packing 4 K-contiguous int8 into an int for
+  `__dp4a`, a `__shfl` int32 reduction, the dual-scale dequant folded in once at the store. Routed by
+  the shared kGemvMaxM=16 split (decode→GEMV, prefill→tiled DP4A). **Parity is STRONGER than the
+  weight-only q8 GEMV's ~1e-6: int32 accumulation is EXACT and associative (no overflow — |i8·i8|·k ≈
+  1.4e8 « 2^31), so the warp-strided sum is the SAME int32 as the tiled kernel's and the float dequant
+  is identical → the GEMV is BIT-IDENTICAL to the tiled kernel, max|diff|=0** (test_cuda w8a8
+  gemv==tiled at m=1/8/16 incl. wide k; the m=1..16 vs-CPU-oracle cases stay ~1e-6). Isolated A/B
+  (run_cuda_bench 1.5b, force_tiled_w8a8): the projection decode ops **3.7–24× @m=1** (down 24×,
+  gate/up 6.95×, q/o 3.69×, k/v 5.0× — the tiled kernel was worst on the wide-k `down`), diff 0.
+  End-to-end (run_cuda_decode_bench NI_W8A8, 1.5B paged ctx 128, tiled vs GEMV) **decode 23.4 → 52.3
+  tok/s (2.24×), prefill control flat**, and the full 28-layer forward emits the byte-for-byte same
+  greedy stream (tokens slow==fast MATCH — the bit-identity holds end-to-end). This closes P1's cap:
+  W8A8 decode goes from **0.60× fp32 → 1.33× fp32**, now MATCHING the fp16 default (52.2 tok/s) — so
+  W8A8 wins on both phases vs fp32 (prefill 1.10× compute, decode 1.33× bytes) while keeping ¼-the-weight
+  memory. golden tokens unchanged (run_cuda_parity: fp32 0/12, W8A8 next-token preserved). Remaining
+  W8A8 follow-up: a W8A8 lm_head (see the int8-embed bullet — the int8 COMPUTE win at prefill, needs a
+  token guard since it feeds argmax).
 - int8-quantize embedding / lm_head — **DONE** (CPU + GPU; weight-only int8, the biggest single
   weight). A per-vocab-row Q8 of the tied embed_tokens, shared by the gather (embedding_q8 /
   cuda_embedding_q8: dequant the looked-up row) and the lm_head (linear_q8 / cuda_linear_q8) — fp32

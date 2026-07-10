@@ -150,6 +150,42 @@ static bool check_w8a8(int64_t m, int64_t n, int64_t k, bool with_bias, double t
     return ok;
 }
 
+// The W8A8 decode GEMV (m<=kGemvMaxM) must be BIT-IDENTICAL to the tiled DP4A kernel, not merely within
+// tolerance: a single cuda_linear_w8a8 call quantizes x to one int8 xq/a_scale, and both kernels sum
+// the same int8×int8 products into an int32 (EXACT, associative — order-independent, no overflow) then
+// do the identical float dequant, so only the reduction ORDER differs and the result cannot. A/B the
+// two kernels on the same inputs via force_tiled_w8a8 and assert max|diff|==0 (the strong claim the
+// weight-only q8 GEMV can't make — its fp32 accumulate reorders to ~1e-6).
+static bool check_w8a8_gemv_bitident(int64_t m, int64_t n, int64_t k, bool with_bias,
+                                     std::mt19937& rng) {
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    Tensor x({m, k}), w({n, k}), bias({n});
+    for (int64_t i = 0; i < x.numel(); ++i) x[i] = dist(rng);
+    for (int64_t i = 0; i < w.numel(); ++i) w[i] = dist(rng);
+    for (int64_t i = 0; i < bias.numel(); ++i) bias[i] = dist(rng);
+    QTensor qw = quantize_q8(w);
+    Tensor ws({n});
+    for (int64_t o = 0; o < n; ++o) ws[o] = qw.scale[static_cast<size_t>(o)];
+    Tensor xd = to_device(x), wqd = to_device_i8(qw.q.data(), {n, k}), wsd = to_device(ws);
+    Tensor bd = to_device(bias);
+    const Tensor* bp = with_bias ? &bd : nullptr;
+
+    cuda_policy().force_tiled_w8a8 = false;
+    Tensor y_gemv = to_host(cuda_linear_w8a8(xd, wqd, wsd, bp));
+    cuda_policy().force_tiled_w8a8 = true;
+    Tensor y_tiled = to_host(cuda_linear_w8a8(xd, wqd, wsd, bp));
+    cuda_policy().force_tiled_w8a8 = false;
+
+    double d = 0.0;
+    for (int64_t i = 0; i < y_gemv.numel(); ++i)
+        d = std::max(d, std::fabs(static_cast<double>(y_gemv[i]) - y_tiled[i]));
+    const bool ok = (d == 0.0);
+    std::printf("test_cuda: w8a8 gemv==tiled [%4lld x %4lld] @ [%5lld x %4lld]^T %-7s max|diff|=%.3e %s\n",
+                (long long)m, (long long)k, (long long)n, (long long)k, with_bias ? "+bias" : "no-bias",
+                d, ok ? "ok (bit-identical)" : "FAIL");
+    return ok;
+}
+
 // Weight-only int8 embedding gather (G5d) vs the CPU embedding_q8 oracle. quantize_q8(table) gives
 // int8 codes + per-row scales (uploaded); the gather is one multiply per element (no reduction), so
 // GPU and CPU compute the identical float — exact up to the single float multiply.
@@ -288,12 +324,20 @@ int main() {
     ok &= check_attention(2, 40, 40, 64, true, 0, 1e-3, rng);       // prefill: num_splits=1 fallback (no-op)
     cuda_policy().use_split_attn = false;
 
-    // W8A8 DP4A int8 GEMM (G5d): the projection shapes, prefill + small m, with and without bias.
+    // W8A8 DP4A int8 GEMM (G5d): the projection shapes, prefill + decode, with and without bias.
     // The integer core is identical to the CPU oracle, so the tolerance is just the float dequant.
-    ok &= check_w8a8(128, 896, 896, true, 2e-3, rng);    // q/o prefill, +bias
-    ok &= check_w8a8(128, 4864, 896, false, 2e-3, rng);  // gate/up prefill, no bias
-    ok &= check_w8a8(100, 896, 4864, false, 2e-3, rng);  // down: ragged m + wide k
-    ok &= check_w8a8(4, 896, 896, true, 2e-3, rng);      // small m (decode-ish), +bias
+    // m<=kGemvMaxM(16) routes to the decode GEMV (one warp per output, ¼ the fp32 weight bytes — the
+    // P1 decode cap), m>16 to the tiled GEMM; cover both, incl. m=1 (true decode) + wide k.
+    ok &= check_w8a8(128, 896, 896, true, 2e-3, rng);    // q/o prefill, +bias (tiled)
+    ok &= check_w8a8(128, 4864, 896, false, 2e-3, rng);  // gate/up prefill, no bias (tiled)
+    ok &= check_w8a8(100, 896, 4864, false, 2e-3, rng);  // down: ragged m + wide k (tiled)
+    ok &= check_w8a8(1, 896, 896, true, 2e-3, rng);      // q/o decode, m=1 (GEMV), +bias
+    ok &= check_w8a8(1, 4864, 896, false, 2e-3, rng);    // gate/up decode, m=1 (GEMV)
+    ok &= check_w8a8(16, 896, 4864, false, 2e-3, rng);   // batched decode, m=16 wide k (GEMV boundary)
+    // The GEMV must be BIT-IDENTICAL to the tiled kernel (int32 exact) — the strong parity claim.
+    ok &= check_w8a8_gemv_bitident(1, 896, 896, true, rng);     // decode projection, +bias
+    ok &= check_w8a8_gemv_bitident(8, 4864, 896, false, rng);   // batched decode, wide n
+    ok &= check_w8a8_gemv_bitident(16, 896, 4864, false, rng);  // m=16 boundary, wide k
 
     // Weight-only int8 embed/lm_head (G5d): the gather is exact (one multiply); the linear matches the
     // CPU linear_q8 oracle within the fp32-reduction tolerance. m<=16 routes to the decode GEMV (one
