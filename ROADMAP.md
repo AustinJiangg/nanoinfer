@@ -844,9 +844,9 @@ the right moment:
   greedy stream (tokens slow==fast MATCH — the bit-identity holds end-to-end). This closes P1's cap:
   W8A8 decode goes from **0.60× fp32 → 1.33× fp32**, now MATCHING the fp16 default (52.2 tok/s) — so
   W8A8 wins on both phases vs fp32 (prefill 1.10× compute, decode 1.33× bytes) while keeping ¼-the-weight
-  memory. golden tokens unchanged (run_cuda_parity: fp32 0/12, W8A8 next-token preserved). Remaining
-  W8A8 follow-up: a W8A8 lm_head (see the int8-embed bullet — the int8 COMPUTE win at prefill, needs a
-  token guard since it feeds argmax).
+  memory. golden tokens unchanged (run_cuda_parity: fp32 0/12, W8A8 next-token preserved). The named
+  W8A8 follow-up — a W8A8 lm_head PREFILL (the int8 COMPUTE win) — is also DONE (see the int8-embed
+  bullet: opt-in use_w8a8_lmhead, isolated 4.59× / e2e prefill 1.15×, token-guarded 0/12).
 - int8-quantize embedding / lm_head — **DONE** (CPU + GPU; weight-only int8, the biggest single
   weight). A per-vocab-row Q8 of the tied embed_tokens, shared by the gather (embedding_q8 /
   cuda_embedding_q8: dequant the looked-up row) and the lm_head (linear_q8 / cuda_linear_q8) — fp32
@@ -869,9 +869,23 @@ the right moment:
   the lm_head decode op **6% → 82% of bandwidth, 13.5× @m=1** (2.0× @m=16 batched decode); end-to-end
   (run_cuda_decode_bench NI_QEMBED=1, lm_head kernel toggled, layers held on the GEMV) **decode 1.40× @ctx
   32/64, 1.45× @ctx 128**, prefill control flat — Amdahl-diluted (the lm_head is one op of ~360/step, but
-  the biggest single weight, ~27% of decode traffic). Remaining follow-up: a W8A8 lm_head (the int8 COMPUTE
-  win at prefill, where lm_head is compute- not memory-bound) once that prefill matmul matters — it feeds
-  argmax, so it needs a token guard.
+  the biggest single weight, ~27% of decode traffic). **W8A8 lm_head prefill — DONE** (the int8 COMPUTE
+  win on the lm_head, the mirror of the W8A8 layer path): the quantize_embed lm_head ran weight-only int8
+  (int8 STORAGE, fp32 FMA — no compute win), but at PREFILL the lm_head is the single biggest, compute-bound
+  matmul (`forward` computes logits for ALL seq rows), so `CudaEmbedQ8Weight::linear()` now routes m>kGemvMaxM
+  to int8×int8 DP4A (`cuda_linear_w8a8` reuses its very codes_/scale_ as the int8 weight, quantizes the
+  activation on device) — the 4:1-MAC lever. Opt-in (`cuda_policy().use_w8a8_lmhead`, default OFF) + token-
+  guarded because it feeds argmax; DECODE stays the weight-only q8 GEMV (memory-bound → int8 activations buy
+  no speed, only argmax risk). **Token guard passes cleanly**: run_cuda_parity's uncached greedy (every step
+  is m>16 → W8A8 lm_head fires every token) is 0/12 vs fp32, next-token preserved, byte-for-byte the same
+  token stream as the weight-only lm_head — the final-hidden activation quant flips no argmax. Isolated
+  (run_cuda_bench 1.5b) lm_head prefill **4.59× vs weight-only q8** (17.7 vs 3.9 TFLOP/s — the weight-only
+  q8 prefill kernel was an unoptimized correctness fallback, so this is int8-compute + a slow baseline both;
+  act-quant err 0.28). End-to-end (run_cuda_decode_bench NI_QEMBED ± NI_W8A8_LMHEAD, 1.5B prefill=512)
+  **prefill ~1650 → ~1890 tok/s (1.15×)** — a REAL e2e win, not the usual Amdahl tie, because vocab=151936
+  makes the lm_head a genuine chunk of prefill (unlike a single layer projection). No decode change. So a
+  quantize_embed model should flip use_w8a8_lmhead on for prefill-heavy work; kept opt-in as the argmax-
+  adjacent conservative default.
 - batched sampling — **DONE**. forward_batch already returned [N, vocab] in one pass, but the token
   draw was a Python loop calling sample_token per row — each copying the whole vocab row even for greedy.
   `sample_batch` (scheduler.py) selects the running set's tokens together: rows that are plain greedy

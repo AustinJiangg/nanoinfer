@@ -360,6 +360,14 @@ class CudaEmbedQ8Weight : public Weight {
 public:
     CudaEmbedQ8Weight(Tensor codes, Tensor scale) : codes_(std::move(codes)), scale_(std::move(scale)) {}
     Tensor linear(const Tensor& x, const Tensor* bias) const override {
+        // Backlog follow-up — the int8 COMPUTE win on the lm_head, mirroring the W8A8 layer path.
+        // At PREFILL (m>kGemvMaxM) the lm_head is the single biggest, compute-bound matmul; run it as
+        // int8×int8 DP4A (cuda_linear_w8a8 reuses these very codes_/scale_ as the int8 weight, quantizes
+        // the activation on device) instead of the weight-only int8-storage fp32 GEMM. Opt-in + token-
+        // guarded (feeds argmax). At DECODE it stays the weight-only q8 GEMV: memory-bound, so int8
+        // activations buy no speed and only add argmax risk (cuda_linear_q8 routes m<=kGemvMaxM to GEMV).
+        if (cuda_policy().use_w8a8_lmhead && x.size(0) > kGemvMaxM)
+            return cuda_linear_w8a8(x, codes_, scale_, bias);
         return cuda_linear_q8(x, codes_, scale_, bias);
     }
     Tensor gather(const std::vector<int64_t>& ids) const override {

@@ -370,6 +370,39 @@ int main(int argc, char** argv) {
         }
     }
 
+    // --- W8A8 lm_head PREFILL: int8×int8 compute vs the weight-only q8 GEMM (backlog follow-up). The
+    // quantize_embed lm_head runs weight-only int8 (int8 STORAGE, fp32 FMA — no compute win); at prefill
+    // the lm_head is the single biggest, compute-bound matmul, so int8×int8 DP4A (4:1 MACs) should win
+    // like it does on the wide layer GEMMs. Both read the SAME int8 codes; the diff column is the ADDED
+    // activation-quant error (W8A8 vs weight-only q8), the accuracy cost the argmax must tolerate. ---
+    std::printf("\nint8 W8A8 lm_head prefill: DP4A compute vs weight-only q8 (m=128, GFLOP/s):\n");
+    std::printf("%-9s %10s %10s %8s | %10s\n", "shape", "W8A8 GF/s", "q8 GF/s", "speedup", "act-quant err");
+    {
+        const Shape lm = shapes.back();  // lm_head (151936 × hidden)
+        const int64_t m = 128, n = lm.n, k = lm.k;
+        Tensor x({m, k}), w({n, k});
+        for (int64_t i = 0; i < x.numel(); ++i) x[i] = dist(rng);
+        for (int64_t i = 0; i < w.numel(); ++i) w[i] = dist(rng);
+        QTensor qw = quantize_q8(w);
+        Tensor ws({n});
+        for (int64_t o = 0; o < n; ++o) ws[o] = qw.scale[static_cast<size_t>(o)];
+        Tensor xd = to_device(x);
+        Tensor codesd = to_device_i8(qw.q.data(), {n, k}), wsd = to_device(ws);
+        cuda_policy().force_tiled_q8 = true;  // m=128>16 already tiled; explicit for clarity
+        auto run_q8 = [&] { Tensor y = cuda_linear_q8(xd, codesd, wsd, nullptr); };
+        auto run_w8 = [&] { Tensor y = cuda_linear_w8a8(xd, codesd, wsd, nullptr); };
+        Tensor y_q8 = to_host(cuda_linear_q8(xd, codesd, wsd, nullptr));
+        Tensor y_w8 = to_host(cuda_linear_w8a8(xd, codesd, wsd, nullptr));
+        cuda_policy().force_tiled_q8 = false;
+        double aerr = 0.0;
+        for (int64_t i = 0; i < y_q8.numel(); ++i)
+            aerr = std::max(aerr, std::fabs((double)y_q8[i] - y_w8[i]));
+        const double q8_ms = time_ms(run_q8, 30, 5), w8_ms = time_ms(run_w8, 30, 5);
+        const double flop = 2.0 * m * n * k;
+        std::printf("%-9s %10.0f %10.0f %7.2fx | %13.1e\n", lm.label, flop / (w8_ms * 1e-3) / 1e9,
+                    flop / (q8_ms * 1e-3) / 1e9, q8_ms / w8_ms, aerr);
+    }
+
     cublasDestroy(handle);
     std::printf("run_cuda_bench: ok\n");
     return 0;

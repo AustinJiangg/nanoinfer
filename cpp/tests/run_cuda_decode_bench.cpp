@@ -136,6 +136,10 @@ int main(int argc, char** argv) {
             g_ab_int8_lmhead = (e[0] == '1');
             cfg.quantize_embed = g_ab_int8_lmhead;
         }
+        // NI_W8A8_LMHEAD=1 (backlog follow-up, pairs with NI_QEMBED): route the int8 lm_head's PREFILL
+        // through int8×int8 DP4A (the compute win) instead of weight-only int8. Reflected in the prefill
+        // tok/s (run with/without to A/B the e2e prefill delta); decode is unaffected (stays weight-only).
+        if (const char* e = std::getenv("NI_W8A8_LMHEAD")) cuda_policy().use_w8a8_lmhead = (e[0] == '1');
         // NI_W8A8=1 runs the layer projections as int8×int8 DP4A (P1, the COMPUTE lever, 4:1 MACs):
         // it won isolated on 1.5B's wide GEMMs (gate/up 1.94×, lm_head 2.16× — run_cuda_bench 1.5b),
         // and unlike fp16/wmma (byte levers) it also cuts the projection FLOPs — does it translate

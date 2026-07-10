@@ -55,6 +55,12 @@ struct CudaPolicy {
     // (the P1-named decode cap). GEMV is bit-identical to the tiled kernel (int32 exact), so this only
     // trades speed, not the result. Left false in normal use.
     bool force_tiled_w8a8 = false;
+    // W8A8 lm_head (backlog follow-up): route the int8 embed/lm_head's PREFILL linear (m>kGemvMaxM,
+    // the biggest compute-bound matmul) through int8×int8 DP4A (the 4:1-MAC compute win) instead of the
+    // weight-only-int8-storage fp32 GEMM. Opt-in and token-guarded — the lm_head feeds argmax, so the
+    // activation quant can flip a close token. Decode stays the weight-only q8 GEMV (memory-bound → no
+    // compute win, less argmax risk). Left false in normal use; pairs with BackendConfig.quantize_embed.
+    bool use_w8a8_lmhead = false;
     // Attention (CudaBackend::attention + CudaPagedKVCache::attend). force_naive_attn: the naive
     // one-thread-per-query kernel, the A/B baseline (G5e). Shared-mem K/V tiling (G5f) at prefill
     // (sq>1) is bit-identical to the non-tiled kernel; it TIES on 0.5B (KV fits L2) but WINS at

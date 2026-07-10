@@ -208,6 +208,22 @@ int main(int argc, char** argv) {
                             "logits max|diff|=%g; weights %.0f MB\n",
                             gene, ref_gen.size(), nexte ? "preserved" : "CHANGED", maxde,
                             double(modele.weight_bytes().first) / 1e6);
+
+                // W8A8 lm_head (backlog follow-up): the same int8 embed/lm_head, but its PREFILL linear
+                // runs int8×int8 DP4A (the compute win) instead of weight-only int8. The lm_head feeds
+                // argmax and the activation quant is lossy, so this is the TOKEN GUARD — informational,
+                // not gated (like the W8A8 layers). Decode stays the weight-only q8 GEMV (unchanged).
+                cuda_policy().use_w8a8_lmhead = true;
+                std::vector<int64_t> gotw = greedy(modele);
+                cuda_policy().use_w8a8_lmhead = false;
+                int genw = 0;
+                for (size_t i = 0; i < ref_gen.size() && i < gotw.size(); ++i)
+                    if (ref_gen[i] != gotw[i]) ++genw;
+                const bool nextw = !ref_gen.empty() && !gotw.empty() && ref_gen[0] == gotw[0];
+                print_ids("w8lm  :", gotw);
+                std::printf("W8A8 lm_head (int8 prefill compute): greedy vs fp32 %d/%zu differ, "
+                            "next-token %s\n",
+                            genw, ref_gen.size(), nextw ? "preserved" : "CHANGED");
             }
             device_pool_trim();
             {  // full int8 GPU model (W8A8 layers + int8 embed) — the memory headline
