@@ -19,7 +19,7 @@ TOKEN-IDENTICAL to plain target greedy (the S0 invariant), or its speedup is voi
 includes prefill (one target + one draft forward for spec, one target for plain — fair, and
 <1% of a long run), so it's the honest end-to-end generate rate.
 
-    python tests/bench_spec.py weights/qwen2.5-0.5b weights/qwen2.5-1.5b --device cuda
+    python bench/bench_spec.py weights/qwen2.5-0.5b weights/qwen2.5-1.5b --device cuda
 """
 
 from __future__ import annotations

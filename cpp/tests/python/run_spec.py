@@ -11,7 +11,7 @@ Two checks:
      with a genuine (< 100%) accept rate — the actual speculative-decoding win to come.
 
     cmake --build build -j
-    python tests/run_spec.py weights/qwen2.5-0.5b weights/qwen2.5-1.5b
+    python tests/python/run_spec.py weights/qwen2.5-0.5b weights/qwen2.5-1.5b
 """
 
 from __future__ import annotations
@@ -21,11 +21,13 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
 from ni.engine import default_weights_dir, nicpp  # noqa: E402
 from ni.nit0 import read_ids  # noqa: E402
 from ni.speculative import greedy_speculative, greedy_prompt_lookup, prompt_lookup  # noqa: E402
+
+from gateutil import plain_greedy  # noqa: E402  (sibling: the shared reference path)
 
 
 def check_lookup_matcher() -> bool:
@@ -76,12 +78,6 @@ def check_primitive(model, prompt: list[int]) -> bool:
     print(f"  primitive: multi==sequential |diff|={d_prim:.1e}  "
           f"truncate+replay |diff|={d_roll:.1e}  -> {'OK' if ok else 'FAIL'}")
     return ok
-
-
-def plain_greedy(model, prompt: list[int], max_tokens: int, eos_id: int = -1) -> list[int]:
-    """Reference: the F6 single-sequence greedy generate (k-independent)."""
-    return model.generate(prompt, max_tokens=max_tokens, params=nicpp.SamplingParams(),
-                          seed=0, eos_id=eos_id)
 
 
 def run_case(name, target, draft, prompt, max_tokens, ks, *, expect_full_accept=False,

@@ -18,7 +18,7 @@ to cheapest:
       token matches p (D3) — the algorithm and the C++ sampler agree end to end.
 
     cmake --build build -j
-    python tests/run_spec_sample.py weights/qwen2.5-0.5b weights/qwen2.5-1.5b
+    python tests/python/run_spec_sample.py weights/qwen2.5-0.5b weights/qwen2.5-1.5b
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
 from ni.engine import default_weights_dir, nicpp  # noqa: E402
 from ni.nit0 import read_ids  # noqa: E402

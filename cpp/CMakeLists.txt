@@ -138,7 +138,9 @@ target_link_libraries(run_quant PRIVATE nicore)
 target_include_directories(run_quant PRIVATE tests)
 
 # C5: time prefill + decode (tokens/sec) and report the SIMD target + thread count.
-add_executable(run_bench tests/run_bench.cpp)
+# Benches live in bench/ (they measure, they don't gate); they share tests/'
+# weight-loading helpers (parity_util.hpp), hence the tests include dir.
+add_executable(run_bench bench/run_bench.cpp)
 target_link_libraries(run_bench PRIVATE nicore)
 target_include_directories(run_bench PRIVATE tests)
 
@@ -185,24 +187,24 @@ if(NI_CUDA)
   # G5a: micro-benchmark the naive linear() kernel vs cuBLAS sgemm (the yardstick) on
   # the real projection shapes. cuBLAS is only linked here, never in nicore — the engine
   # runs our own kernels (the golden rule); this tool just measures the gap to close.
-  add_executable(run_cuda_bench tests/run_cuda_bench.cpp)
+  add_executable(run_cuda_bench bench/run_cuda_bench.cpp)
   target_link_libraries(run_cuda_bench PRIVATE nicore CUDA::cublas)
   target_include_directories(run_cuda_bench PRIVATE tests)
 
   # G5b: end-to-end decode tok/s, A/B'ing the GEMV vs the forced-naive GEMM in one process.
-  add_executable(run_cuda_decode_bench tests/run_cuda_decode_bench.cpp)
+  add_executable(run_cuda_decode_bench bench/run_cuda_decode_bench.cpp)
   target_link_libraries(run_cuda_decode_bench PRIVATE nicore)
   target_include_directories(run_cuda_decode_bench PRIVATE tests)
 
   # G5f: isolated attention() micro-bench — naive vs non-tiled online vs shared-mem tiled, on
   # synthetic data (no weights), so the kernel change isn't diluted by the full step.
-  add_executable(run_cuda_attn_bench tests/run_cuda_attn_bench.cpp)
+  add_executable(run_cuda_attn_bench bench/run_cuda_attn_bench.cpp)
   target_link_libraries(run_cuda_attn_bench PRIVATE nicore)
   target_include_directories(run_cuda_attn_bench PRIVATE tests)
 
   # P2: long-context decode sweep — end-to-end decode tok/s over context x {contiguous, paged} x
   # {split off, on} in one process, to find where Flash-Decoding (G5g) + paging dominate on 1.5B.
-  add_executable(run_cuda_ctx_sweep tests/run_cuda_ctx_sweep.cpp)
+  add_executable(run_cuda_ctx_sweep bench/run_cuda_ctx_sweep.cpp)
   target_link_libraries(run_cuda_ctx_sweep PRIVATE nicore)
   target_include_directories(run_cuda_ctx_sweep PRIVATE tests)
 endif()
@@ -212,7 +214,7 @@ endif()
 # export + reference dump being present — skip-clean when absent, the same graceful degrade as the
 # GPU tests. The parity binaries return nonzero on regression; run_quant is informational (always
 # exits 0), so its baseline match-count is pinned via PASS_REGULAR_EXPRESSION. Numbers in
-# tests/BASELINE.md. Run just this suite with `ctest -L weights` (or exclude it with `ctest -LE weights`).
+# docs/BASELINE.md. Run just this suite with `ctest -L weights` (or exclude it with `ctest -LE weights`).
 set(NI_WEIGHTS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/weights/qwen2.5-0.5b)
 if(EXISTS ${NI_WEIGHTS_DIR}/ref_ids.txt)
   add_test(NAME run_parity   COMMAND run_parity   ${NI_WEIGHTS_DIR})

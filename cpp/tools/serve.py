@@ -9,7 +9,7 @@ sequence, dynamic admit/evict), HF decodes the results.
         --prompt "Water boils at"
 
 Greedy (the default) is deterministic and each completion is identical to running
-that prompt alone (tests/run_serve.py). With --max-batch < #prompts the extra ones
+that prompt alone (tests/python/run_serve.py). With --max-batch < #prompts the extra ones
 queue and are admitted as others finish; raise it to run them all concurrently.
 """
 

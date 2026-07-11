@@ -16,7 +16,7 @@ A MIXED batch (draft + lookup requests interleaved) is the real test of per-sequ
 proposer state — each sequence carries its own draft cache / n-gram context independently.
 
     cmake --build build -j
-    python tests/run_spec_serve.py weights/qwen2.5-0.5b weights/qwen2.5-1.5b
+    python tests/python/run_spec_serve.py weights/qwen2.5-0.5b weights/qwen2.5-1.5b
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
 import numpy as np  # noqa: E402
 
@@ -32,6 +32,8 @@ from ni.engine import default_weights_dir, nicpp  # noqa: E402
 from ni.nit0 import read_ids  # noqa: E402
 from ni.spec_scheduler import SpecRequest, SpecScheduler  # noqa: E402
 from ni.speculative import greedy_prompt_lookup, greedy_speculative  # noqa: E402
+
+from gateutil import plain_greedy  # noqa: E402  (sibling: the shared reference path)
 
 
 def check_spec_batch(model, base: list[int], device: str = "cpu") -> bool:
@@ -81,12 +83,6 @@ def check_spec_batch(model, base: list[int], device: str = "cpu") -> bool:
     print(f"  spec_batch: forward_spec_batch == per-seq forward  |diff|={dmax:.1e} "
           f"(tol={tol:.0e}) tokens={'==' if tok_ok else '!='} -> {'OK' if ok else 'FAIL'}")
     return ok
-
-
-def plain_greedy(model, prompt: list[int], max_tokens: int, eos_id: int = -1) -> list[int]:
-    """The ultimate reference: plain single-sequence greedy (F6, parity-locked vs nanoinfer)."""
-    return model.generate(prompt, max_tokens=max_tokens, params=nicpp.SamplingParams(),
-                          seed=0, eos_id=eos_id)
 
 
 def standalone_spec(target, draft, req: SpecRequest) -> list[int]:

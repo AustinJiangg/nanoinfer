@@ -24,10 +24,10 @@ The scheduler drives the running set in three phases per step:
 
 Correctness (batch-invariant): with GREEDY decoding every emitted token is the target's own
 argmax, so a sequence's output is token-identical to plain target greedy whether it runs
-alone or interleaved (the S0 gate, `tests/run_spec_serve.py`). With SAMPLING (S5) each
+alone or interleaved (the S0 gate, `tests/python/run_spec_serve.py`). With SAMPLING (S5) each
 sequence carries its own seeded RNG, so the draw stream is independent of interleaving: its
 output is distribution-identical to plain sampling and, at a fixed seed, token-identical to
-standalone sample_speculative / sample_prompt_lookup (`tests/run_spec_sample.py`). Either
+standalone sample_speculative / sample_prompt_lookup (`tests/python/run_spec_sample.py`). Either
 way, folding spec into continuous batching changes throughput, never a sequence's output.
 """
 

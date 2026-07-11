@@ -11,8 +11,8 @@ Python orchestration over our own CUDA kernels). Two checks:
 Contiguous + batched path only (block_size=0). The paged scheduler on GPU needs the
 device BlockPool / PagedKVCache bound into nicpp — a separate step.
 
-    cmake --build build -j -DNI_CUDA=ON     # builds nicpp against the CUDA core
-    python tests/run_cuda_serve.py weights/qwen2.5-0.5b
+    cmake -S . -B build-cuda -DNI_CUDA=ON && cmake --build build-cuda -j   # nicpp on the CUDA core
+    python tests/python/run_cuda_serve.py weights/qwen2.5-0.5b
 """
 
 from __future__ import annotations
@@ -21,18 +21,13 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
 from ni.engine import default_weights_dir, nicpp  # noqa: E402
 from ni.nit0 import read_ids  # noqa: E402
 from ni.scheduler import Request, Scheduler  # noqa: E402
 
-
-def standalone(model, r: Request) -> list[int]:
-    params = nicpp.SamplingParams(temperature=r.temperature, top_k=r.top_k, top_p=r.top_p,
-                                  repetition_penalty=r.repetition_penalty)
-    return model.generate(r.prompt_ids, max_tokens=r.max_tokens, params=params, seed=r.seed,
-                          eos_id=r.eos_id)
+from gateutil import build_requests, standalone  # noqa: E402  (sibling: the shared reference path)
 
 
 def main() -> int:
@@ -45,16 +40,7 @@ def main() -> int:
     base = read_ids(wd / "ref_ids.txt")
     print(f"model: {model.config.num_layers} layers, vocab {model.config.vocab_size} (CUDA)")
 
-    # Distinct prompts + lengths so sequences finish at different steps (that staggering
-    # is what exercises continuous batching). r4 carries a repetition penalty.
-    reqs = [
-        Request("r0", base, max_tokens=12),
-        Request("r1", base[:3], max_tokens=6),
-        Request("r2", base + [12095], max_tokens=8),
-        Request("r3", base[:2], max_tokens=4),
-        Request("r4", base, max_tokens=10, repetition_penalty=1.3),
-        Request("r5", base[1:4], max_tokens=7),
-    ]
+    reqs = build_requests(base)
     ref = {r.request_id: standalone(model, r) for r in reqs}
 
     # --- 1. Parity: scheduler interleaving == standalone, across batch sizes ---

@@ -10,7 +10,7 @@ repetition penalty — a processor that shapes greedy too — to check the sched
 tracks each sequence's context independently.
 
     cmake --build build -j                 # build nicpp (F6)
-    python tests/run_serve.py weights/qwen2.5-0.5b
+    python tests/python/run_serve.py weights/qwen2.5-0.5b
 """
 
 from __future__ import annotations
@@ -18,36 +18,13 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
 from ni.engine import default_weights_dir, nicpp  # noqa: E402
 from ni.nit0 import read_ids  # noqa: E402
 from ni.scheduler import Request, Scheduler  # noqa: E402
 
-
-def standalone(model, req: Request) -> list[int]:
-    """The reference: one request via the F6 single-sequence generate()."""
-    params = nicpp.SamplingParams(
-        temperature=req.temperature, top_k=req.top_k, top_p=req.top_p,
-        repetition_penalty=req.repetition_penalty,
-    )
-    return model.generate(req.prompt_ids, max_tokens=req.max_tokens, params=params,
-                          seed=req.seed, eos_id=req.eos_id)
-
-
-def build_requests(base: list[int]) -> list[Request]:
-    # Distinct prompts (varied content + length) and varied max_tokens, so sequences
-    # finish at different steps — that staggering is what exercises continuous
-    # batching (evict a short one, admit a queued one). eos_id=-1 → fixed lengths,
-    # so the comparison is clean. r4 adds a repetition penalty.
-    return [
-        Request("r0", base, max_tokens=12),
-        Request("r1", base[:3], max_tokens=6),
-        Request("r2", base + [12095], max_tokens=8),
-        Request("r3", base[:2], max_tokens=4),
-        Request("r4", base, max_tokens=10, repetition_penalty=1.3),
-        Request("r5", base[1:4], max_tokens=7),
-    ]
+from gateutil import build_requests, standalone  # noqa: E402  (sibling: the shared reference path)
 
 
 def main() -> int:

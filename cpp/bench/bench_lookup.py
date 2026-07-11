@@ -21,7 +21,7 @@ Each config is correctness-gated: its output must be TOKEN-IDENTICAL to plain ta
 (if a k+1-token verify cost the same as a 1-token decode); measured `speedup` falls below it
 by the fatter-verify tax (verifying k+1 tokens is a mini-prefill, > one decode step).
 
-    python tests/bench_lookup.py weights/qwen2.5-1.5b --device cuda
+    python bench/bench_lookup.py weights/qwen2.5-1.5b --device cuda
 """
 
 from __future__ import annotations

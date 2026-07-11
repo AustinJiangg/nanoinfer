@@ -23,7 +23,7 @@ returns — greedy by default, with the same repetition-penalty / temperature / 
 / top-p warpers, in the same order, as nanoinfer/sampling.py. Greedy is deterministic
 and operates on the float32 logits exactly as the C++ sampler does, so a sequence's
 output is identical whether it runs alone or interleaved, batched or paged — the
-parity test (tests/run_serve.py)."""
+parity test (tests/python/run_serve.py)."""
 
 from __future__ import annotations
 

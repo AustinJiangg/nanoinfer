@@ -10,7 +10,7 @@ checks the cached forward path agrees with the uncached one.
 Run after building the module and dumping a reference (weights are already exported):
     cmake --build build -j
     python tools/dump_reference.py weights/qwen2.5-0.5b "The capital of France is"
-    python tests/run_binding.py weights/qwen2.5-0.5b
+    python tests/python/run_binding.py weights/qwen2.5-0.5b
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
 from ni.engine import default_weights_dir, nicpp  # noqa: E402
 from ni.nit0 import load_bin, read_ids  # noqa: E402
