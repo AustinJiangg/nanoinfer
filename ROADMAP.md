@@ -917,9 +917,13 @@ arch churn to settle; G7 is independent filler; A4 is droppable.
       commit: python-oracle 29 passed / 5 deselected, cpp-cpu 9/9 nomodel, neon-qemu
       5/5 under qemu (fresh cross-configure), cuda-build-only `libnicore.a` linked.
       README gains a CI badge.
-- [ ] **E2** — write the tiered gate into CLAUDE.md: CI = unit + fixture parity;
-      local pre-commit = the full golden-token gates. (Already the practice — make it
-      written.)
+- [x] **E2** ✅ landed — the tiered gate written into CLAUDE.md ("The tiered gate"
+      section): CI tier = model-free unit + numpy-fixture parity (a backstop);
+      local pre-commit tier = the full golden-token gates that prove token-for-token
+      identity to the oracle (the correctness floor). The rule stated: run the full
+      local gate before committing anything touching the forward/kernel/cache/scheduler
+      — CI has no weights, so CI-green ≠ safe to ship. Names the `nomodel`/`weights`
+      ctest label split as the mechanism.
 
 ### New architectures (A-track) — generalize the engine beyond Qwen2.5
 

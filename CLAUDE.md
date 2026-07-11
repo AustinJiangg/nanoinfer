@@ -31,6 +31,36 @@ we're skipping the part we're here to learn.
 - **Comment the *why*, not the *what*.** Especially the fiddly bits: RoPE
   half-split, GQA head repetition, attention masking, KV-cache indexing.
 
+## The tiered gate (what runs where)
+
+Two tiers, split by what they need. The **golden-token** gates need the ~1 GB weight
+export + a reference dump (`cpp/tools/export_weights.py` + `cpp/tools/dump_reference.py`),
+and the CUDA ones a GPU — none of which the free CI runners have. So the gate is split,
+not weakened:
+
+- **CI tier** (`.github/workflows/ci.yml`, model-free + GPU-free) — unit tests and
+  numpy-fixture parity, the seams that don't need a checkpoint. Four jobs:
+  `pytest -m "not slow"` (the Python oracle's fast layer tests, no download);
+  `ctest -L nomodel` (the C++ core's self-contained unit tests + the numpy-parity
+  `ops_parity`); the aarch64/qemu **NEON** parity (the checked-in cross-compile
+  recipe); and a compile-only `nicore` build with `NI_CUDA=ON` in a CUDA container
+  (no GPU → build-breakage detection is the ceiling). Catches build breakage and math
+  regressions in the model-free code — a **backstop, not the floor**.
+- **Local pre-commit tier** (needs the weight export + ref dump; the CUDA gates need
+  the GPU) — the golden-token gates that prove **token-for-token identity to the
+  oracle**, the actual correctness floor: `ctest -L weights` (run_parity / run_generate
+  / run_cache / run_batch / run_paged / run_quant_*), the CUDA gates (run_cuda_parity /
+  cache / paged / batch), the Python serving parity (`cpp/tests/python/run_serve.py`,
+  `run_spec*.py`, `run_http_serve.py`, …), and the full `pytest` (incl. the slow
+  HF-parity tests). `ctest -L nomodel` reproduces the CI C++ subset locally (use
+  `-L nomodel`, not `-LE weights` — the latter also pulls the GPU-only `test_cuda`,
+  which is unlabelled, in a `NI_CUDA=ON` build).
+
+**The rule:** run the full local gate before committing anything that touches the
+forward pass, a kernel, a cache, or the scheduler — CI cannot see those regress (it has
+no weights). CI green ≠ safe to ship; it means "didn't break the build or the model-free
+math." The `nomodel` / `weights` ctest labels are exactly this split.
+
 ## Known sharp edges (read before debugging)
 
 - **RoPE rotation**: Qwen2/Llama use the "neox / half-split" rotation (split the
