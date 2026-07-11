@@ -1,5 +1,7 @@
 # nanoinfer
 
+[![CI](https://github.com/AustinJiangg/nanoinfer/actions/workflows/ci.yml/badge.svg)](https://github.com/AustinJiangg/nanoinfer/actions/workflows/ci.yml)
+
 A from-scratch LLM inference engine, built for learning. The forward pass and the
 generation loop are written by hand; only weight loading and tokenization lean on
 Hugging Face. The goal is to understand inference first, then progressively add the

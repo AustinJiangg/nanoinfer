@@ -1,0 +1,106 @@
+name: CI
+
+# The tiered gate, CI half: unit + fixture parity only. Everything here runs
+# WITHOUT model weights or a GPU — the full golden-token gates (run_parity,
+# run_cuda_*, the Python serving parity) need the ~1 GB weight export + a
+# reference dump and stay a local pre-commit step (see CLAUDE.md). CI's job is
+# to catch build breakage and math regressions in the model-free seams.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # 1. The Python oracle's fast layer tests (shape + synthetic parity). `not slow`
+  #    excludes the HF-download parity tests, so no network / no model here.
+  python-oracle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the package (CPU torch)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: pytest (not slow — no weight download)
+        run: pytest -m "not slow" -q
+
+  # 2. The C++ CPU core: build everything, run the `nomodel` ctest suite (the
+  #    self-contained unit tests + the numpy-fixture parity). The weight-dependent
+  #    `weights` suite isn't even registered without the export, so `-L nomodel`
+  #    is the explicit allowlist. gen_fixtures only needs numpy (+ the in-tree ni).
+  cpp-cpu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Host deps (gen_fixtures numpy + optional pybind11 module)
+        run: pip install numpy pybind11
+      - name: Configure
+        run: cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
+      - name: Build (all CPU targets — compile-breakage detection)
+        run: cmake --build cpp/build -j
+      - name: ctest (nomodel)
+        run: ctest --test-dir cpp/build -L nomodel --output-on-failure
+
+  # 3. The NEON inner products, cross-compiled to aarch64 and run under qemu-user
+  #    — the checked-in recipe (cpp/cmake/aarch64-linux-gnu.cmake), moved into CI.
+  #    Proves the NEON dots reproduce the scalar oracle; it's a correctness gate,
+  #    not a benchmark (qemu emulates the ISA, not the M4's timing).
+  neon-qemu:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cpp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Cross toolchain + qemu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-aarch64-linux-gnu qemu-user-static
+      - name: Host deps for gen_fixtures
+        run: pip install numpy
+      - name: Configure (aarch64 cross, NEON, no OpenMP/pybind11)
+        run: >
+          cmake -S . -B build-aarch64
+          -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64-linux-gnu.cmake
+          -DNI_NATIVE=OFF
+          -DCMAKE_DISABLE_FIND_PACKAGE_OpenMP=ON
+          -DCMAKE_DISABLE_FIND_PACKAGE_pybind11=ON
+      - name: Build NEON tests
+        run: cmake --build build-aarch64 -j --target test_simd test_ops test_quant ops_parity
+      - name: ctest under qemu
+        run: ctest --test-dir build-aarch64 -R 'test_simd|test_ops|test_quant|ops_parity' --output-on-failure
+
+  # 4. CUDA: compile-only. The free runners have no GPU, so the golden-token CUDA
+  #    gates can't run here — building `nicore` with NI_CUDA=ON in a CUDA devel
+  #    container is the maximum available protection (catches kernel-source breakage).
+  cuda-build-only:
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.4.1-devel-ubuntu22.04
+    steps:
+      # git first, so actions/checkout uses a real clone inside the bare CUDA image.
+      - name: Build deps (git for checkout, cmake, g++, python3)
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git cmake g++ python3
+      - uses: actions/checkout@v4
+      - name: Configure (NI_CUDA=ON, sm_89)
+        run: cmake -S cpp -B cpp/build-cuda -DNI_CUDA=ON
+      - name: Compile nicore (build-only — no GPU on the runner)
+        run: cmake --build cpp/build-cuda -j --target nicore

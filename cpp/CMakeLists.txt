@@ -119,6 +119,18 @@ set_tests_properties(gen_fixtures PROPERTIES FIXTURES_SETUP fixtures)
 add_test(NAME ops_parity COMMAND ops_parity ${CMAKE_CURRENT_BINARY_DIR}/fixtures)
 set_tests_properties(ops_parity PROPERTIES FIXTURES_REQUIRED fixtures)
 
+# E1 (CI): label the model-free tests `nomodel` so CI runs exactly them
+# (`ctest -L nomodel`) — a positive allowlist, the complement of the weight-dependent
+# `weights` suite below. gen_fixtures/ops_parity are the numpy-parity pair (the setup
+# fixture is auto-pulled when ops_parity is selected); the rest are self-contained unit
+# tests. The `weights` suite is registered only when the exported weights + reference
+# dump are present, so a weightless CI checkout runs nomodel alone regardless — the
+# explicit label makes that CI contract intentional, not incidental to a missing file.
+set_tests_properties(
+  test_tensor test_ops test_io test_sampling test_cache test_quant test_simd
+  gen_fixtures ops_parity
+  PROPERTIES LABELS nomodel)
+
 # End-to-end vs nanoinfer. Not wired into ctest: they need the ~2 GB weight
 # export + a reference dump first (see the file headers).
 add_executable(run_parity tests/run_parity.cpp)

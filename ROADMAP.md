@@ -897,15 +897,26 @@ arch churn to settle; G7 is independent filler; A4 is droppable.
       build requirement bumped to `setuptools>=77`), and a README License section
       noting the engine code is MIT while HF-downloaded weights/tokenizer configs keep
       their own licenses and aren't redistributed here.
-- [ ] **E1** — GitHub Actions CI, four jobs, none needing model weights or a GPU
-      runtime: (1) *python-oracle* — `pytest -m "not slow"` (the fixture layer tests,
-      no download); (2) *cpp-cpu* — CMake + ctest with a new `nomodel` label
-      (test_tensor/ops/quant/simd/cache/io run on gen_fixtures output; the
-      NIT0-needing gates get a `model` label, excluded in CI); (3) *neon-qemu* — the
-      aarch64 cross-compile + qemu run of test_simd/test_ops/test_quant (the NEON
-      recipe, moved into CI); (4) *cuda-build-only* — compile `nicore` in an
-      nvidia/cuda devel container (free runners have no GPU; build-breakage detection
-      is the maximum available protection).
+- [x] **E1** ✅ landed — GitHub Actions CI (`.github/workflows/ci.yml`), four jobs,
+      none needing model weights or a GPU runtime: (1) *python-oracle* —
+      `pytest -m "not slow"` (the fixture layer tests, no download); (2) *cpp-cpu* —
+      CMake + `ctest -L nomodel`, a NEW `nomodel` label on the model-free suite
+      (test_tensor/ops/io/sampling/cache/quant/simd + gen_fixtures/ops_parity). Design
+      note: the weight-dependent gates already carry a `weights` label AND are only
+      registered when the export is present, so a weightless CI checkout runs nomodel
+      alone regardless — `nomodel` makes it a positive allowlist (safer than `-LE
+      weights`, which would sweep in any future unlabelled test). The job builds ALL
+      CPU targets (compile-breakage detection, incl. the pybind11 `nicpp` module) then
+      runs only nomodel. (3) *neon-qemu* — the checked-in aarch64 cross-compile +
+      qemu-user recipe (`cmake/aarch64-linux-gnu.cmake`), moved verbatim into CI
+      (`working-directory: cpp`); gen_fixtures runs on host python (numpy only) and is
+      auto-pulled as ops_parity's setup fixture. (4) *cuda-build-only* — configure
+      `-DNI_CUDA=ON` and compile `nicore` in an `nvidia/cuda:12.4.1-devel` container
+      (free runners have no GPU; git apt-installed before checkout so the bare image
+      clones). **All four validated locally** against the real toolchains before
+      commit: python-oracle 29 passed / 5 deselected, cpp-cpu 9/9 nomodel, neon-qemu
+      5/5 under qemu (fresh cross-configure), cuda-build-only `libnicore.a` linked.
+      README gains a CI badge.
 - [ ] **E2** — write the tiered gate into CLAUDE.md: CI = unit + fixture parity;
       local pre-commit = the full golden-token gates. (Already the practice — make it
       written.)
