@@ -29,13 +29,11 @@ import sys
 import time
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-CPP = HERE.parent
-sys.path.insert(0, str(CPP / "build"))    # nicpp.*.so
-sys.path.insert(0, str(CPP / "python"))   # speculative
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
 
-import nicpp  # noqa: E402
-from speculative import greedy_speculative  # noqa: E402
+from ni.engine import nicpp  # noqa: E402
+from ni.nit0 import read_ids  # noqa: E402
+from ni.speculative import greedy_speculative  # noqa: E402
 
 # Diverse prompts (Qwen2.5 tokenizer ids, both 0.5B/1.5B share vocab 151936). Embedded so the
 # honest multi-prompt result is the DEFAULT and reproducible without HF at bench time — accept
@@ -53,10 +51,6 @@ DIVERSE_PROMPTS = {
     "list":   [8420, 525, 4236, 10414, 369, 19429, 9314, 510,     # "Here are five tips for
                16, 13],                                           #   staying healthy:\n1."
 }
-
-
-def read_ids(path: Path) -> list[int]:
-    return [int(x) for x in path.read_text().split()]
 
 
 def best_time(fn, runs: int):

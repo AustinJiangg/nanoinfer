@@ -20,10 +20,9 @@ import argparse
 import sys
 from pathlib import Path
 
-CPP = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(CPP / "build"))  # nicpp.*.so
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
 
-import nicpp  # noqa: E402
+from ni.engine import default_weights_dir, nicpp  # noqa: E402
 
 DEFAULT_MODEL = "Qwen/Qwen2.5-0.5B"
 
@@ -31,7 +30,7 @@ DEFAULT_MODEL = "Qwen/Qwen2.5-0.5B"
 def main() -> None:
     p = argparse.ArgumentParser(description="nanoinfer-cpp text generation (F6 binding)")
     p.add_argument("--prompt", required=True)
-    p.add_argument("--weights-dir", default=str(CPP / "weights/qwen2.5-0.5b"),
+    p.add_argument("--weights-dir", default=str(default_weights_dir()),
                    help="exported NIT0 weights dir (tools/export_weights.py)")
     p.add_argument("--model", default=DEFAULT_MODEL, help="HF id for the tokenizer only")
     p.add_argument("--max-tokens", type=int, default=32)

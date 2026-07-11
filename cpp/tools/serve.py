@@ -20,12 +20,10 @@ import sys
 import time
 from pathlib import Path
 
-CPP = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(CPP / "build"))   # nicpp.*.so
-sys.path.insert(0, str(CPP / "python"))  # scheduler
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
 
-import nicpp  # noqa: E402
-from scheduler import Request, Scheduler  # noqa: E402
+from ni.engine import default_weights_dir, nicpp  # noqa: E402
+from ni.scheduler import Request, Scheduler  # noqa: E402
 
 DEFAULT_MODEL = "Qwen/Qwen2.5-0.5B"
 
@@ -34,7 +32,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description="nanoinfer-cpp multi-prompt serving (F7)")
     p.add_argument("--prompt", action="append", required=True, dest="prompts",
                    help="repeat to enqueue multiple prompts")
-    p.add_argument("--weights-dir", default=str(CPP / "weights/qwen2.5-0.5b"))
+    p.add_argument("--weights-dir", default=str(default_weights_dir()))
     p.add_argument("--model", default=DEFAULT_MODEL, help="HF id for the tokenizer only")
     p.add_argument("--max-tokens", type=int, default=32)
     p.add_argument("--max-batch", type=int, default=4, help="concurrent sequences")

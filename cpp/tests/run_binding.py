@@ -20,21 +20,14 @@ from pathlib import Path
 
 import numpy as np
 
-HERE = Path(__file__).resolve().parent
-CPP = HERE.parent
-sys.path.insert(0, str(CPP / "build"))  # nicpp.*.so
-sys.path.insert(0, str(CPP / "tools"))  # nit0
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
 
-import nicpp  # noqa: E402
-from nit0 import load_bin  # noqa: E402
-
-
-def read_ids(path: Path) -> list[int]:
-    return [int(x) for x in path.read_text().split()]
+from ni.engine import default_weights_dir, nicpp  # noqa: E402
+from ni.nit0 import load_bin, read_ids  # noqa: E402
 
 
 def main() -> int:
-    wd = Path(sys.argv[1] if len(sys.argv) > 1 else "weights/qwen2.5-0.5b")
+    wd = Path(sys.argv[1]) if len(sys.argv) > 1 else default_weights_dir()
 
     model = nicpp.Model(str(wd))
     cfg = model.config

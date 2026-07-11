@@ -24,19 +24,14 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-CPP = HERE.parent
-sys.path.insert(0, str(CPP / "build"))   # nicpp.*.so
-sys.path.insert(0, str(CPP / "python"))  # spec_scheduler, speculative
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
 
 import numpy as np  # noqa: E402
-import nicpp  # noqa: E402
-from spec_scheduler import SpecRequest, SpecScheduler  # noqa: E402
-from speculative import greedy_prompt_lookup, greedy_speculative  # noqa: E402
 
-
-def read_ids(path: Path) -> list[int]:
-    return [int(x) for x in path.read_text().split()]
+from ni.engine import default_weights_dir, nicpp  # noqa: E402
+from ni.nit0 import read_ids  # noqa: E402
+from ni.spec_scheduler import SpecRequest, SpecScheduler  # noqa: E402
+from ni.speculative import greedy_prompt_lookup, greedy_speculative  # noqa: E402
 
 
 def check_spec_batch(model, base: list[int], device: str = "cpu") -> bool:
@@ -209,8 +204,8 @@ def run_configs(label, target, draft, reqs, batch_sizes) -> bool:
 
 
 def main() -> int:
-    d05 = Path(sys.argv[1] if len(sys.argv) > 1 else "weights/qwen2.5-0.5b")
-    d15 = Path(sys.argv[2] if len(sys.argv) > 2 else "weights/qwen2.5-1.5b")
+    d05 = Path(sys.argv[1]) if len(sys.argv) > 1 else default_weights_dir()
+    d15 = Path(sys.argv[2]) if len(sys.argv) > 2 else default_weights_dir("qwen2.5-1.5b")
     device = sys.argv[3] if len(sys.argv) > 3 else "cpu"  # 'cpu' oracle (bit-identical) or 'cuda'
 
     m05 = nicpp.Model(str(d05), device=device)

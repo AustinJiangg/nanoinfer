@@ -27,18 +27,11 @@ parity test (tests/run_serve.py)."""
 
 from __future__ import annotations
 
-import sys
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
 
 import numpy as np
-
-CPP = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(CPP / "build"))  # nicpp.*.so
-
-import nicpp  # noqa: E402
 
 
 @dataclass

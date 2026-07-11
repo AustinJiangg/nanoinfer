@@ -21,17 +21,11 @@ from pathlib import Path
 
 import numpy as np
 
-HERE = Path(__file__).resolve().parent
-CPP = HERE.parent
-sys.path.insert(0, str(CPP / "build"))    # nicpp.*.so
-sys.path.insert(0, str(CPP / "python"))   # speculative
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
 
-import nicpp  # noqa: E402
-from speculative import greedy_speculative, greedy_prompt_lookup, prompt_lookup  # noqa: E402
-
-
-def read_ids(path: Path) -> list[int]:
-    return [int(x) for x in path.read_text().split()]
+from ni.engine import default_weights_dir, nicpp  # noqa: E402
+from ni.nit0 import read_ids  # noqa: E402
+from ni.speculative import greedy_speculative, greedy_prompt_lookup, prompt_lookup  # noqa: E402
 
 
 def check_lookup_matcher() -> bool:
@@ -136,8 +130,8 @@ def run_lookup_case(name, target, prompt, max_tokens, ngrams, ks, *, eos_id=-1) 
 
 
 def main() -> int:
-    d05 = Path(sys.argv[1] if len(sys.argv) > 1 else "weights/qwen2.5-0.5b")
-    d15 = Path(sys.argv[2] if len(sys.argv) > 2 else "weights/qwen2.5-1.5b")
+    d05 = Path(sys.argv[1]) if len(sys.argv) > 1 else default_weights_dir()
+    d15 = Path(sys.argv[2]) if len(sys.argv) > 2 else default_weights_dir("qwen2.5-1.5b")
 
     m05 = nicpp.Model(str(d05))
     ok = True

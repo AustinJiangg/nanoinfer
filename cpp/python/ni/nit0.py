@@ -1,7 +1,9 @@
-"""Read/write the little-endian NIT0 tensor format shared by the fixtures, the
-weight exporter, and the reference dumper. Mirrors cpp/src/serialize.{hpp,cpp}.
+"""The reference-dump file formats shared by the fixtures, the weight exporter,
+the reference dumper, and the parity gates.
 
-Format:  magic "NIT0" | int32 ndim | int32*ndim shape | float32*N data (row-major).
+  * NIT0 tensors — magic "NIT0" | int32 ndim | int32*ndim shape | float32*N data
+    (row-major, little-endian). Mirrors cpp/src/serialize.{hpp,cpp}.
+  * token-id text — space-separated ints (ref_ids.txt / ref_gen_ids.txt).
 """
 
 from __future__ import annotations
@@ -30,3 +32,11 @@ def load_bin(path: str | Path) -> np.ndarray:
         shape = [struct.unpack("<i", f.read(4))[0] for _ in range(ndim)]
         data = np.frombuffer(f.read(), dtype="<f4")
     return data.reshape(shape)
+
+
+def read_ids(path: str | Path) -> list[int]:
+    return [int(x) for x in Path(path).read_text().split()]
+
+
+def write_ids(path: str | Path, ids: list[int]) -> None:
+    Path(path).write_text(" ".join(str(i) for i in ids))

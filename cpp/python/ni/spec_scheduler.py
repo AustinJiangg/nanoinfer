@@ -33,21 +33,16 @@ way, folding spec into continuous batching changes throughput, never a sequence'
 
 from __future__ import annotations
 
-import sys
 from collections import deque
-from dataclasses import dataclass, field
-from enum import Enum
-from pathlib import Path
+from dataclasses import dataclass
 
 import numpy as np
 
-CPP = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(CPP / "build"))  # nicpp.*.so
-
-import nicpp  # noqa: E402
-
-from scheduler import PrefixCache  # noqa: E402  (F8c: reuse it verbatim — spec shares the TARGET cache)
-from speculative import (  # noqa: E402
+from .engine import nicpp
+# F8c: PrefixCache reused verbatim — spec shares the TARGET cache. State is the same
+# waiting/running/finished lifecycle as the plain scheduler's, defined once there.
+from .scheduler import PrefixCache, State
+from .speculative import (
     DraftModelProposer,
     PromptLookupProposer,
     SpecStats,
@@ -92,12 +87,6 @@ class SpecRequest:
     def sampling(self) -> bool:
         # Greedy unless a non-greedy SamplingParams was supplied (temperature > 0).
         return self.params is not None and not self.params.greedy()
-
-
-class State(Enum):
-    WAITING = "waiting"
-    RUNNING = "running"
-    FINISHED = "finished"
 
 
 class SpecSequence:

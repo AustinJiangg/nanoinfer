@@ -30,14 +30,13 @@ import argparse
 import sys
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-CPP = HERE.parent
-sys.path.insert(0, str(CPP / "build"))    # nicpp.*.so
-sys.path.insert(0, str(CPP / "python"))   # speculative
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
 
-import nicpp  # noqa: E402
-from speculative import greedy_prompt_lookup  # noqa: E402
-from bench_spec import DIVERSE_PROMPTS, best_time, read_ids  # noqa: E402
+from ni.engine import nicpp  # noqa: E402
+from ni.nit0 import read_ids  # noqa: E402
+from ni.speculative import greedy_prompt_lookup  # noqa: E402
+
+from bench_spec import DIVERSE_PROMPTS, best_time  # noqa: E402  (sibling: the shared prompt set)
 
 # A copy-heavy prompt (Qwen2.5 ids, vocab 151936): a passage whose phrasing recurs verbatim,
 # so the target's OWN greedy continuation quotes the earlier text — prompt-lookup's home turf

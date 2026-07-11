@@ -21,17 +21,11 @@ import sys
 import time
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-CPP = HERE.parent
-sys.path.insert(0, str(CPP / "build"))   # nicpp.*.so
-sys.path.insert(0, str(CPP / "python"))  # scheduler
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
 
-import nicpp  # noqa: E402
-from scheduler import Request, Scheduler  # noqa: E402
-
-
-def read_ids(path: Path) -> list[int]:
-    return [int(x) for x in path.read_text().split()]
+from ni.engine import default_weights_dir, nicpp  # noqa: E402
+from ni.nit0 import read_ids  # noqa: E402
+from ni.scheduler import Request, Scheduler  # noqa: E402
 
 
 def standalone(model, r: Request) -> list[int]:
@@ -42,7 +36,7 @@ def standalone(model, r: Request) -> list[int]:
 
 
 def main() -> int:
-    wd = Path(sys.argv[1] if len(sys.argv) > 1 else "weights/qwen2.5-0.5b")
+    wd = Path(sys.argv[1]) if len(sys.argv) > 1 else default_weights_dir()
     try:
         model = nicpp.Model(str(wd), device="cuda")
     except Exception as e:  # no CUDA build / no GPU

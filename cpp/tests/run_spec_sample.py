@@ -28,13 +28,11 @@ from pathlib import Path
 
 import numpy as np
 
-HERE = Path(__file__).resolve().parent
-CPP = HERE.parent
-sys.path.insert(0, str(CPP / "build"))    # nicpp.*.so
-sys.path.insert(0, str(CPP / "python"))   # speculative
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
 
-import nicpp  # noqa: E402
-from speculative import (  # noqa: E402
+from ni.engine import default_weights_dir, nicpp  # noqa: E402
+from ni.nit0 import read_ids  # noqa: E402
+from ni.speculative import (  # noqa: E402
     _draw,
     greedy_prompt_lookup,
     greedy_speculative,
@@ -42,10 +40,6 @@ from speculative import (  # noqa: E402
     sample_prompt_lookup,
     sample_speculative,
 )
-
-
-def read_ids(path: Path) -> list[int]:
-    return [int(x) for x in path.read_text().split()]
 
 
 def tvd(a: np.ndarray, b: np.ndarray) -> float:
@@ -232,7 +226,7 @@ def check_real_draft_marginal(target, draft, prompt, params, n=250, k=4, tol=0.0
     # step's first emitted token (loop position 0) must be distributed as p0 = dist after cur.
     # BOTH caches are prefilled ONCE and truncated back each sample (S1 rollback is bit-exact),
     # so every sample is a clean independent draft-sample + verify + accept — no re-prefilling.
-    from speculative import DraftModelProposer  # local: only this check needs the raw proposer
+    from ni.speculative import DraftModelProposer  # local: only this check needs the raw proposer
     cap = len(prompt) + 8
     tc = target.make_cache(cap)
     cur = int(np.argmax(target.forward(prompt, tc)[-1]))          # fix the conditioning token
@@ -272,7 +266,7 @@ def check_real_draft_marginal(target, draft, prompt, params, n=250, k=4, tol=0.0
 
 
 def check_scheduler_sampling(target, draft, base, params) -> bool:
-    from spec_scheduler import SpecRequest, SpecScheduler  # local import: only this check
+    from ni.spec_scheduler import SpecRequest, SpecScheduler  # local import: only this check
 
     reqs = [
         SpecRequest("d0", base,     max_tokens=12, proposer="draft",  k=4, params=params, seed=1),
@@ -316,7 +310,7 @@ def check_prefix_sharing_sampling(target, draft, base, params) -> bool:
     draw stream are unchanged: a sampled sequence stays TOKEN-identical to standalone at the same
     seed even when it reuses a shared prefix (the S5 batch-invariance property extended to prefix
     sharing). Mixed draft/lookup share a long prefix; all blocks free on clear (both pools)."""
-    from spec_scheduler import SpecRequest, SpecScheduler  # local import: only this check
+    from ni.spec_scheduler import SpecRequest, SpecScheduler  # local import: only this check
 
     shared = [base[i % len(base)] for i in range(24)]        # 24-tok common prefix (6 blocks @ bs=4)
     reqs = [
@@ -351,8 +345,8 @@ def check_prefix_sharing_sampling(target, draft, base, params) -> bool:
 
 
 def main() -> int:
-    d05 = Path(sys.argv[1] if len(sys.argv) > 1 else "weights/qwen2.5-0.5b")
-    d15 = Path(sys.argv[2] if len(sys.argv) > 2 else "weights/qwen2.5-1.5b")
+    d05 = Path(sys.argv[1]) if len(sys.argv) > 1 else default_weights_dir()
+    d15 = Path(sys.argv[2]) if len(sys.argv) > 2 else default_weights_dir("qwen2.5-1.5b")
 
     ok = True
     print("U1. accept rule (exact, scripted RNG):")

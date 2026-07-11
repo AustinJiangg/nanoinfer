@@ -14,7 +14,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from nit0 import save_bin
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
+from ni.nit0 import save_bin  # noqa: E402
 
 
 def main() -> None:

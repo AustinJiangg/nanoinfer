@@ -14,7 +14,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from nit0 import save_bin
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
+from ni.nit0 import save_bin, write_ids  # noqa: E402
 
 
 def main() -> None:
@@ -35,7 +36,7 @@ def main() -> None:
         logits = model(ids)[0]  # [seq, vocab]
 
     id_list = ids[0].tolist()
-    (out / "ref_ids.txt").write_text(" ".join(str(i) for i in id_list))
+    write_ids(out / "ref_ids.txt", id_list)
     save_bin(out / "ref_logits.bin", logits.numpy())
 
     # Greedy continuation (full-recompute, no EOS stop) for the C++ generate parity
@@ -48,7 +49,7 @@ def main() -> None:
             nxt = int(model(cur)[0, -1].argmax())
             gen.append(nxt)
             cur = torch.cat([cur, torch.tensor([[nxt]])], dim=1)
-    (out / "ref_gen_ids.txt").write_text(" ".join(str(i) for i in gen))
+    write_ids(out / "ref_gen_ids.txt", gen)
 
     print(f"prompt: {prompt!r}")
     print(f"seq={len(id_list)}  next-token argmax={int(logits[-1].argmax())}")

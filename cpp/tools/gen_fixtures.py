@@ -14,7 +14,9 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from nit0 import save_bin
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
+from ni.nit0 import save_bin  # noqa: E402
 
 RMS_EPS = 1e-6  # must match kRmsEps in cpp/tests/ops_parity.cpp
 

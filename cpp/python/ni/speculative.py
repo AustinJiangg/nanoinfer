@@ -41,14 +41,11 @@ CPU-oracle-locked: over the CPU backend, `tokens == model.generate(...)` for the
 
 from __future__ import annotations
 
-import sys
 from dataclasses import dataclass, field
-from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build"))  # nicpp.*.so
-import nicpp  # noqa: E402
+from .engine import nicpp
 
 
 def _draw(probs, rng) -> int:
