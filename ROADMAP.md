@@ -939,19 +939,32 @@ gate recipe: (1) HF → Python oracle, fp32 logits allclose + greedy token-for-t
 golden tokens; (4) serving, run_serve / run_spec_serve / HTTP smoke;
 (5) dump_reference goldens + a BASELINE-{model}.md.
 
-- [ ] **A0** — the architecture-description layer (shared infra; a pure refactor for
-      Qwen2.5). Config fields (Python ModelConfig + C++ Config + NIT0 header v2 —
-      versioned, still reads v1): `qkv_bias` (Qwen2.5 true, all others false),
-      `qk_norm` (Qwen3/Gemma3), explicit `head_dim` (decoupled from hidden/n_heads),
-      `rope_scaling` (none | llama3{factor, low_freq, high_freq, orig_max_pos}),
-      `act_fn` (silu | gelu), muP-style scalars defaulting to identity
-      (embedding_multiplier, attention_scale, residual_multiplier, logits_scaling),
-      the MoE block (`n_experts` — 0 = dense, `top_k`, `moe_ffn_dim`), and the
-      sliding-window pair (`sliding_window`, `sliding_pattern`). Weight-name maps
-      become a small registry keyed by HF `model_type` in weights.py /
-      export_weights.py (still the only place that knows HF names). **Done when:**
-      the Qwen2.5 full chain regresses bit-identical (the G0 bar: zero behavior
-      change).
+- [x] **A0** ✅ landed — the architecture-description layer (shared infra; a pure
+      refactor for Qwen2.5). Added the feature-flag *vocabulary* to Python
+      `ModelConfig` + C++ `Config` + a versioned `config.txt` (nit0_version 2):
+      `qkv_bias`, `qk_norm`, `act_fn` (silu|gelu enum), `rope_scaling`
+      (none|llama3{factor, low/high_freq, orig_max_pos}), the muP scalars
+      (embedding/attention/residual multiplier + logits_scaling, all identity), the
+      MoE block (`n_experts` 0=dense, `moe_top_k`, `moe_intermediate_size`), and the
+      sliding-window pair. `head_dim` was already explicit. **Only `qkv_bias` is
+      wired into the forward** — a `Model::qkv_bias_ptr` seam threads it through all
+      three forward variants (forward / forward_batch / forward_spec_batch), and the
+      Python `Attention` takes `bias=cfg.qkv_bias`; for Qwen2.5 (true) that's a pure
+      refactor. Every other flag is described-but-consumed-later, tagged with the
+      stage that wires it (A1–A4). Weight-name maps became a `model_type`-keyed
+      registry in weights.py (default = the shared Llama-family map; the seam A3's
+      fused-MoE remap plugs into). **Versioning:** the C++ loader still reads a v1
+      config (missing keys keep the Qwen2.5 defaults, `qkv_bias` default = 1);
+      `from_hf` normalizes transformers-5.x's `rope_type: "default"` no-scaling tag
+      to None. **Gate — Qwen2.5 bit-identical, confirmed both ways:** re-dumped
+      reference logits are **byte-identical** (md5 unchanged) to pre-change; the full
+      golden gate (`ctest -L weights`, 13/13 CPU+CUDA) passes against BOTH the old v1
+      export (back-compat) and the fresh v2 export; `ctest -L nomodel` 9/9, full
+      `pytest` 34/34 (incl. slow HF-parity), and the binding / serve / spec Python
+      gates all MATCH (the spec gate runs the 0.5B-v2 draft against a **still-v1**
+      1.5B target — mixed-version back-compat). The 1.5B export is deliberately left
+      at v1 (re-export needs ~12 GB co-resident, near the box ceiling); it loads
+      correctly precisely because the v1-compat defaults are right for Qwen2.5.
 - [ ] **A1** — **Qwen3-0.6B + 1.7B** (2025-04, Apache 2.0): the smallest delta.
       (1) QK-Norm — per-head RMSNorm over head_dim on Q and K, post-projection,
       pre-RoPE, own weights; near-zero new kernel code (reshape to tokens·heads rows

@@ -120,10 +120,11 @@ class Attention(nn.Module):
         self.n_kv_heads = cfg.num_kv_heads
         self.head_dim = cfg.head_dim
 
-        # Qwen2 uses biases on q/k/v projections; output proj has none.
-        self.q_proj = nn.Linear(cfg.hidden_size, self.n_heads * self.head_dim, bias=True)
-        self.k_proj = nn.Linear(cfg.hidden_size, self.n_kv_heads * self.head_dim, bias=True)
-        self.v_proj = nn.Linear(cfg.hidden_size, self.n_kv_heads * self.head_dim, bias=True)
+        # q/k/v biases are arch-dependent (A0 flag): Qwen2.5 has them, Qwen3/Llama
+        # don't. The output proj never has a bias in this family.
+        self.q_proj = nn.Linear(cfg.hidden_size, self.n_heads * self.head_dim, bias=cfg.qkv_bias)
+        self.k_proj = nn.Linear(cfg.hidden_size, self.n_kv_heads * self.head_dim, bias=cfg.qkv_bias)
+        self.v_proj = nn.Linear(cfg.hidden_size, self.n_kv_heads * self.head_dim, bias=cfg.qkv_bias)
         self.o_proj = nn.Linear(self.n_heads * self.head_dim, cfg.hidden_size, bias=False)
 
     def forward(

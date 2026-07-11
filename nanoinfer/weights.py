@@ -9,7 +9,7 @@ tests.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import torch
 
@@ -56,31 +56,51 @@ def load_model(model_name: str, dtype=torch.float32, device="cpu") -> tuple[Mode
     return model, tokenizer
 
 
-def _remap_state_dict(hf_sd: dict, our_sd: dict, cfg: ModelConfig) -> dict:
-    """Translate HF parameter names to ours.
+def _remap_llama_family(hf_name: str, tensor: torch.Tensor) -> tuple[str, torch.Tensor]:
+    """The default HF->ours name map, shared by every Llama-family arch.
 
-    HF Qwen2 layout:
+    HF Qwen2/Qwen3/Llama layout:
         model.embed_tokens.weight
         model.layers.{i}.input_layernorm.weight
         model.layers.{i}.self_attn.{q,k,v,o}_proj.{weight,bias}
+        model.layers.{i}.self_attn.{q,k}_norm.weight   (Qwen3/Gemma3 only)
         model.layers.{i}.post_attention_layernorm.weight
         model.layers.{i}.mlp.{gate,up,down}_proj.weight
         model.norm.weight
         lm_head.weight                       (absent if embeddings are tied)
 
-    Our layout drops the leading "model." for the body and keeps lm_head at top.
+    Our layout just drops the leading "model." for the body and keeps lm_head at
+    top. The per-tensor shape is untouched — this is a pure rename.
     """
+    if hf_name == "lm_head.weight":
+        return "lm_head.weight", tensor
+    if hf_name.startswith("model."):
+        return hf_name[len("model."):], tensor
+    # Be loud about anything we didn't anticipate rather than silently dropping it.
+    raise RuntimeError(f"Unrecognized HF weight name: {hf_name}")
+
+
+# Weight-name registry keyed by HF model_type (A0). This module is the ONE place
+# that knows HF's names; the registry is the seam where a future arch whose layout
+# differs (e.g. A3 Granite's fused MoE experts) plugs in its own remapper without
+# touching the rest of the loader. The Llama-family archs (Qwen2, Qwen3, Llama3)
+# all share the default map, so the registry is a fallback-to-default lookup.
+_NAME_MAP_REGISTRY: dict[str, Callable[[str, torch.Tensor], tuple[str, torch.Tensor]]] = {}
+
+
+def _name_mapper(model_type: str):
+    return _NAME_MAP_REGISTRY.get(model_type, _remap_llama_family)
+
+
+def _remap_state_dict(hf_sd: dict, our_sd: dict, cfg: ModelConfig) -> dict:
+    """Translate HF parameter names to ours, per the model_type registry."""
+    remap = _name_mapper(cfg.model_type)
     out: dict[str, torch.Tensor] = {}
 
     for hf_name, tensor in hf_sd.items():
-        if hf_name == "lm_head.weight":
-            out["lm_head.weight"] = tensor
-        elif hf_name.startswith("model."):
-            out[hf_name[len("model."):]] = tensor
-        else:
-            # Be loud about anything we didn't anticipate rather than silently
-            # dropping it.
-            raise RuntimeError(f"Unrecognized HF weight name: {hf_name}")
+        our_name, t = remap(hf_name, tensor)
+        if our_name is not None:
+            out[our_name] = t
 
     # Tied embeddings: some checkpoints omit lm_head and reuse the input embedding.
     if cfg.tie_word_embeddings and "lm_head.weight" not in out:

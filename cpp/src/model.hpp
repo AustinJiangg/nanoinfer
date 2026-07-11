@@ -86,6 +86,10 @@ public:
 
 private:
     const Tensor& W(const std::string& name) const;
+    // The bias tensor `name`, or nullptr when this arch has no q/k/v bias (A0's
+    // qkv_bias flag: Qwen2.5 carries one, Qwen3/Llama don't). The exporter simply
+    // omits the bias .bin when qkv_bias is off, so this must not look it up then.
+    const Tensor* qkv_bias_ptr(const std::string& name) const;
     // A linear projection that dispatches to the Q8 path when `name` is quantized.
     Tensor project(const Tensor& x, const std::string& name, const Tensor* bias) const;
     // The token-embedding gather and the output projection to logits — each weight-only int8

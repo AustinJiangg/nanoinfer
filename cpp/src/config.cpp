@@ -24,6 +24,37 @@ Config load_config(const std::string& path) {
         else if (key == "rope_theta") f >> c.rope_theta;
         else if (key == "tie_word_embeddings") f >> c.tie_word_embeddings;
         else if (key == "eos_token_id") f >> c.eos_token_id;
+        // --- A0 architecture-description fields. A v1 config omits all of these;
+        // the Config defaults (= Qwen2.5) then stand, which is what "still reads v1"
+        // means. String-valued keys (act_fn, rope_scaling) map onto the enums. ---
+        else if (key == "nit0_version") f >> c.nit0_version;
+        else if (key == "qkv_bias") f >> c.qkv_bias;
+        else if (key == "qk_norm") f >> c.qk_norm;
+        else if (key == "act_fn") {
+            std::string v; f >> v;
+            if (v == "silu") c.act_fn = ActFn::Silu;
+            else if (v == "gelu") c.act_fn = ActFn::Gelu;
+            else throw std::runtime_error("load_config: unknown act_fn '" + v + "'");
+        }
+        else if (key == "rope_scaling") {
+            std::string v; f >> v;
+            if (v == "none") c.rope_scaling = RopeScaling::None;
+            else if (v == "llama3") c.rope_scaling = RopeScaling::Llama3;
+            else throw std::runtime_error("load_config: unknown rope_scaling '" + v + "'");
+        }
+        else if (key == "rope_scaling_factor") f >> c.rope_scaling_factor;
+        else if (key == "rope_scaling_low_freq") f >> c.rope_scaling_low_freq;
+        else if (key == "rope_scaling_high_freq") f >> c.rope_scaling_high_freq;
+        else if (key == "rope_scaling_orig_max_pos") f >> c.rope_scaling_orig_max_pos;
+        else if (key == "embedding_multiplier") f >> c.embedding_multiplier;
+        else if (key == "attention_multiplier") f >> c.attention_multiplier;
+        else if (key == "residual_multiplier") f >> c.residual_multiplier;
+        else if (key == "logits_scaling") f >> c.logits_scaling;
+        else if (key == "n_experts") f >> c.n_experts;
+        else if (key == "moe_top_k") f >> c.moe_top_k;
+        else if (key == "moe_intermediate_size") f >> c.moe_intermediate_size;
+        else if (key == "sliding_window") f >> c.sliding_window;
+        else if (key == "sliding_pattern") f >> c.sliding_pattern;
         else { std::string ignored; f >> ignored; }  // unknown key: skip its value
     }
 

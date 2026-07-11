@@ -197,6 +197,11 @@ const Tensor& Model::W(const std::string& name) const {
     return it->second;
 }
 
+const Tensor* Model::qkv_bias_ptr(const std::string& name) const {
+    // A0: a bias only exists (and was only exported) when the arch has qkv_bias.
+    return cfg_.qkv_bias ? &W(name) : nullptr;
+}
+
 Tensor Model::forward(const std::vector<int64_t>& ids, KVCacheBase* cache) const {
     const int64_t seq = static_cast<int64_t>(ids.size());
     const float eps = cfg_.rms_norm_eps;
@@ -216,9 +221,9 @@ Tensor Model::forward(const std::vector<int64_t>& ids, KVCacheBase* cache) const
 
         // --- attention (pre-norm + residual) ---
         Tensor h = backend_->rmsnorm(x, W(L + "input_layernorm.weight"), eps);
-        Tensor q = project(h, L + "self_attn.q_proj.weight", &W(L + "self_attn.q_proj.bias"));
-        Tensor k = project(h, L + "self_attn.k_proj.weight", &W(L + "self_attn.k_proj.bias"));
-        Tensor v = project(h, L + "self_attn.v_proj.weight", &W(L + "self_attn.v_proj.bias"));
+        Tensor q = project(h, L + "self_attn.q_proj.weight", qkv_bias_ptr(L + "self_attn.q_proj.bias"));
+        Tensor k = project(h, L + "self_attn.k_proj.weight", qkv_bias_ptr(L + "self_attn.k_proj.bias"));
+        Tensor v = project(h, L + "self_attn.v_proj.weight", qkv_bias_ptr(L + "self_attn.v_proj.bias"));
 
         q = backend_->split_heads(q, cfg_.num_attention_heads, cfg_.head_dim);
         k = backend_->split_heads(k, cfg_.num_kv_heads, cfg_.head_dim);
@@ -294,9 +299,9 @@ Tensor Model::forward_batch(const std::vector<int64_t>& tokens,
         // --- attention (pre-norm + residual) ---
         Tensor h = backend_->rmsnorm(x, W(L + "input_layernorm.weight"), eps);  // [n, hidden]
         // Batched projections: one matmul over all n rows, weights streamed once.
-        Tensor q = project(h, L + "self_attn.q_proj.weight", &W(L + "self_attn.q_proj.bias"));
-        Tensor k = project(h, L + "self_attn.k_proj.weight", &W(L + "self_attn.k_proj.bias"));
-        Tensor v = project(h, L + "self_attn.v_proj.weight", &W(L + "self_attn.v_proj.bias"));
+        Tensor q = project(h, L + "self_attn.q_proj.weight", qkv_bias_ptr(L + "self_attn.q_proj.bias"));
+        Tensor k = project(h, L + "self_attn.k_proj.weight", qkv_bias_ptr(L + "self_attn.k_proj.bias"));
+        Tensor v = project(h, L + "self_attn.v_proj.weight", qkv_bias_ptr(L + "self_attn.v_proj.bias"));
 
         // Per-sequence attention: each token has its own cache, length, and RoPE
         // position, so this is a loop, not a batched matmul. Each iteration reuses
@@ -373,9 +378,9 @@ Tensor Model::forward_spec_batch(const std::vector<int64_t>& tokens,
         Tensor h = backend_->rmsnorm(x, W(L + "input_layernorm.weight"), eps);  // [M, hidden]
         // Batched projections: one matmul over all M verify rows, weights streamed once
         // (the F8a lever — here across the whole ragged verify batch, not one token/seq).
-        Tensor q = project(h, L + "self_attn.q_proj.weight", &W(L + "self_attn.q_proj.bias"));
-        Tensor k = project(h, L + "self_attn.k_proj.weight", &W(L + "self_attn.k_proj.bias"));
-        Tensor v = project(h, L + "self_attn.v_proj.weight", &W(L + "self_attn.v_proj.bias"));
+        Tensor q = project(h, L + "self_attn.q_proj.weight", qkv_bias_ptr(L + "self_attn.q_proj.bias"));
+        Tensor k = project(h, L + "self_attn.k_proj.weight", qkv_bias_ptr(L + "self_attn.k_proj.bias"));
+        Tensor v = project(h, L + "self_attn.v_proj.weight", qkv_bias_ptr(L + "self_attn.v_proj.bias"));
 
         // Per-sequence attention over that sequence's contiguous query block. Extracting
         // the block ([cnt, *]) then split_heads is the SAME sequence of ops as forward()
