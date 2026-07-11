@@ -75,19 +75,27 @@ build on.
 ## Project layout
 
 ```
-nanoinfer/
-  config.py     ModelConfig, loaded from the HF config
-  weights.py    load an HF checkpoint -> our own state-dict naming
-  layers.py     rmsnorm, rope, attention, swiglu, transformer block
-  cache.py      per-layer KV cache for incremental decoding (stage 1)
-  sampling.py   temperature / top-k / top-p / repetition penalty (stage 2)
-  model.py      assembles the blocks; forward(input_ids, cache=None) -> logits
-  generate.py   the autoregressive loop + CLI entry point
-tests/
+nanoinfer/        the Python engine — frozen as the reference oracle
+  config.py       ModelConfig, loaded from the HF config
+  weights.py      load an HF checkpoint -> our own state-dict naming
+  layers.py       rmsnorm, rope, attention, swiglu, transformer block
+  cache.py        per-layer KV cache for incremental decoding (stage 1)
+  sampling.py     temperature / top-k / top-p / repetition penalty (stage 2)
+  model.py        assembles the blocks; forward(input_ids, cache=None) -> logits
+  generate.py     the autoregressive loop + CLI entry point
+tests/            pytest for the oracle
   test_layers.py    shape + numerical-parity tests vs HF
   test_cache.py     cached decode == stage-0 full recompute, token-for-token
   test_sampling.py  warpers + greedy-equivalence invariants
   test_generate.py  end-to-end: greedy output matches HF, deterministic
+cpp/              the C++/CUDA engine (see cpp/README.md for its layout)
+  src/            C++ core + src/cuda/ backend (the `nicore` kernels)
+  bindings/       nicpp — the pybind11 seam
+  python/ni/      Python orchestration: scheduler, speculative, spec_scheduler
+  tools/          weight export, reference dump, generate/serve CLIs
+  tests/          C++ parity tests (ctest); tests/python/ = Python parity gates
+  bench/          performance benches
+  docs/           BASELINE.md / BASELINE-1.5b.md — the frozen gate numbers
 ROADMAP.md      the staged plan
 CLAUDE.md       how we develop here: the golden rule, conventions, sharp edges
 ```

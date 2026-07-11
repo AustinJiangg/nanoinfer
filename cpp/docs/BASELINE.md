@@ -22,20 +22,21 @@ refactor, must also stay digit-identical since no kernel changes.
 
 ## How to run the gate
 
-```bash
-# 1. self-contained unit + op-parity tests (10 tests)
-cd cpp/build-cuda && ctest --output-on-failure
+One `ctest` invocation covers everything — R1 wired the weight-dependent binaries in
+as the labelled `weights` suite (they skip-clean when the export / ref dump is absent):
 
-# 2. weight-dependent parity/golden binaries (need the export + ref dump already in the dir)
+```bash
 cd cpp
-for b in run_parity run_generate run_cache run_batch run_paged; do ./build-cuda/$b weights/qwen2.5-0.5b; done
-for m in none q8 q4 q4g; do ./build-cuda/run_quant weights/qwen2.5-0.5b $m; done
-./build-cuda/run_quant weights/qwen2.5-0.5b none embed
-for b in run_cuda_parity run_cuda_cache run_cuda_paged run_cuda_batch; do ./build-cuda/$b weights/qwen2.5-0.5b; done
+cmake -S . -B build-cuda -DNI_CUDA=ON && cmake --build build-cuda -j
+ctest --test-dir build-cuda --output-on-failure   # 23 tests: 10 self-contained + 13 `weights`
 ```
 
-(R1 should wire the weight-dependent binaries into `ctest` as a labelled `weights`
-suite so this whole list collapses to one `ctest` invocation, per REFACTOR.md R0/R1.)
+`ctest -L weights` runs just the weight-dependent suite. One check is not wired into
+ctest and stays manual (int8 embed/lm_head on top of fp32 layers — the none+embed8 row):
+
+```bash
+./build-cuda/run_quant weights/qwen2.5-0.5b none embed
+```
 
 ## ctest (self-contained)
 

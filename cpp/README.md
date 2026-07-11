@@ -15,13 +15,23 @@ the parent `ROADMAP.md` for the staged plan.
 
 ```bash
 cd cpp
-cmake -S . -B build
-cmake --build build -j
+cmake -S . -B build && cmake --build build -j        # CPU-only engine
 ctest --test-dir build --output-on-failure
+
+cmake -S . -B build-cuda -DNI_CUDA=ON                # + the CUDA backend (sm_89)
+cmake --build build-cuda -j
+ctest --test-dir build-cuda --output-on-failure      # the full gate: 23 tests
 ```
 
 Requires a C++17 compiler, CMake ≥ 3.16, and Python 3 + numpy (only to generate
 the parity fixtures — the engine itself has no Python dependency).
+
+`ctest` includes the weight-dependent parity/golden suite (label `weights`)
+automatically once the weight export + reference dump exist (see "Run the full
+Qwen2.5 forward" below); without them those tests skip-clean and only the
+self-contained ones run. `ctest -L weights` runs just that suite, `-LE weights`
+excludes it. The frozen expected numbers live in [docs/BASELINE.md](docs/BASELINE.md)
+(0.5B) and [docs/BASELINE-1.5b.md](docs/BASELINE-1.5b.md).
 
 The build targets the host CPU (`-march=native`, enabling the AVX2/FMA kernels)
 and uses OpenMP if found. Both are optional and degrade to the same numbers:
@@ -50,19 +60,23 @@ same graceful degrade. See "Use from Python" below.
 
 ```
 cpp/
-  src/
-    tensor.{hpp,cpp}     row-major contiguous float32 Tensor (shape/stride/data)
-    ops.{hpp,cpp}        matmul, rmsnorm, softmax, add — naive, readable
-    serialize.{hpp,cpp}  read/write the "NIT0" tensor format (the parity bridge)
-    simd.hpp             C5: AVX2/FMA + NEON dot products (double-accum), scalar fallback
-    parallel.hpp         C5: OpenMP thread-count knobs for the kernels
-  tests/
-    test_util.hpp        dependency-free CHECK / CHECK_CLOSE / compare_tensors
-    test_tensor.cpp      shape/stride/indexing
-    test_ops.cpp         hand-verified numerical cases
-    ops_parity.cpp       allclose vs numpy fixtures
-  tools/
-    gen_fixtures.py      numpy reference -> NIT0 fixtures (ctest setup step)
+  src/           the C++ core (`nicore`): tensor, ops, quant, cache, paged KV,
+                 backend seam, model, sampling, generate, NIT0 serialize;
+                 simd.hpp (AVX2/FMA + NEON dots), parallel.hpp (OpenMP knobs)
+  src/cuda/      the CUDA backend: cuda.hpp / cuda_backend.hpp (deliberately
+                 CUDA-type-free seams) + runtime/gemm/quant/elementwise/backend .cu
+  bindings/      nicpp.cpp — the pybind11 module (the .so lands in the build dir)
+  python/ni/     the Python orchestration package: engine (nicpp discovery),
+                 scheduler (F7/F8 continuous batching), speculative +
+                 spec_scheduler (S-track), nit0 (the parity file formats)
+  tools/         entry scripts: export_weights, dump_reference, gen_fixtures,
+                 generate (single-prompt CLI), serve (multi-prompt CLI)
+  tests/         C++ unit + parity tests (wired into ctest) + test_util/parity_util
+  tests/python/  the Python parity gates (run as scripts) + gateutil
+  bench/         performance benches, C++ and Python — they measure, they don't gate
+  docs/          BASELINE.md / BASELINE-1.5b.md — the frozen gate numbers
+  cmake/         aarch64 cross toolchain (the NEON-under-qemu correctness gate)
+  weights/       NIT0 weight exports + reference dumps (gitignored, multi-GB)
 ```
 
 ## The parity bridge
@@ -137,8 +151,8 @@ The kernels run with the GIL released. Tokenization stays in Python (HF, allowed
 the golden rule); the core works purely on token ids.
 
 ```python
-import sys; sys.path.insert(0, "build")     # the .so lands in build/
-import nicpp
+import sys; sys.path.insert(0, "python")    # the ni package
+from ni.engine import nicpp                 # locates the .so in build*/ (or $NI_BUILD_DIR)
 
 model = nicpp.Model("weights/qwen2.5-0.5b")          # or nicpp.quant_mode("q8")
 ids = [785, 6722, 315, 9625, 374]                     # "The capital of France is"
@@ -154,7 +168,7 @@ scheduler will drive (one cache per sequence, batched orchestration in Python).
 
 ```bash
 # parity through the binding: logits + greedy match nanoinfer, cached==uncached
-python tests/run_binding.py weights/qwen2.5-0.5b
+python tests/python/run_binding.py weights/qwen2.5-0.5b
 # text in/out on the C++ engine (HF tokenize -> our kernels -> HF decode)
 python tools/generate.py --prompt "The capital of France is" --max-tokens 20
 python tools/generate.py --prompt "Once upon a time" --temperature 0.8 --top-p 0.95 --seed 1234
@@ -168,7 +182,7 @@ nanoinfer; sampled output is not token-identical (the C++ RNG differs from torch
 
 ### Continuous batching (F7) + batched decode (F8a)
 
-`python/scheduler.py` is the serving layer: a `Scheduler` that runs many requests
+`python/ni/scheduler.py` is the serving layer: a `Scheduler` that runs many requests
 at once over the F6 kernels. Each request gets its own KV cache; every step decodes
 the running set by one token, evicts finished sequences, and admits queued ones into
 the freed slots — *continuous* batching, so a short request never waits behind a
@@ -185,9 +199,9 @@ bit-identical to a standalone `forward([tokens[s]], caches[s])`, so output is
 unchanged — `batched=False` keeps the per-sequence `forward()` loop (F7) for A/B.
 
 ```python
-import sys; sys.path.insert(0, "build"); sys.path.insert(0, "python")
-import nicpp
-from scheduler import Request, Scheduler
+import sys; sys.path.insert(0, "python")
+from ni.engine import nicpp
+from ni.scheduler import Request, Scheduler
 
 model = nicpp.Model("weights/qwen2.5-0.5b")
 sched = Scheduler(model, max_batch=4)
@@ -201,7 +215,7 @@ outputs = sched.run()        # {request_id: output_ids}; or call sched.step() yo
 ./build/run_batch weights/qwen2.5-0.5b
 # greedy output is token-identical to standalone generate at every batch size and on
 # both decode paths (batched / per-sequence), incl. a repetition-penalty request
-python tests/run_serve.py weights/qwen2.5-0.5b
+python tests/python/run_serve.py weights/qwen2.5-0.5b
 # serve several prompts at once (HF tokenize -> scheduler -> HF decode)
 python tools/serve.py --max-batch 2 --max-tokens 16 \
     --prompt "The capital of France is" --prompt "Once upon a time" --prompt "Water boils at"
@@ -280,9 +294,9 @@ python tools/serve.py --block-size 4 --num-blocks 128 --prefix-sharing --max-tok
 With F8c the Fusion track is a mini-vLLM: Python orchestration (continuous batching +
 paged block scheduler + prefix sharing) over our own C++ kernels (batched decode +
 paged attention), parity-locked end to end. On the backlog (open, not deferred-forever
-— see the parent ROADMAP's Backlog): batched sampling (the draw is still per-sequence in
-Python) and a true int8×int8→int32 GEMM (C4 quant is still weight-only, so it saves
-memory, not compute) — both natural to fold into the GPU GEMM work (G5).
+— see the parent ROADMAP's Backlog): batched sampling (the draw is still per-sequence
+in Python). The true int8×int8→int32 GEMM landed on the GPU side as W8A8 (DP4A decode
+GEMV + lm_head prefill — see docs/BASELINE.md); the CPU's C4 quant stays weight-only.
 
 ## Performance (C5: SIMD + threads)
 
@@ -343,10 +357,10 @@ a silent change.
       the kernels. Parity-tested through the binding and a text demo (HF tokenize →
       C++ kernels → HF decode). See "Use from Python" below. The F7 substrate.
 - [x] **F7** — Python serving layer: a continuous-batching `Scheduler`
-      (`python/scheduler.py`) over the F6 kernels — per-sequence KV cache, one-token
+      (`python/ni/scheduler.py`) over the F6 kernels — per-sequence KV cache, one-token
       decode per step, dynamic admit/evict (no head-of-line blocking). Greedy output
       is token-identical to standalone generate at every batch size
-      (`tests/run_serve.py`); `tools/serve.py` serves several prompts at once. The
+      (`tests/python/run_serve.py`); `tools/serve.py` serves several prompts at once. The
       *scheduling* win; batched-GEMM throughput is the next kernel step.
 - [x] **F8a** — batched decode kernel: `Model::forward_batch` decodes N sequences in
       one pass, fusing the per-sequence projection GEMMs over the N rows (attention
@@ -364,4 +378,14 @@ a silent change.
       keyed by the block-aligned token prefix. A request reuses a cached prefix's
       blocks (`PagedKVCache.share_prefix`) and prefills only its suffix
       (`Scheduler(prefix_sharing=True)`) — bit-identical to standalone, the win being
-      skipped prefill + shared blocks (`tests/run_serve.py`, `tests/run_paged.cpp`).
+      skipped prefill + shared blocks (`tests/python/run_serve.py`, `tests/run_paged.cpp`).
+
+The tracks beyond this list — **G0–G6** (the CUDA backend: full GPU forward, paged
+attention, tuned GEMM / FlashAttention / Flash-Decoding, CUDA graphs), **S0–S5**
+(speculative decoding: draft-model + prompt-lookup proposers, KV rollback, batching
+integration, rejection sampling), **P0–P2** (the 1.5B perf retune), **R0–R5** (the
+structural refactor), and **NEON** — are all landed; the parent
+[ROADMAP.md](../ROADMAP.md) documents each stage (plan + journey) and
+[REFACTOR.md](../REFACTOR.md) the R-track. Their frozen parity/perf numbers live in
+[docs/BASELINE.md](docs/BASELINE.md) and [docs/BASELINE-1.5b.md](docs/BASELINE-1.5b.md).
+Metal (a third backend) is the one deferred item.
