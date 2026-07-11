@@ -90,6 +90,57 @@ static bool check_attention(int64_t H, int64_t sq, int64_t sk, int64_t D, bool c
     return ok;
 }
 
+// Paged shared-mem tiled attention (the backlog mirror of G5f-tiled): the tiled paged kernel must be
+// BIT-IDENTICAL to the non-tiled paged kernel — same keys in the same lane order, only staged through
+// smem via a block-table gather. Drives a real CudaPagedKVCache (no weights): seed `ctx` positions,
+// advance, then attend a multi-query block of `t` new tokens at query_offset=ctx (the prefill /
+// spec-verify shape) twice — non-tiled (no_tiled_attn) vs tiled (use_tiled_attn, or the D>=128
+// default when `force` is false). attend() re-writes the same slots while the length isn't advanced,
+// so both runs see identical K/V. NaN-aware (the G5f empty-lane lesson: fmax swallows NaN).
+static bool check_paged_tiled(int64_t H, int64_t n_kv, int64_t t, int64_t ctx, int64_t D, int64_t bs,
+                              bool causal, bool force, std::mt19937& rng) {
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    const int64_t n_rep = H / n_kv;
+    CudaBlockPool pool(/*num_layers=*/1, n_kv, D, bs, (ctx + t) / bs + 2);
+    CudaPagedKVCache paged(&pool);
+    if (ctx > 0) {  // seed the cache so the new queries attend across old blocks too
+        Tensor qc({H, ctx, D}), kc({n_kv, ctx, D}), vc({n_kv, ctx, D});
+        for (int64_t i = 0; i < qc.numel(); ++i) qc[i] = dist(rng);
+        for (int64_t i = 0; i < kc.numel(); ++i) kc[i] = dist(rng);
+        for (int64_t i = 0; i < vc.numel(); ++i) vc[i] = dist(rng);
+        Tensor qd = to_device(qc), kd = to_device(kc), vd = to_device(vc);
+        paged.attend(0, qd, kd, vd, n_rep, true, 0);
+        paged.advance(ctx);
+    }
+    Tensor q({H, t, D}), k({n_kv, t, D}), v({n_kv, t, D});
+    for (int64_t i = 0; i < q.numel(); ++i) q[i] = dist(rng);
+    for (int64_t i = 0; i < k.numel(); ++i) k[i] = dist(rng);
+    for (int64_t i = 0; i < v.numel(); ++i) v[i] = dist(rng);
+    Tensor qd = to_device(q), kd = to_device(k), vd = to_device(v);
+
+    cuda_policy().no_tiled_attn = true;  // baseline: the proven non-tiled warp kernel
+    Tensor o_warp = to_host(paged.attend(0, qd, kd, vd, n_rep, causal, ctx));
+    cuda_policy().no_tiled_attn = false;
+    cuda_policy().use_tiled_attn = force;  // force=false leans on the D>=kTileMinHeadDim default
+    Tensor o_tiled = to_host(paged.attend(0, qd, kd, vd, n_rep, causal, ctx));
+    cuda_policy().use_tiled_attn = false;
+
+    double maxdiff = 0.0;
+    bool nan = false;
+    for (int64_t i = 0; i < o_warp.numel(); ++i) {
+        const double d = std::fabs(static_cast<double>(o_warp[i]) - o_tiled[i]);
+        if (std::isnan(d)) nan = true;
+        else maxdiff = std::max(maxdiff, d);
+    }
+    const bool ok = !nan && maxdiff == 0.0;
+    std::printf("test_cuda: paged-tiled H=%lld nkv=%lld t=%3lld ctx=%3lld D=%3lld bs=%2lld %-6s %s "
+                "max|diff|=%.3e %s\n",
+                (long long)H, (long long)n_kv, (long long)t, (long long)ctx, (long long)D,
+                (long long)bs, causal ? "causal" : "full", force ? "forced " : "default",
+                nan ? std::numeric_limits<double>::quiet_NaN() : maxdiff, ok ? "ok" : "FAIL");
+    return ok;
+}
+
 // Embedding gather vs the CPU oracle (G5d). Random [vocab, hidden] table, random ids; an fp32
 // table matches exactly (a pure copy — no arithmetic), an fp16 table within fp16 rounding (the
 // looked-up rows are half-rounded). Covers the fp16-table path now that embed_tokens goes fp16.
@@ -312,6 +363,16 @@ int main() {
     ok &= check_attention(4, 5, 5, 64, true, 0, 1e-3, rng);      // tiled ragged: sq < warps/block
     ok &= check_attention(2, 130, 130, 64, true, 0, 1e-3, rng);  // tiled ragged tiles + query blocks
     cuda_policy().use_tiled_attn = false;
+
+    // Paged tiled kernel (backlog): bit-identical to the non-tiled paged kernel on a real
+    // CudaPagedKVCache. D=128 rows exercise the P0 default-on dispatch (force=false); D=64 rows
+    // force it (the 0.5B A/B shape). Small bs makes one 32-key smem slab gather across many blocks;
+    // ctx not block-aligned starts the gather mid-block; small t leaves most lanes/warps empty.
+    ok &= check_paged_tiled(12, 2, 40, 0, 128, 16, true, false, rng);   // 1.5B prefill, default-on
+    ok &= check_paged_tiled(12, 2, 5, 13, 128, 4, true, false, rng);    // verify shape onto a populated cache
+    ok &= check_paged_tiled(12, 2, 130, 30, 128, 16, true, false, rng); // ragged query blocks + long ctx
+    ok &= check_paged_tiled(14, 2, 40, 23, 64, 8, true, true, rng);     // 0.5B shape, forced, odd offset
+    ok &= check_paged_tiled(14, 2, 16, 8, 64, 4, false, true, rng);     // non-causal, forced
 
     // Flash-Decoding / split-KV (G5g): the KV is split across warps and recombined, so the reduction
     // order differs from the non-split kernel — match the CPU oracle within tol (same 1e-3, not

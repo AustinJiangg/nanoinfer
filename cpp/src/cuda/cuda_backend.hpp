@@ -65,7 +65,9 @@ struct CudaPolicy {
     // one-thread-per-query kernel, the A/B baseline (G5e). Shared-mem K/V tiling (G5f) at prefill
     // (sq>1) is bit-identical to the non-tiled kernel; it TIES on 0.5B (KV fits L2) but WINS at
     // head_dim>=128 (~1.03-1.26x isolated, ~2.7% e2e prefill on 1.5B — the doubled per-key smem bytes
-    // make the reuse pay), so it is the DEFAULT for D>=kTileMinHeadDim. use_tiled_attn forces it on at
+    // make the reuse pay), so it is the DEFAULT for D>=kTileMinHeadDim — on BOTH KV paths: the
+    // contiguous kernel and its paged mirror (paged_attention_warp_tiled_kernel, which gathers the
+    // tile through the block table) dispatch on the same condition. use_tiled_attn forces it on at
     // any D (e.g. to A/B it on 0.5B); no_tiled_attn forces it off (the A/B baseline at D>=128 — how a
     // bench measures the non-tiled path once tiling is the default). use_split_attn: Flash-Decoding
     // split-KV when the shape warrants it (small sq, long context) — reorders the reduction (not

@@ -818,11 +818,34 @@ the right moment:
   split treatment (`paged_attention_split_kv_kernel`, sharing `attention_combine_kernel`) — bit-identical
   to the contiguous split path (run_cuda_paged max|diff|=0); (b) paired with the paged cache (no cat_seq),
   the win lands undiluted — paged+split ~81 tok/s @ctx2048 (fastest of all four), and runs at ctx4096
-  where the contiguous cache OOMs. Remaining: Flash-Decoding combines partials in a separate kernel pass
-  — could fuse, and the split kernel could share the G5f-tiled smem staging (low priority on this model).
-- shared-mem tiling for the PAGED attention kernel — G5f tiled only the contiguous path (enough to
-  characterize the muted-by-L2 result). Mirroring it into paged_attention_warp_kernel (gather blocks
-  into smem) is mechanical and would stay bit-identical; do it if/when tiling starts winning.
+  where the contiguous cache OOMs. Both named remainders now RESOLVED by measurement (the G5a
+  discipline): (a) **combine fusion — measured, NOT worth it**: the combine kernel costs 5.4–9.7 µs
+  at the real decode shapes (nq=12–14, splits 8–38), indistinguishable from an EMPTY kernel launch
+  (4.3–5.7 µs) — it is pure launch overhead, ~2.5–4% of a split attend at ctx 1–4k (0.5% at 16k),
+  and a full fusion saves ≤ 28 layers × ~5 µs ≈ 0.14 ms against an 18–28 ms decode step (<1%,
+  before launch pipelining hides most of it — the G6 exposed-fraction lesson). Skipped, recorded.
+  (b) **sharing the G5f-tiled smem staging with the split kernel is structurally moot**: split only
+  engages at decode (sq=1, split_count≥2; prefill degrades to split_count=1), and smem staging pays
+  only when multiple queries reuse a staged slab — one query has no reuse, the same reason the tiled
+  dispatch never fires at sq=1.
+- shared-mem tiling for the PAGED attention kernel — **DONE** (the "if/when tiling starts winning"
+  condition arrived with P0: tiling became the head_dim≥128 DEFAULT, yet the paged path — the only
+  viable 1.5B long-context config per P2 — was still on the non-tiled fallback).
+  `paged_attention_warp_tiled_kernel` mirrors attention_warp_tiled_kernel with the Bc=32 slab
+  GATHERED through the block table (GQA folded into the load); same dispatch + priority as
+  contiguous (default at D≥128, use_tiled_attn/no_tiled_attn overrides, sq>1 only). With lane l ↔
+  key (base+l) it stays **bit-identical to the non-tiled paged kernel**: test_cuda paged-tiled
+  max|diff|=0 on 5 shapes (D=128 default-dispatch incl. a verify shape onto a populated cache at a
+  non-aligned offset, bs=4 slab-crossing gathers, D=64 forced, non-causal), run_cuda_paged's new
+  forced-tiled section max|diff|=0 on BOTH models (paged-tiled == contiguous-tiled lockstep AND ==
+  the non-tiled paged prefill), golden tokens + run_spec_serve (ragged spec verify now lands on the
+  kernel by default on 1.5B) all green. run_cuda_paged's diff reduction also made NaN-aware (the
+  G5f fmax-swallows-NaN lesson). Isolated (run_cuda_attn_bench, new paged section): 1.5B shapes
+  **1.17× @sq128**, ~1.00–1.03× at sq 512–2048; 0.5B ties (1.00–1.03×) — the same L2-muted shape as
+  contiguous tiling, confirming the D≥128 default gate for paged too. e2e paged prefill 512 (1.5B
+  fp16, interleaved best-of-5, NI_NO_TILE_ATTN A/B added to run_cuda_decode_bench): a tie within
+  noise (1837.6 vs 1849.6 tok/s) — attention is a minority of the prefill step (the P0 shape). Net:
+  consistency + a small isolated win, never a loss, parity-free.
 - int8×int8→int32 GEMM — DONE (G5d W8A8: CPU oracle linear_w8a8 + simd::dot_qq, GPU cuda_linear_w8a8
   DP4A, model-integrated; the compute win — gate/up 1.11×, down 1.14×, lm_head 1.36×). **W8A8 decode
   GEMV — DONE** (the P1-named decode cap, the q8-GEMV analog for the int8×int8 path): cuda_linear_w8a8

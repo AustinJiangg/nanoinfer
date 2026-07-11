@@ -142,6 +142,53 @@ int main(int argc, char** argv) {
     cuda_policy().use_tiled_attn = false;
     cuda_policy().no_tiled_attn = false;
     cuda_policy().use_split_attn = false;
+
+    // PAGED attend, tiled vs non-tiled (the backlog mirror of G5f-tiled — the paged kernel the
+    // 1.5B long-context default config actually runs at prefill). Drives a real CudaPagedKVCache
+    // (block_size 16, the harness standard); each timed attend() includes the paged_write of the
+    // sq new tokens on BOTH arms, so the ratio is fair (and the write is O(n_kv·sq·D), noise next
+    // to the O(H·sq·sk·D) attention). Prefill rows only — at sq=1 tiling has no query reuse and
+    // the dispatch never picks it. tiled == non-tiled must hold bit-for-bit (same lane/key order).
+    std::printf("\npaged attend (block_size=16): tiled vs non-tiled, GQA n_kv=%lld\n",
+                (long long)(H >= 2 ? 2 : 1));
+    std::printf("%5s %6s | %9s %9s | %8s | %10s\n", "sq", "sk", "notile ms", "tiled ms", "t/notile",
+                "tile==notl");
+    const int64_t n_kv = H >= 2 ? 2 : 1, n_rep = H / n_kv;  // Qwen2.5 GQA shape (14/2 or 12/2)
+    for (const Cfg& c : cfgs) {
+        const int64_t sq = c.sq, sk = c.sk, ctx = sk - sq;
+        if (sq <= 1) continue;  // decode: tiling never dispatches (no reuse) — nothing to A/B
+        const int64_t bs = 16;
+        CudaBlockPool pool(/*num_layers=*/1, n_kv, D, bs, sk / bs + 4);
+        CudaPagedKVCache paged(&pool);
+        Tensor q({H, sq, D}), k({n_kv, sq, D}), v({n_kv, sq, D});
+        for (int64_t i = 0; i < q.numel(); ++i) q[i] = dist(rng);
+        for (int64_t i = 0; i < k.numel(); ++i) k[i] = dist(rng);
+        for (int64_t i = 0; i < v.numel(); ++i) v[i] = dist(rng);
+        Tensor qd = to_device(q), kd = to_device(k), vd = to_device(v);
+        if (ctx > 0) {  // seed the context so the queries attend across old blocks too
+            Tensor qc({H, ctx, D}), kc({n_kv, ctx, D}), vc({n_kv, ctx, D});
+            for (int64_t i = 0; i < kc.numel(); ++i) kc[i] = dist(rng);
+            for (int64_t i = 0; i < vc.numel(); ++i) vc[i] = dist(rng);
+            Tensor qcd = to_device(qc), kcd = to_device(kc), vcd = to_device(vc);
+            paged.attend(0, qcd, kcd, vcd, n_rep, true, 0);
+            paged.advance(ctx);
+        }
+        auto run = [&] { Tensor o = paged.attend(0, qd, kd, vd, n_rep, /*causal=*/true, ctx); };
+
+        cuda_policy().no_tiled_attn = true;
+        Tensor o_notile = to_host(paged.attend(0, qd, kd, vd, n_rep, true, ctx));
+        const double ms_notile = time_ms(run, 30, 5);
+        cuda_policy().no_tiled_attn = false;
+        cuda_policy().use_tiled_attn = true;  // force on so the A/B also runs at D<128
+        Tensor o_tiled = to_host(paged.attend(0, qd, kd, vd, n_rep, true, ctx));
+        const double ms_tiled = time_ms(run, 30, 5);
+        cuda_policy().use_tiled_attn = false;
+
+        const double d_tn = maxdiff(o_tiled, o_notile);  // must be 0 (same key order)
+        ok &= (d_tn == 0.0);
+        std::printf("%5lld %6lld | %9.3f %9.3f | %7.2fx | %10.1e\n", (long long)sq, (long long)sk,
+                    ms_notile, ms_tiled, ms_notile / ms_tiled, d_tn);
+    }
     std::printf("run_cuda_attn_bench: %s\n", ok ? "ok" : "FAIL (parity)");
     return ok ? 0 : 1;
 }

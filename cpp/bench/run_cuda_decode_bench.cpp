@@ -122,6 +122,9 @@ int main(int argc, char** argv) {
         // NI_TILE_ATTN=1 opts into the shared-memory K/V tiled kernel at prefill (G5f A/B): isolate
         // the tiling's prefill contribution (bit-identical output either way; default is non-tiled).
         if (const char* e = std::getenv("NI_TILE_ATTN")) cuda_policy().use_tiled_attn = (e[0] == '1');
+        // NI_NO_TILE_ATTN=1 forces tiling OFF — the A/B baseline at head_dim>=128, where tiling is
+        // the DEFAULT since P0 (on both KV paths; pairs with NI_PAGED=1 for the paged tiled kernel).
+        if (const char* e = std::getenv("NI_NO_TILE_ATTN")) cuda_policy().no_tiled_attn = (e[0] == '1');
         // NI_SPLIT_ATTN=1 opts into Flash-Decoding / split-KV attention (G5g): the long-context decode
         // lever. A/B the decode tok/s by running this bench at a long context with and without it set.
         if (const char* e = std::getenv("NI_SPLIT_ATTN")) cuda_policy().use_split_attn = (e[0] == '1');

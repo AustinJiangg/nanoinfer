@@ -8,6 +8,7 @@
 //   python ../tools/dump_reference.py  weights/qwen2.5-0.5b "The capital of France is"
 //   ./build/run_cuda_paged weights/qwen2.5-0.5b
 #include <cmath>
+#include <limits>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -21,10 +22,23 @@
 
 using namespace ni;
 
+// NaN-aware (the G5f lesson): std::fmax(x, NaN) silently returns x, so a NaN-poisoned logit row
+// would otherwise vanish from the reduction and the gate would pass on garbage. A NaN diff is
+// returned as NaN, which fails every `< tol` / `== 0.0` check downstream.
 static double full_maxdiff(const Tensor& a, const Tensor& b) {
     double m = 0.0;
-    for (int64_t i = 0; i < a.numel(); ++i) m = std::fmax(m, std::fabs(double(a[i]) - double(b[i])));
+    for (int64_t i = 0; i < a.numel(); ++i) {
+        const double d = std::fabs(double(a[i]) - double(b[i]));
+        if (std::isnan(d)) return d;
+        m = std::fmax(m, d);
+    }
     return m;
+}
+
+// Accumulate diffs without fmax's NaN-swallowing: once any operand is NaN, stay NaN.
+static double worse(double a, double b) {
+    if (std::isnan(a) || std::isnan(b)) return std::numeric_limits<double>::quiet_NaN();
+    return std::fmax(a, b);
 }
 
 int main(int argc, char** argv) {
@@ -68,7 +82,7 @@ int main(int argc, char** argv) {
         for (size_t t = 1; t < ref_gen.size(); ++t) {
             Tensor dc = model.forward({tok}, cont.get());
             Tensor dp = model.forward({tok}, &paged);
-            maxd = std::fmax(maxd, full_maxdiff(dc, dp));
+            maxd = worse(maxd, full_maxdiff(dc, dp));
             tok = argmax_row(dc, 0, vocab);
             got.push_back(tok);
         }
@@ -109,13 +123,37 @@ int main(int argc, char** argv) {
         for (int s = 1; s < split_steps; ++s) {  // decode: sq=1, sk>=512 -> split engages on both paths
             Tensor dc = model.forward({st}, cont2.get());
             Tensor dp = model.forward({st}, &paged2);
-            splitd = std::fmax(splitd, full_maxdiff(dc, dp));
+            splitd = worse(splitd, full_maxdiff(dc, dp));
             st = argmax_row(dc, 0, vocab);
         }
         cuda_policy().use_split_attn = false;
         const bool split_ok = splitd < 1e-4;
         std::printf("flash-decoding: paged-split == contiguous-split max|diff|=%g over %d steps (ctx=%zu)\n",
                     splitd, split_steps, longctx.size());
+
+        // Paged shared-mem K/V tiling (the backlog mirror of G5f-tiled, default at head_dim>=128
+        // since P0): force tiling on (this model may be D=64, where it isn't the default) and re-run
+        // prefill on fresh caches, then a verify-shaped multi-query forward (the S0 primitive: t>1
+        // onto a populated cache at a non-block-aligned offset — the tile gather starts mid-block).
+        // The tiled paged kernel stages the same keys in the same lane order as the non-tiled one,
+        // so BOTH must be bit-identical: paged-tiled == contiguous-tiled in lockstep, and the
+        // paged-tiled prefill == the non-tiled paged prefill logits (lp) from the main run above.
+        cuda_policy().use_tiled_attn = true;
+        std::unique_ptr<KVCacheBase> cont3 = model.make_kv_cache(ids.size() + 16);
+        CudaBlockPool pool3(c.num_layers, c.num_kv_heads, c.head_dim, block_size, num_blocks);
+        CudaPagedKVCache paged3(&pool3);
+        Tensor lc3 = model.forward(ids, cont3.get());
+        Tensor lp3 = model.forward(ids, &paged3);
+        double tiledd = worse(full_maxdiff(lc3, lp3), full_maxdiff(lp3, lp));
+        std::vector<int64_t> vtoks(ids.begin(), ids.begin() + std::min<size_t>(ids.size(), 5));
+        Tensor vc3 = model.forward(vtoks, cont3.get());
+        Tensor vp3 = model.forward(vtoks, &paged3);
+        tiledd = worse(tiledd, full_maxdiff(vc3, vp3));
+        cuda_policy().use_tiled_attn = false;
+        const bool tiled_ok = tiledd == 0.0;
+        std::printf("paged tiled: prefill+verify == contiguous-tiled / == non-tiled paged  "
+                    "max|diff|=%g -> %s\n",
+                    tiledd, tiled_ok ? "BIT-IDENTICAL" : "MISMATCH");
 
         // Rollback (S1): truncate(L) + replay is bit-identical to a cache that only ever decoded
         // the accepted tokens — the same kernels in the same order, so max|diff|==0 even on the
@@ -158,7 +196,7 @@ int main(int argc, char** argv) {
                         rollback_ok ? "BIT-IDENTICAL" : "MISMATCH");
 
             // Paging is pure indexing — same K/V, same order — so expect bit-identical (split path too).
-            const bool ok = maxd < 1e-4 && greedy_ok && split_ok && rollback_ok;
+            const bool ok = maxd < 1e-4 && greedy_ok && split_ok && tiled_ok && rollback_ok;
             std::printf(ok ? "run_cuda_paged: ok\n" : "run_cuda_paged: FAIL\n");
             return ok ? 0 : 1;
         }
