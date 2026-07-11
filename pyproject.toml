@@ -3,6 +3,8 @@ name = "nanoinfer"
 version = "0.1.0"
 description = "A from-scratch LLM inference engine, built for learning."
 requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = [
     "torch>=2.2",
     "transformers>=4.44",
@@ -16,7 +18,7 @@ dev = [
 ]
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]

@@ -892,7 +892,11 @@ lands before the MoE so Granite runs bf16 on GPU from day one; B3 waits for the
 arch churn to settle; G7 is independent filler; A4 is droppable.
 
 ### Engineering periphery (E-track)
-- [ ] **E0** — LICENSE: MIT (decided 2026-07-11).
+- [x] **E0** ✅ landed — MIT `LICENSE` at the repo root (copyright jianglulu, 2026),
+      declared in `pyproject.toml` (PEP 639 SPDX `license = "MIT"` + `license-files`,
+      build requirement bumped to `setuptools>=77`), and a README License section
+      noting the engine code is MIT while HF-downloaded weights/tokenizer configs keep
+      their own licenses and aren't redistributed here.
 - [ ] **E1** — GitHub Actions CI, four jobs, none needing model weights or a GPU
       runtime: (1) *python-oracle* — `pytest -m "not slow"` (the fixture layer tests,
       no download); (2) *cpp-cpu* — CMake + ctest with a new `nomodel` label

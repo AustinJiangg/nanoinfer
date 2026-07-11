@@ -147,3 +147,9 @@ Reading the code or contributing? Three companion docs split the work:
 - **[REFACTOR.md](REFACTOR.md)** — the R-track: paying down the GPU optimization
   arc's exploration-debt (the quant hole, global flags, `#ifdef` scatter) before
   Metal, parity-locked at every step.
+
+## License
+
+[MIT](LICENSE). The engine code is ours; model weights and tokenizer configs are
+downloaded from the Hugging Face Hub under their own licenses (e.g. Qwen2.5 is
+Apache-2.0) and are not redistributed here.
