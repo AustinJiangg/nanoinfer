@@ -777,6 +777,69 @@ Pulled in alongside S whenever the target (1.5B) forward is the bottleneck. Same
         long-context config. Parity spine held (greedy tokens MATCH every context). (BASELINE-1.5b.md §P2
         has the tables + the reproduce line; `NI_PAGED_ONLY=1` skips the doomed contiguous crawl at ctx≥8k.)
 
+## Serving (V-track) — the HTTP last mile
+
+The engine had every serving *mechanism* (continuous batching, paged KV, prefix
+sharing, speculative decode) but no serving *interface*: the schedulers are
+synchronous step machines, driven only by gates and batch CLIs. The V-track adds
+the other half of a serving system — an async request/stream layer and a real HTTP
+front — hand-rolled on stdlib asyncio, zero new dependencies, because here the
+plumbing IS the learning content (SSE framing, incremental detokenization,
+disconnect→cancel, TTFT/TPOT). Same bar as every track: the serving layer must not
+change a token (the run_serve invariant, extended through the asyncio + HTTP seams).
+
+- [x] **V0** — `AsyncEngine` (`python/ni/async_engine.py`), the asyncio bridge. One
+      engine thread drives ANY scheduler with the add/step/has_work/running/finished
+      surface — plain and spec, CPU and CUDA — and the event loop stays live because
+      the heavy C++ calls drop the GIL (F6). Token streaming needs no scheduler hook:
+      after each step the engine DIFFS every live sequence's `output_ids` against what
+      it already published and emits the tail — which keeps the parity-locked
+      schedulers untouched and picks up a spec step's variable 0..k+1 tokens for free.
+      The one scheduler addition is `cancel()` on both (the disconnect path: queued →
+      dropped; running → evicted via `_finish`, KV blocks back to the pool). Per-request
+      TTFT/TPOT wall-clock timing + an aggregate `metrics()` snapshot (percentiles over
+      a bounded history; the engine also reclaims `scheduler.finished` entries once
+      delivered, so a long-lived server doesn't leak them).
+      **Gate** (`tests/python/run_async_serve.py`, CPU + CUDA green): streamed output
+      token-identical to standalone; chunks concatenate exactly; strict one-chunk-per-
+      token incrementality on the plain scheduler; cancel mid-stream → finish_reason
+      "cancelled", the partial output a PREFIX of the standalone reference (greedy
+      determinism), pool fully freed, the batch-mate unaffected; the SpecScheduler
+      (prompt-lookup) driven unchanged; stop() terminates in-flight streams.
+- [x] **V1** — the HTTP/SSE layer: `python/ni/server.py` (hand-rolled asyncio
+      HTTP/1.1, every response Connection: close — no keep-alive state machine),
+      `python/ni/detok.py` (incremental detokenization), `tools/serve_http.py` (the
+      CLI: tokenizer + device + quant + paged/prefix knobs + `--spec lookup|draft`).
+      POST /v1/completions (JSON in; non-stream, or `"stream": true` → one SSE event
+      per token chunk with the text delta, a final usage/timing event, `[DONE]`),
+      GET /metrics, GET /healthz. One endpoint serves both engines — over a
+      SpecScheduler the same route takes proposer/k/ngram knobs (greedy spec rides the
+      argmax accept; temperature>0 becomes S5 rejection sampling). A client disconnect
+      mid-stream cancels through V0, freeing the sequence's blocks immediately.
+      `IncrementalDetokenizer` is the sliding-window algorithm every real engine uses
+      (vLLM/TGI): byte-level BPE tokens can end mid-UTF-8-character, so decode a window
+      anchored before the new ids and HOLD BACK text while it ends in U+FFFD — never
+      emit text that later "changes"; the deltas must concatenate to the one-shot
+      decode exactly.
+      **Gate** (`tests/python/run_http_serve.py`, CPU + CUDA green, hermetic ids-only):
+      completions == standalone through the full HTTP path; concurrent mixed SSE/plain
+      requests all MATCH (HTTP concurrency → one batched engine); malformed requests →
+      4xx, never a hang; disconnect → cancelled + pool freed + the server keeps serving
+      correctly; detok exact under the worst case (a byte-per-token stub splits every
+      multibyte char). curl smoke on CUDA: the text path returns the golden " Paris…"
+      completion; `--spec lookup` serves the token-identical stream.
+- [x] **V2** — the serving measurement (`bench/bench_http.py`, measures-not-gates):
+      closed-loop load through the real HTTP stack — C clients each posting and
+      awaiting completions until N requests drain; sweeping C traces the
+      throughput–latency curve serving systems live on. 0.5B fp32, paged bs=16,
+      32 tok/req (ignore_eos pins the length so levels compare):
+      **CUDA 4070S — 1→16 clients: 99 → 329 tok/s aggregate (3.3×), TPOT p50 10 → 44 ms,
+      TTFT p50 13 → 170 ms; the knee is ~c=8** (8→16 buys +11% throughput for +80%
+      TPOT — past the knee added concurrency is pure queueing). **CPU 20-core — 11 → 29
+      tok/s, knee ~c=4** (the F8a batched-decode ceiling). This is F8a restated through
+      the serving lens: continuous batching buys aggregate throughput by spending
+      per-request latency, and the knee is where the trade stops paying.
+
 ## Cross-platform (portability proof, after the GPU is learned)
 - [x] **NEON** — `simd.hpp`'s `#elif` path now carries the three inner products on aarch64
       (Apple M-series), so `CpuBackend` runs on Apple ARM. `dot_f32`/`dot_qf32` widen each

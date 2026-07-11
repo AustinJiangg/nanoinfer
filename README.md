@@ -91,7 +91,8 @@ tests/            pytest for the oracle
 cpp/              the C++/CUDA engine (see cpp/README.md for its layout)
   src/            C++ core + src/cuda/ backend (the `nicore` kernels)
   bindings/       nicpp — the pybind11 seam
-  python/ni/      Python orchestration: scheduler, speculative, spec_scheduler
+  python/ni/      Python orchestration: scheduler, speculative, spec_scheduler,
+                  async_engine + server + detok (HTTP serving)
   tools/          weight export, reference dump, generate/serve CLIs
   tests/          C++ parity tests (ctest); tests/python/ = Python parity gates
   bench/          performance benches
@@ -127,6 +128,9 @@ C++/CUDA engine — built on our own kernels:
 - [x] **NEON** — the CPU backend cross-compiles and runs on Apple ARM (op-level parity)
 - [x] **P-track** — perf retune for Qwen2.5-1.5B (P0 tiling default + wmma re-bench, P1 quant ROI /
       fp16-default, P2 long-context: Flash-Decoding + paging un-muted, paged+split up to 18.9× e2e)
+- [x] **V-track** — HTTP serving: an asyncio engine bridge over the schedulers (plain AND spec),
+      a hand-rolled HTTP/1.1 + SSE server with incremental detokenization, disconnect→cancel,
+      TTFT/TPOT metrics, and a closed-loop load bench (`tools/serve_http.py`)
 - [ ] **Metal** — a third backend on the M4 GPU (deferred; structurally prepped)
 
 ## Development

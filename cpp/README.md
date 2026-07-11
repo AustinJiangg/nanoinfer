@@ -68,9 +68,11 @@ cpp/
   bindings/      nicpp.cpp — the pybind11 module (the .so lands in the build dir)
   python/ni/     the Python orchestration package: engine (nicpp discovery),
                  scheduler (F7/F8 continuous batching), speculative +
-                 spec_scheduler (S-track), nit0 (the parity file formats)
+                 spec_scheduler (S-track), async_engine + server + detok
+                 (V-track HTTP serving), nit0 (the parity file formats)
   tools/         entry scripts: export_weights, dump_reference, gen_fixtures,
-                 generate (single-prompt CLI), serve (multi-prompt CLI)
+                 generate (single-prompt CLI), serve (multi-prompt CLI),
+                 serve_http (the HTTP server CLI)
   tests/         C++ unit + parity tests (wired into ctest) + test_util/parity_util
   tests/python/  the Python parity gates (run as scripts) + gateutil
   bench/         performance benches, C++ and Python — they measure, they don't gate
@@ -298,6 +300,33 @@ paged attention), parity-locked end to end. On the backlog (open, not deferred-f
 in Python). The true int8×int8→int32 GEMM landed on the GPU side as W8A8 (DP4A decode
 GEMV + lm_head prefill — see docs/BASELINE.md); the CPU's C4 quant stays weight-only.
 
+### HTTP serving (V-track)
+
+The serving last mile: `AsyncEngine` (`python/ni/async_engine.py`) bridges asyncio to
+the schedulers — one engine thread steps the batch (the C++ forwards drop the GIL, so
+the event loop stays live) and streams each request's tokens by diffing `output_ids`
+per step, which is what makes it scheduler-agnostic: the same engine drives the plain
+`Scheduler` and the `SpecScheduler`, CPU or CUDA. On top, `python/ni/server.py` is a
+hand-rolled HTTP/1.1 + SSE server (stdlib only, deliberately — the plumbing is the
+lesson): `POST /v1/completions` (JSON in, tokens/text out; `"stream": true` for SSE
+with incremental detokenization — `ni/detok.py`, the vLLM-style sliding window that
+holds back split UTF-8), `GET /metrics` (TTFT/TPOT percentiles, throughput, queue
+gauges), `GET /healthz`. A mid-stream client disconnect cancels the request and its
+KV blocks return to the pool.
+
+```bash
+# serve over HTTP (paged KV; add --device cuda / --spec lookup|draft as needed)
+python tools/serve_http.py --block-size 16 --num-blocks 256 --port 8000
+curl -s  localhost:8000/v1/completions -d '{"prompt": "The capital of France is"}'
+curl -sN localhost:8000/v1/completions \
+    -d '{"prompt": "Once upon a time", "max_tokens": 48, "stream": true}'
+# gates: the serving layer must not change a token (both CPU + CUDA green)
+python tests/python/run_async_serve.py    # V0: the asyncio seam
+python tests/python/run_http_serve.py     # V1: end-to-end through real HTTP
+# the throughput/latency curve (V2): sweep closed-loop client concurrency
+python bench/bench_http.py --device cuda --concurrency 1,4,8,16
+```
+
 ## Performance (C5: SIMD + threads)
 
 The hot kernels (`linear`, the quant linears, attention) reduce through the AVX2/FMA
@@ -384,7 +413,9 @@ The tracks beyond this list — **G0–G6** (the CUDA backend: full GPU forward,
 attention, tuned GEMM / FlashAttention / Flash-Decoding, CUDA graphs), **S0–S5**
 (speculative decoding: draft-model + prompt-lookup proposers, KV rollback, batching
 integration, rejection sampling), **P0–P2** (the 1.5B perf retune), **R0–R5** (the
-structural refactor), and **NEON** — are all landed; the parent
+structural refactor), **NEON**, and **V0–V2** (HTTP serving: the asyncio engine
+bridge, the HTTP/SSE server + incremental detok, the serving load bench) — are all
+landed; the parent
 [ROADMAP.md](../ROADMAP.md) documents each stage (plan + journey) and
 [REFACTOR.md](../REFACTOR.md) the R-track. Their frozen parity/perf numbers live in
 [docs/BASELINE.md](docs/BASELINE.md) and [docs/BASELINE-1.5b.md](docs/BASELINE-1.5b.md).
