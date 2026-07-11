@@ -871,6 +871,157 @@ stages the paydown (R0–R5) — parity-locked, the same `max|diff|=0` + golden-
 discipline as the feature stages — *before* Metal, since Metal on today's structure
 would replicate the debt a third time. The refactor is Metal's prerequisite.
 
+## Next phase (set 2026-07-11) — E / A / B / G7
+
+With the V-track done and Metal still hardware-blocked, the next phase pulls four
+threads: engineering periphery (E), **new architectures (A — the centerpiece)**,
+bf16 / low-precision (B), and the G6 graph tails (G7). Model research (2026-07-11)
+fixed the A lineup against this box's real ceilings (15 GB RAM → the fp32 CPU
+oracle caps at ~1.7B total params; 12 GB VRAM). The newest small models were
+screened and the hybrids excluded on honest grounds: **Qwen3.5-0.8B/2B** (2026-03)
+is a Gated-DeltaNet linear-attention hybrid + natively multimodal — a
+recurrent-state kernel is its own future track (the H-track candidate), not a
+Llama-family increment; **Gemma 4 E2B** (2026-04) needs Per-Layer Embeddings and
+outgrows the oracle; **OLMoE-1B-7B** (7B total = fp32 28 GB) and **Nemotron Nano**
+(Mamba hybrid) don't fit the discipline. What remains is a clean architecture
+ladder — QK-Norm → RoPE scaling → MoE → sliding window — that all fits the oracle.
+
+Suggested order: **E → A0+A1 → A2 → B1+B2 → A3 → B3 → G7 → A4 → (B4 anytime)**.
+CI first protects everything after; Qwen3 exercises A0 on the smallest delta; bf16
+lands before the MoE so Granite runs bf16 on GPU from day one; B3 waits for the
+arch churn to settle; G7 is independent filler; A4 is droppable.
+
+### Engineering periphery (E-track)
+- [ ] **E0** — LICENSE: MIT (decided 2026-07-11).
+- [ ] **E1** — GitHub Actions CI, four jobs, none needing model weights or a GPU
+      runtime: (1) *python-oracle* — `pytest -m "not slow"` (the fixture layer tests,
+      no download); (2) *cpp-cpu* — CMake + ctest with a new `nomodel` label
+      (test_tensor/ops/quant/simd/cache/io run on gen_fixtures output; the
+      NIT0-needing gates get a `model` label, excluded in CI); (3) *neon-qemu* — the
+      aarch64 cross-compile + qemu run of test_simd/test_ops/test_quant (the NEON
+      recipe, moved into CI); (4) *cuda-build-only* — compile `nicore` in an
+      nvidia/cuda devel container (free runners have no GPU; build-breakage detection
+      is the maximum available protection).
+- [ ] **E2** — write the tiered gate into CLAUDE.md: CI = unit + fixture parity;
+      local pre-commit = the full golden-token gates. (Already the practice — make it
+      written.)
+
+### New architectures (A-track) — generalize the engine beyond Qwen2.5
+
+Principle: **feature flags, not a class hierarchy** (the llama.cpp shape). All four
+targets are Llama-family variants — differences are local features, so one forward
+with config-driven branches keeps the single attention/cache/scheduler codebase;
+MoE swaps only the FFN. Oracle policy amended: the Python engine goes from "frozen"
+to **frozen per parity-locked model** — a new arch is implemented in the Python
+oracle first (the cheapest place to learn it), parity-locked vs HF, then frozen
+again; the HF → Python → C++ CPU → CUDA chain is unchanged. The uniform per-model
+gate recipe: (1) HF → Python oracle, fp32 logits allclose + greedy token-for-token;
+(2) NIT0 v2 export → C++ CPU, logits ~1e-5 + greedy golden; (3) CUDA, tolerance +
+golden tokens; (4) serving, run_serve / run_spec_serve / HTTP smoke;
+(5) dump_reference goldens + a BASELINE-{model}.md.
+
+- [ ] **A0** — the architecture-description layer (shared infra; a pure refactor for
+      Qwen2.5). Config fields (Python ModelConfig + C++ Config + NIT0 header v2 —
+      versioned, still reads v1): `qkv_bias` (Qwen2.5 true, all others false),
+      `qk_norm` (Qwen3/Gemma3), explicit `head_dim` (decoupled from hidden/n_heads),
+      `rope_scaling` (none | llama3{factor, low_freq, high_freq, orig_max_pos}),
+      `act_fn` (silu | gelu), muP-style scalars defaulting to identity
+      (embedding_multiplier, attention_scale, residual_multiplier, logits_scaling),
+      the MoE block (`n_experts` — 0 = dense, `top_k`, `moe_ffn_dim`), and the
+      sliding-window pair (`sliding_window`, `sliding_pattern`). Weight-name maps
+      become a small registry keyed by HF `model_type` in weights.py /
+      export_weights.py (still the only place that knows HF names). **Done when:**
+      the Qwen2.5 full chain regresses bit-identical (the G0 bar: zero behavior
+      change).
+- [ ] **A1** — **Qwen3-0.6B + 1.7B** (2025-04, Apache 2.0): the smallest delta.
+      (1) QK-Norm — per-head RMSNorm over head_dim on Q and K, post-projection,
+      pre-RoPE, own weights; near-zero new kernel code (reshape to tokens·heads rows
+      and drive the existing rmsnorm op/kernel); (2) no QKV bias; (3) explicit
+      head_dim=128 — on 0.6B q_proj is 1024→2048, NOT square, flushing any hidden
+      `n_heads·head_dim == hidden` assumption; (4) rope_theta 1e6; vocab identical to
+      Qwen2.5 (151936). 1.7B fp32 = 6.8 GB — AT the oracle RAM ceiling; the fallback
+      is tensor-streaming export (never HF + fp32 copies co-resident). **Bonus:** a
+      new spec pair — 0.6B draft / 1.7B target, same tokenizer, r≈0.35 vs today's
+      0.45 — rerun bench_spec unchanged and check S2's "r is the binding constraint"
+      curve against a second data point.
+- [ ] **A2** — **Llama-3.2-1B** (Meta 2024-09): the config-heavy rung, cheap after
+      A1. (1) llama3 rope scaling — scale inv_freq in three frequency bands at LOAD
+      time (low ÷ factor 32, high untouched, smooth ramp between); the RoPE kernel is
+      untouched — config-time resolution, the rope_theta lesson applied forward;
+      (2) vocab 128256, a tiktoken-family BPE with different space handling → add a
+      Llama tokenizer case to the incremental-detok gate (V1's algorithm must prove
+      tokenizer-generic); (3) tied embeddings (already supported). 16 layers, 32 Q /
+      8 KV heads, head_dim 64, fp32 4.9 GB. License note: Llama Community License,
+      not Apache — fine locally; don't redistribute weights or goldens' text.
+- [ ] **A3** — **Granite-3.1-1B-A400M** (IBM 2024-12, Apache 2.0): the MoE rung, the
+      phase's biggest new code. 1.3B total / 400M active, 32 experts top-8, SwiGLU
+      experts (moe_ffn 512), GQA 16/8, fp32 5.2 GB — the only standard-transformer
+      MoE that fits the oracle. MoE replaces the FFN ONLY: attention, all four
+      caches, scheduler, spec, HTTP work day one. New concepts: the router linear
+      [hidden→32] + top-8 + softmax over the selected (exact HF GraniteMoe semantics
+      locked by PARITY, not docs); HF stores experts FUSED (input_linear
+      [E, 2·ffn, hidden] = gate+up) — export unfuses to per-expert names; the muP
+      scalars earn their A0 fields. CPU forward: decode (m=1) loops the 8 chosen
+      experts; prefill groups tokens BY EXPERT — gather rows per expert, one GEMM per
+      expert per projection (each expert's weight streamed once, the C5 lever; the
+      ragged grouping is forward_spec_batch's shape — the lesson transfers). CUDA
+      staged: correctness first (gather/scatter + reuse the existing linear kernels
+      per active expert), grouped-GEMM optimization second; quant = a per-expert
+      QuantizedWeight, the Q8/W8A8 interface unchanged. Extra gates: expert-grouped
+      prefill == per-token loop bit-identical (CPU); router top-k determinism.
+- [ ] **A4** — **Gemma-3-1B** (Google 2025-03): the stretch rung, LAST, droppable. A
+      genuinely different attention shape: 5:1 sliding(1024)/global layer interleave,
+      dual rope theta (local 10k / global 1M), QK-Norm, sandwich norms (pre+post),
+      GeGLU, 262K vocab. Scope decision (simple first): v1 = a windowed MASK over the
+      full cache (attend sees the last W keys — mask-only change, paged read path
+      untouched); v2 = true windowed eviction on the paged cache (local layers' KV
+      becomes O(W), the actual memory point) only if v1 lands cleanly.
+
+### Low precision (B-track) — bf16 + the accumulation ladder
+- [ ] **B1** — bf16 weight storage. DType::BF16 + __nv_bfloat16 instantiations of
+      the dtype-templated kernels (gemv/tiled — templated since the fp16 work) + the
+      embedding gather. Why bf16 isn't fp16 again: checkpoints SHIP bf16 (fp32's
+      exponent range, no overflow risk), so bf16 storage is byte-exact to the shipped
+      weights — one rounding step removed entirely; NIT0 keeps raw bf16 bytes (file +
+      load RAM halve — cracks the door to 3B-class GPU-only models). The CPU oracle
+      converts to fp32 at load; the fp32 spine is untouched.
+- [ ] **B2** — wmma fp32 accumulators, re-measured. G5d's wmma accumulated in fp16
+      (err 8e-3); switch to fragment<accumulator, float> for fp16 AND bf16 inputs
+      (bf16 wmma mandates fp32 accum anyway). Honest expectation: GeForce halves
+      fp32-accum tensor throughput vs fp16-accum (deliberate segmentation), so the
+      lm_head's 105%-of-cuBLAS may drop to ~50–60% and tie the fp32 tiled kernel —
+      measure and record either way (the G5f-tiled discipline).
+- [ ] **B3a** — half-precision KV cache (the real payoff; smallest blast radius
+      first). Cast K/V to bf16 at write; attend converts to fp32 in registers
+      (softmax/accumulate stay fp32). Long-context decode is KV-bandwidth-bound (P2),
+      so halved KV bytes target ~1.3–1.8× — AND max context/batch doubles, stacking
+      with paged+split. The tolerance bar is re-measured per-op; comparisons stay
+      NaN-aware (the G5f lesson).
+- [ ] **B3b** — half-precision hidden states: activations bf16 between ops, fp32
+      accumulation inside the GEMM/norm/softmax reductions; the residual stream
+      measured both ways (fp32 vs bf16 residual), the golden gate decides. The
+      GPU-vs-CPU tolerance ladder is re-calibrated and recorded; the CPU fp32 oracle
+      chain is unchanged.
+- [ ] **B4** — CPU f32-accum SIMD dot, opt-in (NI_F32_ACC, default OFF — double-accum
+      stays the bit-exact default). 8-wide fp32 FMA vs today's 4-wide double: measure
+      prefill (decode is memory-bound — expect ~nil). The deliverable IS the lesson:
+      what bit-exactness costs, stated by measurement.
+
+### CUDA graphs, the batched/split tail (G7)
+- [ ] **G7a** — graphs over batched decode: forward_batch's grid varies with batch
+      size N → a per-N graph cache (capture on first sight; N changes only on
+      admit/evict, so re-capture amortizes — vLLM's bucketing).
+- [ ] **G7b** — graphs + split-KV: the split grid grows with context → a fixed
+      max-split grid, each block self-limits from the device-read length; surplus
+      splits write empty partials (m=−inf, l=0) — the combine already handles empties
+      (the G5f NaN fix pays forward); the combine reads the live split count from
+      device.
+- [ ] **G7c** — the int8-embed gather under graph: route the Q8 gather through the
+      g_cuda_graph_token device-token path (the fp32/fp16 gathers already have it).
+      Gates as G6: graph == eager bit-identical per path; an honest A/B across a
+      context sweep — expect the win where decode is launch-bound (batched, short
+      ctx), the exposed-fraction lesson in hand.
+
 ## Backlog (pull in when the moment fits)
 Open candidates, not a closed/deferred-forever list — fold one into a stage when it's
 the right moment:

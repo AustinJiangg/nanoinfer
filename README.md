@@ -132,6 +132,9 @@ C++/CUDA engine — built on our own kernels:
       a hand-rolled HTTP/1.1 + SSE server with incremental detokenization, disconnect→cancel,
       TTFT/TPOT metrics, and a closed-loop load bench (`tools/serve_http.py`)
 - [ ] **Metal** — a third backend on the M4 GPU (deferred; structurally prepped)
+- [ ] **Next phase (E/A/B/G7)** — MIT license + CI; new architectures (Qwen3, Llama-3.2-1B,
+      Granite-1B-A400M MoE, Gemma-3-1B); bf16 + half-precision KV/activations; batched/split
+      CUDA graphs — see the "Next phase" section in ROADMAP.md
 
 ## Development
 
