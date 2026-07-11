@@ -344,6 +344,24 @@ class Scheduler:
         self.peak_batch = max(self.peak_batch, len(self.running))
         self.steps += 1
 
+    def cancel(self, request_id: str) -> bool:
+        """Abort a request wherever it is (the serving layer's disconnect path).
+        Queued: drop it, finishing it with an empty output. Running: evict it now
+        — _finish frees its KV (paged: the blocks return to the pool for the next
+        admit) and records the partial output in `finished`. Already finished (or
+        unknown): no-op. Returns True if it was live when cancelled."""
+        for r in self.waiting:
+            if r.request_id == request_id:
+                self.waiting.remove(r)
+                self.finished[request_id] = []
+                return True
+        for seq in self.running:
+            if seq.req.request_id == request_id:
+                self._finish(seq)
+                self.running = [s for s in self.running if s.state is State.RUNNING]
+                return True
+        return False
+
     def run(self) -> dict[str, list[int]]:
         """Drive all queued requests to completion; return {request_id: output_ids}."""
         while self.has_work():
