@@ -37,7 +37,22 @@ struct RopeCache {
     Tensor cos;
     Tensor sin;
 };
-RopeCache build_rope_cache(int64_t seq_len, int64_t head_dim, float theta);
+
+// Optional RoPE frequency scaling resolved at build time (A2 Llama-3.2). When
+// `enabled`, the base inv_freq is rescaled in three frequency bands before the
+// cos/sin table is built — the rotation (apply_rope) is unchanged, the same
+// "fix the frequencies at load, not the hot path" lesson as rope_theta. Kept a
+// plain-double struct here so ops stays independent of config.hpp's enum; the
+// model maps its Config's RopeScaling::Llama3 onto this. Defaults = disabled.
+struct RopeScalingParams {
+    bool enabled = false;
+    double factor = 1.0;
+    double low_freq_factor = 1.0;
+    double high_freq_factor = 4.0;
+    double orig_max_pos = 0.0;
+};
+RopeCache build_rope_cache(int64_t seq_len, int64_t head_dim, float theta,
+                           RopeScalingParams scaling = {});
 
 // Apply RoPE to a [heads, seq, head_dim] tensor (batch-1). cos/sin are
 // [>=pos_offset+seq, head_dim]; token i in x is at absolute position

@@ -54,7 +54,16 @@ Model::Model(const std::string& weights_dir, QuantMode mode, Device device, Back
     if (w_.empty()) throw std::runtime_error("Model: no .bin weights in " + weights_dir);
 
     // Build the RoPE tables once for the full context; forward slices them.
-    rope_ = build_rope_cache(cfg_.max_position_embeddings, cfg_.head_dim, cfg_.rope_theta);
+    // A2: a llama3-scaled config rescales inv_freq here, at build time — the
+    // apply_rope kernel is untouched (config-time resolution, the rope_theta lesson).
+    RopeScalingParams rope_scaling;
+    if (cfg_.rope_scaling == RopeScaling::Llama3) {
+        rope_scaling = {/*enabled=*/true, cfg_.rope_scaling_factor,
+                        cfg_.rope_scaling_low_freq, cfg_.rope_scaling_high_freq,
+                        double(cfg_.rope_scaling_orig_max_pos)};
+    }
+    rope_ = build_rope_cache(cfg_.max_position_embeddings, cfg_.head_dim, cfg_.rope_theta,
+                             rope_scaling);
 
     if (mode != QuantMode::None) {
         std::vector<std::string> names;

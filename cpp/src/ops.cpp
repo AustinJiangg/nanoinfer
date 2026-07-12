@@ -99,7 +99,27 @@ Tensor mul(const Tensor& a, const Tensor& b) {
     return out;
 }
 
-RopeCache build_rope_cache(int64_t seq_len, int64_t head_dim, float theta) {
+// llama3 (A2): rescale one base inv_freq value into its scaled counterpart. Long
+// wavelengths (low freq) are divided by `factor`, short ones (high freq) kept, and
+// the band between blends smoothly — mirrors HF's _compute_llama3_parameters and the
+// Python oracle's _apply_rope_scaling exactly (the branch order matches the numpy
+// where()s: > low_wl first, then < high_wl, else the medium blend).
+static double llama3_scale_inv_freq(double inv_freq, const RopeScalingParams& s) {
+    // 2*pi, matching the Python oracle's math.pi (M_PI is not guaranteed under
+    // -std=c++17 / the aarch64 cross-build's strict-ANSI mode).
+    constexpr double kTwoPi = 6.283185307179586;
+    const double low_wl = s.orig_max_pos / s.low_freq_factor;
+    const double high_wl = s.orig_max_pos / s.high_freq_factor;
+    const double wavelen = kTwoPi / inv_freq;
+    if (wavelen > low_wl) return inv_freq / s.factor;   // low freq: stretch
+    if (wavelen < high_wl) return inv_freq;             // high freq: keep
+    const double smooth = (s.orig_max_pos / wavelen - s.low_freq_factor) /
+                          (s.high_freq_factor - s.low_freq_factor);
+    return (1.0 - smooth) * inv_freq / s.factor + smooth * inv_freq;  // medium: blend
+}
+
+RopeCache build_rope_cache(int64_t seq_len, int64_t head_dim, float theta,
+                           RopeScalingParams scaling) {
     require(head_dim % 2 == 0, "rope head_dim must be even");
     const int64_t half = head_dim / 2;
     Tensor cos({seq_len, head_dim});
@@ -107,8 +127,9 @@ RopeCache build_rope_cache(int64_t seq_len, int64_t head_dim, float theta) {
     for (int64_t p = 0; p < seq_len; ++p) {
         for (int64_t i = 0; i < half; ++i) {
             // inv_freq_i = theta^(-(2i)/head_dim); angle = position * inv_freq.
-            const double inv_freq =
+            double inv_freq =
                 1.0 / std::pow(double(theta), double(2 * i) / double(head_dim));
+            if (scaling.enabled) inv_freq = llama3_scale_inv_freq(inv_freq, scaling);
             const double angle = double(p) * inv_freq;
             const float c = float(std::cos(angle));
             const float s = float(std::sin(angle));
