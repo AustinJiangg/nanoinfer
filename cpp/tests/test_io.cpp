@@ -1,5 +1,6 @@
 // Error-path tests for the config parser and tensor IO guards (added after a
 // review flagged silent failure on malformed config / corrupt .bin files).
+#include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <string>
@@ -64,7 +65,53 @@ int main() {
     }
     CHECK(throws([&] { ni::load_bin(bin); }));
 
-    for (const auto& p : {ok, bad, nd, bin}) std::remove(p.c_str());
+    // NIT1 (B1): a bf16 payload inflates to fp32 exactly (bits << 16). Hand-write the file —
+    // C++ save_bin deliberately only writes NIT0; the bf16 writer is Python-side (ni/nit0.py).
+    const std::string bin1 = "io_t1.bin";
+    {
+        std::ofstream f(bin1, std::ios::binary);
+        f.write("NIT1", 4);
+        const int32_t dtype = 1, ndim = 1, dim = 3;
+        f.write(reinterpret_cast<const char*>(&dtype), 4);
+        f.write(reinterpret_cast<const char*>(&ndim), 4);
+        f.write(reinterpret_cast<const char*>(&dim), 4);
+        // bf16 bit patterns: 1.0 = 0x3F80, -2.5 = 0xC020, 0.0 = 0x0000 (fp32's top halves).
+        const uint16_t payload[3] = {0x3F80, 0xC020, 0x0000};
+        f.write(reinterpret_cast<const char*>(payload), sizeof(payload));
+    }
+    ni::Tensor rb = ni::load_bin(bin1);
+    CHECK(rb.numel() == 3);
+    CHECK(rb[0] == 1.0f && rb[1] == -2.5f && rb[2] == 0.0f);  // exact, not approximate
+
+    // A NIT1 header with an unknown dtype is rejected, not misread as shape.
+    const std::string bin2 = "io_t2.bin";
+    {
+        std::ofstream f(bin2, std::ios::binary);
+        f.write("NIT1", 4);
+        const int32_t dtype = 7, ndim = 1, dim = 1;
+        f.write(reinterpret_cast<const char*>(&dtype), 4);
+        f.write(reinterpret_cast<const char*>(&ndim), 4);
+        f.write(reinterpret_cast<const char*>(&dim), 4);
+        const float v = 1.0f;
+        f.write(reinterpret_cast<const char*>(&v), 4);
+    }
+    CHECK(throws([&] { ni::load_bin(bin2); }));
+
+    // A truncated bf16 payload is a short read, not silent garbage.
+    const std::string bin3 = "io_t3.bin";
+    {
+        std::ofstream f(bin3, std::ios::binary);
+        f.write("NIT1", 4);
+        const int32_t dtype = 1, ndim = 1, dim = 4;
+        f.write(reinterpret_cast<const char*>(&dtype), 4);
+        f.write(reinterpret_cast<const char*>(&ndim), 4);
+        f.write(reinterpret_cast<const char*>(&dim), 4);
+        const uint16_t payload[2] = {0x3F80, 0x3F80};  // 2 of the declared 4 elements
+        f.write(reinterpret_cast<const char*>(payload), sizeof(payload));
+    }
+    CHECK(throws([&] { ni::load_bin(bin3); }));
+
+    for (const auto& p : {ok, bad, nd, bin, bin1, bin2, bin3}) std::remove(p.c_str());
     std::printf(g_failures ? "test_io: %d failures\n" : "test_io: ok\n", g_failures);
     return g_failures ? 1 : 0;
 }

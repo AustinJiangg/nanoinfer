@@ -5,7 +5,12 @@ state-dict tensor as `<name>.bin` plus a `config.txt`. The C++ Model reads this
 directory directly, so both engines run the *same* Qwen2.5 tensors and their
 logits can be compared (see cpp/tools/dump_reference.py + cpp/tests/run_parity).
 
-Usage:  python export_weights.py <out_dir> [model_name]
+Usage:  python export_weights.py <out_dir> [model_name] [dtype]
+dtype: fp32 (default; NIT0, byte-identical to pre-B1 exports) or bf16 (B1; NIT1,
+half the file). bf16 is verified LOSSLESS per tensor before use: checkpoints ship
+bf16 and our fp32 load is an exact upcast, so the round-trip must reproduce the
+fp32 bytes — any tensor that doesn't (a genuinely-fp32 source) stays fp32 in the
+export, and the C++/Python loaders read the mixed directory transparently.
 The fp32 export is ~2 GB; the directory is gitignored.
 """
 
@@ -14,8 +19,10 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
-from ni.nit0 import save_bin  # noqa: E402
+from ni.nit0 import bf16_bits_to_f32, f32_to_bf16_bits, save_bin  # noqa: E402
 
 
 def _write_rope_scaling(f, rope_scaling) -> None:
@@ -44,6 +51,9 @@ def _write_rope_scaling(f, rope_scaling) -> None:
 def main() -> None:
     out = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("weights/qwen2.5-0.5b")
     model_name = sys.argv[2] if len(sys.argv) > 2 else "Qwen/Qwen2.5-0.5B"
+    dtype = sys.argv[3] if len(sys.argv) > 3 else "fp32"
+    if dtype not in ("fp32", "bf16"):
+        raise SystemExit(f"export: dtype must be fp32 or bf16, got {dtype!r}")
     out.mkdir(parents=True, exist_ok=True)
 
     import torch
@@ -93,6 +103,9 @@ def main() -> None:
 
     sd = model.state_dict()
     count = 0
+    n_bf16 = 0
+    n_kept_f32 = 0
+    total_bytes = 0
     for name, t in sd.items():
         if name.startswith("rope_"):  # non-persistent buffers; skip if ever present
             continue
@@ -101,9 +114,23 @@ def main() -> None:
         if name == "lm_head.weight" and cfg.tie_word_embeddings:
             continue
         assert t.dtype == torch.float32, f"{name} is {t.dtype}, expected float32"
-        save_bin(out / f"{name}.bin", t.detach().cpu().numpy())
+        arr = t.detach().cpu().numpy()
+        tensor_dtype = "f32"
+        if dtype == "bf16":
+            # Lossless gate: bf16 is only used when the fp32 round-trips exactly (true for
+            # every tensor of a bf16-shipped checkpoint — our fp32 is its exact upcast).
+            # A genuinely-fp32 tensor would lose bits, so it stays f32 (NIT0) in the export.
+            if np.array_equal(bf16_bits_to_f32(f32_to_bf16_bits(arr)).reshape(arr.shape), arr):
+                tensor_dtype = "bf16"
+                n_bf16 += 1
+            else:
+                n_kept_f32 += 1
+        save_bin(out / f"{name}.bin", arr, dtype=tensor_dtype)
+        total_bytes += (out / f"{name}.bin").stat().st_size
         count += 1
-    print(f"wrote {count} weight tensors + config.txt to {out}")
+    detail = f" ({n_bf16} bf16, {n_kept_f32} kept f32)" if dtype == "bf16" else ""
+    print(f"wrote {count} weight tensors{detail} + config.txt to {out} "
+          f"({total_bytes / 1e6:.0f} MB)")
 
 
 if __name__ == "__main__":

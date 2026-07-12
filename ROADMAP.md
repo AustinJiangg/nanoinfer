@@ -1033,13 +1033,32 @@ golden tokens; (4) serving, run_serve / run_spec_serve / HTTP smoke;
       becomes O(W), the actual memory point) only if v1 lands cleanly.
 
 ### Low precision (B-track) — bf16 + the accumulation ladder
-- [ ] **B1** — bf16 weight storage. DType::BF16 + __nv_bfloat16 instantiations of
-      the dtype-templated kernels (gemv/tiled — templated since the fp16 work) + the
-      embedding gather. Why bf16 isn't fp16 again: checkpoints SHIP bf16 (fp32's
-      exponent range, no overflow risk), so bf16 storage is byte-exact to the shipped
-      weights — one rounding step removed entirely; NIT0 keeps raw bf16 bytes (file +
-      load RAM halve — cracks the door to 3B-class GPU-only models). The CPU oracle
-      converts to fp32 at load; the fp32 spine is untouched.
+- [x] **B1** ✅ landed — bf16 weight storage, in two halves. **(1) Kernels:** DType::BF16 +
+      `to_device_bf16` (RNE convert-on-upload) + __nv_bfloat16 instantiations of the
+      dtype-templated kernels through the same ldf/load4 loaders fp16 uses — GEMV (decode),
+      float4 tiled (aligned prefill, incl. the lm_head until B2's bf16 wmma), the scalar
+      tiled kernel newly templated as the ragged fallback (fp32 compute — TIGHTER than
+      fp16's wmma-h fallback), and the embedding gather. `BackendConfig::bf16_weights`,
+      exclusive with fp16_weights (make_backend rejects both). **The headline proof —
+      "byte-exact to the checkpoint" held to the last digit:** on Qwen2.5-0.5B (ships
+      bf16 → our fp32 export is its exact upcast → RNE f32→bf16 inverts it exactly), the
+      GPU bf16 model's logits diff vs the fp32 ref is **3.76701e-05 — IDENTICAL to the
+      fp32-GPU run's own diff** (the kernels compute in fp32 on the same weight values),
+      where fp16 shifts it to 4.10e-5. Storage 1979 → 991 MB (2.00×), golden greedy MATCH.
+      test_cuda: the bf16 kernel errors on RANDOM (non-bf16-representable) weights land
+      exactly at theory — gemv-b 5.7e-2 ≈ 8-10× gemv-h's 5.9e-3, embed-bf16 = 8.0× the fp16
+      table (the 3 mantissa bits). **(2) NIT1 format:** the .bin container gains a
+      dtype-tagged sibling (magic "NIT1" | dtype 0=f32/1=bf16 | ndim | shape | payload);
+      NIT0 stays byte-identical for existing exports, and C++ save_bin still writes NIT0.
+      `export_weights.py <dir> <model> bf16` writes bf16 payloads gated by a PER-TENSOR
+      lossless round-trip check (a genuinely-fp32 tensor stays f32 in a mixed dir; on
+      0.5B all 290/290 pass — the checkpoint is fully bf16) → file 1.9 GB → 947 MB. Both
+      loaders (serialize.cpp / nit0.py) inflate bf16→fp32 (bits<<16, exact), so the CPU
+      oracle is untouched: run_parity on the bf16 export prints max|diff|=4.24385e-05 /
+      mean=4.79201e-06 — the fp32 export's numbers TO THE DIGIT — and every golden gate
+      (run_generate, run_cuda_parity, cache/paged/batch, serve/spec/http) passes against
+      it unchanged. Load RAM: the host map still inflates to fp32 (the 3B-class
+      stream-on-load tail stays open — noted for when a 3B target actually exists).
 - [ ] **B2** — wmma fp32 accumulators, re-measured. G5d's wmma accumulated in fp16
       (err 8e-3); switch to fragment<accumulator, float> for fp16 AND bf16 inputs
       (bf16 wmma mandates fp32 accum anyway). Honest expectation: GeForce halves
