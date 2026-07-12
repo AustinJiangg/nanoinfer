@@ -5,10 +5,13 @@ slow test loads a small HF checkpoint and parity-checks our forward pass against
 HF's — that's the real correctness guarantee for stage 0.
 """
 
+from dataclasses import replace
+
 import torch
 
 from nanoinfer.config import ModelConfig
 from nanoinfer.layers import (
+    Attention,
     RMSNorm,
     SwiGLU,
     TransformerBlock,
@@ -88,6 +91,33 @@ def test_transformer_block_shape():
     x = torch.randn(2, 8, cfg.hidden_size)
     out = block(x, cos[:8], sin[:8])
     assert out.shape == x.shape
+
+
+def test_qk_norm_default_off():
+    # Qwen2.5 default: qk_norm False -> no q_norm/k_norm submodules, no new params.
+    attn = Attention(tiny_cfg())
+    assert attn.q_norm is None and attn.k_norm is None
+
+
+def test_qk_norm_builds_and_is_live():
+    # A1 Qwen3 path: qk_norm True builds a head_dim-sized RMSNorm on Q and K, and
+    # it actually feeds attention (output changes vs the same weights without norm).
+    cfg = replace(tiny_cfg(), qk_norm=True)
+    attn = Attention(cfg)
+    assert attn.q_norm is not None and attn.k_norm is not None
+    assert attn.q_norm.weight.shape == (cfg.head_dim,)
+
+    torch.manual_seed(0)
+    x = torch.randn(1, 5, cfg.hidden_size)
+    cos, sin = build_rope_cache(5, cfg.head_dim, cfg.rope_theta, device="cpu")
+    with torch.no_grad():
+        # Non-identity norm weights so the norm is not a silent no-op.
+        attn.q_norm.weight.copy_(torch.rand(cfg.head_dim) + 0.5)
+        attn.k_norm.weight.copy_(torch.rand(cfg.head_dim) + 0.5)
+        out_qk = attn(x, cos, sin)
+        attn.q_norm = attn.k_norm = None  # same projections, norm disabled
+        out_plain = attn(x, cos, sin)
+    assert not torch.allclose(out_qk, out_plain)
 
 
 def test_causal_attention_is_causal():

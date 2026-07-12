@@ -127,6 +127,18 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(cfg.hidden_size, self.n_kv_heads * self.head_dim, bias=cfg.qkv_bias)
         self.o_proj = nn.Linear(self.n_heads * self.head_dim, cfg.hidden_size, bias=False)
 
+        # QK-Norm (A0 flag, A1 Qwen3): a per-head RMSNorm over head_dim applied to
+        # Q and K after projection, before RoPE — it stabilizes the attention
+        # logits. The weights are size head_dim (one norm shared across heads, HF's
+        # "only on the head dim" comment), not hidden_size. Qwen2.5 has none, so
+        # these stay None and add no parameters — leaving that path bit-identical.
+        if cfg.qk_norm:
+            self.q_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps)
+            self.k_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps)
+        else:
+            self.q_norm = None
+            self.k_norm = None
+
     def forward(
         self,
         x: torch.Tensor,
@@ -138,9 +150,18 @@ class Attention(nn.Module):
     ) -> torch.Tensor:
         b, t, _ = x.shape
 
-        # Project and reshape to [b, n_heads, t, head_dim].
-        q = self.q_proj(x).view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(b, t, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        # Project and reshape to [b, t, n_heads, head_dim]. QK-Norm (Qwen3) applies
+        # its per-head RMSNorm here — post-projection, over head_dim (the last dim),
+        # before the transpose and before RoPE — matching HF's placement exactly. V
+        # is never normed. (RMSNorm over the last dim commutes with the head/seq
+        # transpose, but we mirror HF's order to keep the parity argument trivial.)
+        q = self.q_proj(x).view(b, t, self.n_heads, self.head_dim)
+        k = self.k_proj(x).view(b, t, self.n_kv_heads, self.head_dim)
+        if self.q_norm is not None:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
         v = self.v_proj(x).view(b, t, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
         # RoPE is applied before caching: keys are stored already rotated, so a
