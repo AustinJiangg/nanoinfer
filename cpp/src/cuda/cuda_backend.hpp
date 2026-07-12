@@ -90,8 +90,9 @@ extern bool g_cuda_keep_device_logits;
 
 class CudaBackend : public Backend {
 public:
-    // R-track de-globalization: the fp16-weights decision (was the g_cuda_fp16_weights global) is now a
-    // per-instance config field, read in to_resident. make_backend(device, cfg) constructs it with cfg.
+    // R-track de-globalization: the half-storage decision (fp16 was the g_cuda_fp16_weights global;
+    // bf16 is B1) is a per-instance config field, read in to_resident. make_backend(device, cfg)
+    // constructs it with cfg (and rejects fp16_weights+bf16_weights together).
     explicit CudaBackend(BackendConfig config = {}) : config_(config) {}
 
     Device device() const override;
@@ -122,8 +123,9 @@ public:
     std::unique_ptr<KVCacheBase> make_kv_cache(int64_t num_layers, int64_t n_kv_heads,
                                                int64_t head_dim, int64_t max_seq) override;
     Tensor finalize_logits(Tensor logits) override;
-    // R3: H2D upload at load (fp16 for the big eligible weights under config_.fp16_weights, else fp32).
-    Tensor to_resident(Tensor weight, bool fp16_eligible) override;
+    // R3: H2D upload at load (fp16/bf16 for the big eligible weights under config_.fp16_weights /
+    // config_.bf16_weights, else fp32).
+    Tensor to_resident(Tensor weight, bool half_eligible) override;
     // R3c: device weight construction (the model's quant-build #ifdefs, now behind the Backend).
     std::unique_ptr<Weight> make_quant_weight(const Tensor& host, QuantMode mode) override;
     std::unique_ptr<Weight> make_embed_weight(const Tensor& host) override;

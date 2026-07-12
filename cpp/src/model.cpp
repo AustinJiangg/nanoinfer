@@ -26,12 +26,13 @@ bool is_layer_proj(const std::string& name) {
            name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
-// Weights uploaded as fp16 when the backend's fp16_weights config is on (G5d): the layer projections PLUS the
-// big token embedding / output projection. embed_tokens (vocab×hidden) is the single largest
-// weight — ~136M params, ~544 MB in fp32, and tied as the lm_head — so storing it as half is the
-// biggest single memory win; fp32-accumulated, it keeps the golden tokens. "lm_head.weight"
-// covers an untied checkpoint. Norms/biases stay fp32: tiny, and precision-sensitive.
-bool is_fp16_weight(const std::string& name) {
+// Weights uploaded at half precision when the backend's fp16_weights (G5d) or bf16_weights (B1)
+// config is on: the layer projections PLUS the big token embedding / output projection.
+// embed_tokens (vocab×hidden) is the single largest weight — ~136M params, ~544 MB in fp32, and
+// tied as the lm_head — so storing it at 2 bytes is the biggest single memory win;
+// fp32-accumulated, it keeps the golden tokens. "lm_head.weight" covers an untied checkpoint.
+// Norms/biases stay fp32: tiny, and precision-sensitive.
+bool is_half_eligible(const std::string& name) {
     return is_layer_proj(name) || name == "embed_tokens.weight" || name == "lm_head.weight";
 }
 }  // namespace
@@ -93,13 +94,13 @@ Model::Model(const std::string& weights_dir, QuantMode mode, Device device, Back
     }
 
     // R3: make every remaining weight + the RoPE tables resident on the compute device, once at
-    // load (CPU: identity; CUDA: H2D, fp16 for the big eligible weights — the GPU analogue of C5's
-    // "stream each weight once"). The device knowledge and the fp16_weights decision live in
+    // load (CPU: identity; CUDA: H2D, fp16/bf16 for the big eligible weights — the GPU analogue of
+    // C5's "stream each weight once"). The device knowledge and the half-storage decision live in
     // CudaBackend::to_resident, so this loop carries no #ifdef and names no device global.
     for (auto& kv : w_)
-        kv.second = backend_->to_resident(std::move(kv.second), is_fp16_weight(kv.first));
-    rope_.cos = backend_->to_resident(std::move(rope_.cos), /*fp16_eligible=*/false);
-    rope_.sin = backend_->to_resident(std::move(rope_.sin), /*fp16_eligible=*/false);
+        kv.second = backend_->to_resident(std::move(kv.second), is_half_eligible(kv.first));
+    rope_.cos = backend_->to_resident(std::move(rope_.cos), /*half_eligible=*/false);
+    rope_.sin = backend_->to_resident(std::move(rope_.sin), /*half_eligible=*/false);
 
     // R3: wrap the dense (non-quant) projection weights — now device-resident — as DenseWeight in
     // the same weights_ map a quant mode already filled above, so Model::project drives every
@@ -173,9 +174,10 @@ std::pair<int64_t, int64_t> Model::weight_bytes() const {
     int64_t actual = 0, fp32 = 0;
     for (const auto& kv : w_) {
         const int64_t n = kv.second.numel();
-        // fp16 device weights (G5d) take 2 bytes/elem, not 4 — so the report reflects the fp16
-        // storage win, not just quantization's. CPU weights are always F32, so this is a no-op there.
-        actual += n * (kv.second.dtype() == DType::F16 ? 2 : 4);
+        // fp16/bf16 device weights (G5d/B1) take 2 bytes/elem, not 4 — so the report reflects the
+        // half-storage win, not just quantization's. CPU weights are always F32: a no-op there.
+        const DType dt = kv.second.dtype();
+        actual += n * ((dt == DType::F16 || dt == DType::BF16) ? 2 : 4);
         fp32 += n * 4;
     }
     for (const auto& kv : weights_) {  // dense (DenseWeight) + quant projection weights (R3)

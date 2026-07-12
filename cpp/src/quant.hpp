@@ -36,9 +36,9 @@ enum class QuantMode { None, Q8, Q4, Q4G, W8A8 };
 // the representation uniformly — the symmetric counterpart to the Backend's op dispatch (R3's lesson:
 // the weight format is what varies most across devices). QuantMode is the construction-time *selector*
 // (what to build); Format is the constructed weight's runtime *tag* (what it turned out to be). They
-// are NOT the same set: None builds no Weight (so it has no Format), and F32/F16 are real weights
-// (DenseWeight, distinguished by Tensor dtype) that no QuantMode names. Q8/Q4/Q4G/W8A8 line up.
-enum class Format { F32, F16, Q8, Q4, Q4G, W8A8 };
+// are NOT the same set: None builds no Weight (so it has no Format), and F32/F16/BF16 are real
+// weights (DenseWeight, distinguished by Tensor dtype) that no QuantMode names. Q8/Q4/Q4G/W8A8 line up.
+enum class Format { F32, F16, BF16, Q8, Q4, Q4G, W8A8 };
 
 // R5: the shared Format's human-readable name — the ONE place that maps the representation tag to a
 // string, so a storage diagnostic on either backend names a weight's format without a switch of its

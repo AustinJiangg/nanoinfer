@@ -20,11 +20,12 @@ namespace ni {
 // cross-platform backend. A Backend operates on tensors resident on its own device.
 enum class Device { CPU, CUDA, METAL };
 
-// Element type of a tensor's data. F32 is the default and the only host type; F16 and I8 exist
-// only on device — F16 weights for the tensor-core path, I8 weights/activations for the W8A8
-// DP4A path (G5d). The host vector is always float; dtype() tells a backend how to read the
-// device buffer (and device_alloc how many bytes per element: 4 / 2 / 1).
-enum class DType { F32, F16, I8 };
+// Element type of a tensor's data. F32 is the default and the only host type; F16, BF16 and I8
+// exist only on device — F16/BF16 weights for the half-storage paths (G5d fp16; B1 bf16 — same
+// byte win, but bf16 is byte-exact to the bf16 the checkpoints ship), I8 weights/activations for
+// the W8A8 DP4A path (G5d). The host vector is always float; dtype() tells a backend how to read
+// the device buffer (and device_alloc how many bytes per element: 4 / 2 / 2 / 1).
+enum class DType { F32, F16, BF16, I8 };
 
 class Tensor {
 public:

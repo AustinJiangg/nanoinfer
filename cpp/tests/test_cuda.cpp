@@ -1,14 +1,15 @@
 // G1/G5 parity: the CUDA backend's linear() reproduces the CPU backend's linear() within
 // tolerance, on synthetic data (no model weights). Covers every kernel the dispatch picks:
 // warp-GEMV (m<=16, decode), register-tiled GEMM (m>16, prefill), tensor-core wmma (m>16,
-// opt-in), and the fp16-WEIGHT paths (gemv-h / wmma-h, weight uploaded as half — G5d). The
-// golden e2e tests (run_cuda_parity/cache) only use short sequences, so the prefill + fp16
-// kernels meet the oracle here.
+// opt-in), and the half-WEIGHT paths (gemv-h / wmma-h — fp16, G5d; gemv-b / tiled-b — bf16,
+// B1). The golden e2e tests (run_cuda_parity/cache) only use short sequences, so the prefill
+// + half-storage kernels meet the oracle here.
 //
 // NOT bit-identical: the GPU accumulates in float and in a different order than the CPU's
-// double-accumulated SIMD dot (~1e-4 drift). The wmma/fp16 paths are looser still — fp16
-// rounds operands to ~3 decimal digits, so their printed max|diff| IS the result: the fp16
-// accuracy cost vs the fp32 oracle. The CPU backend is the oracle (itself HF-parity-locked).
+// double-accumulated SIMD dot (~1e-4 drift). The wmma/fp16/bf16 paths are looser still — fp16
+// rounds operands to ~3 decimal digits (bf16 to ~2), so their printed max|diff| IS the result:
+// the half-precision accuracy cost vs the fp32 oracle. The CPU backend is the oracle (itself
+// HF-parity-locked).
 //
 // Self-contained, so it joins ctest; skips at runtime if no GPU is visible. Only built when
 // -DNI_CUDA=ON.
@@ -26,9 +27,9 @@
 
 using namespace ni;
 
-// One shape: GPU linear() (with bias) vs the CPU oracle. f16w uploads the weight as half
-// (exercising the fp16 kernels). ok if max|diff| < tol.
-static bool check_linear(int64_t m, int64_t n, int64_t k, double tol, bool f16w,
+// One shape: GPU linear() (with bias) vs the CPU oracle. wdt picks the weight upload dtype
+// (F32 / F16 / BF16 — the last two exercise the half-storage kernels). ok if max|diff| < tol.
+static bool check_linear(int64_t m, int64_t n, int64_t k, double tol, DType wdt,
                          std::mt19937& rng) {
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     Tensor x({m, k}), w({n, k}), bias({n});
@@ -41,15 +42,23 @@ static bool check_linear(int64_t m, int64_t n, int64_t k, double tol, bool f16w,
 
     CudaBackend gpu;
     Tensor xd = to_device(x), bd = to_device(bias);
-    Tensor wd = f16w ? to_device_f16(w) : to_device(w);  // fp16 or fp32 weight buffer
+    Tensor wd = wdt == DType::F16    ? to_device_f16(w)
+                : wdt == DType::BF16 ? to_device_bf16(w)
+                                     : to_device(w);
     Tensor y_gpu = to_host(gpu.linear(xd, wd, &bd));
 
     double maxdiff = 0.0;
     for (int64_t i = 0; i < y_cpu.numel(); ++i)
         maxdiff = std::max(maxdiff, std::fabs(static_cast<double>(y_cpu[i]) - y_gpu[i]));
     const bool ok = maxdiff < tol;
-    const char* kern = f16w ? (m <= 16 ? "gemv-h" : (n >= 8192 ? "wmma-h" : "tiled-h"))
-                            : (cuda_policy().use_wmma ? "wmma" : (m <= 16 ? "gemv" : "tiled"));
+    const bool aligned = (n % 128 == 0 && k % 16 == 0);
+    const char* kern =
+        wdt == DType::F16
+            ? (m <= 16 ? "gemv-h" : (n >= 8192 ? "wmma-h" : "tiled-h"))
+        : wdt == DType::BF16
+            // B1 dispatch: GEMV / float4 tiled / the scalar-tiled ragged fallback (B2 adds wmma-b).
+            ? (m <= 16 ? "gemv-b" : (aligned ? "tiled-b" : "stile-b"))
+            : (cuda_policy().use_wmma ? "wmma" : (m <= 16 ? "gemv" : "tiled"));
     std::printf("test_cuda: [%4lld x %4lld] @ [%6lld x %4lld]^T (%-6s) max|diff|=%.3e (tol %.0e) %s\n",
                 (long long)m, (long long)k, (long long)n, (long long)k, kern, maxdiff, tol,
                 ok ? "ok" : "FAIL");
@@ -141,10 +150,10 @@ static bool check_paged_tiled(int64_t H, int64_t n_kv, int64_t t, int64_t ctx, i
     return ok;
 }
 
-// Embedding gather vs the CPU oracle (G5d). Random [vocab, hidden] table, random ids; an fp32
-// table matches exactly (a pure copy — no arithmetic), an fp16 table within fp16 rounding (the
-// looked-up rows are half-rounded). Covers the fp16-table path now that embed_tokens goes fp16.
-static bool check_embedding(int64_t vocab, int64_t hidden, int64_t n, bool f16, double tol,
+// Embedding gather vs the CPU oracle (G5d/B1). Random [vocab, hidden] table, random ids; an fp32
+// table matches exactly (a pure copy — no arithmetic), an fp16/bf16 table within that dtype's
+// rounding of the looked-up rows. Covers the half-table paths now that embed_tokens goes half.
+static bool check_embedding(int64_t vocab, int64_t hidden, int64_t n, DType tdt, double tol,
                             std::mt19937& rng) {
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     Tensor table({vocab, hidden});
@@ -157,15 +166,18 @@ static bool check_embedding(int64_t vocab, int64_t hidden, int64_t n, bool f16, 
     Tensor o_cpu = cpu.embedding(table, ids);  // oracle (fp32 table)
 
     CudaBackend gpu;
-    Tensor td = f16 ? to_device_f16(table) : to_device(table);
+    Tensor td = tdt == DType::F16    ? to_device_f16(table)
+                : tdt == DType::BF16 ? to_device_bf16(table)
+                                     : to_device(table);
     Tensor o_gpu = to_host(gpu.embedding(td, ids));
 
     double maxdiff = 0.0;
     for (int64_t i = 0; i < o_cpu.numel(); ++i)
         maxdiff = std::max(maxdiff, std::fabs(static_cast<double>(o_cpu[i]) - o_gpu[i]));
     const bool ok = maxdiff < tol;
-    std::printf("test_cuda: embed [%6lld x %4lld] gather n=%lld (%-3s) max|diff|=%.3e (tol %.0e) %s\n",
-                (long long)vocab, (long long)hidden, (long long)n, f16 ? "f16" : "f32", maxdiff, tol,
+    const char* lbl = tdt == DType::F16 ? "f16" : tdt == DType::BF16 ? "bf16" : "f32";
+    std::printf("test_cuda: embed [%6lld x %4lld] gather n=%lld (%-4s) max|diff|=%.3e (tol %.0e) %s\n",
+                (long long)vocab, (long long)hidden, (long long)n, lbl, maxdiff, tol,
                 ok ? "ok" : "FAIL");
     return ok;
 }
@@ -304,45 +316,56 @@ int main() {
     }
     std::mt19937 rng(1234);  // fixed seed: deterministic, per CLAUDE.md
     bool ok = true;
-    ok &= check_linear(4, 896, 896, 5e-3, false, rng);     // warp-GEMV (decode)
+    ok &= check_linear(4, 896, 896, 5e-3, DType::F32, rng);     // warp-GEMV (decode)
     // Prefill tiled GEMM (G5c+ float4-vectorized). The dispatch picks the tile by output width n:
     // narrow n -> 64×64, huge n (>=8192) -> 128×128. Cover both, square + ragged m, to gate each.
-    ok &= check_linear(128, 896, 896, 5e-3, false, rng);   // tiled-vec 64×64, square (prefill q/o)
-    ok &= check_linear(128, 4864, 896, 5e-3, false, rng);  // tiled-vec 64×64, wide n (gate/up)
-    ok &= check_linear(100, 896, 4864, 5e-3, false, rng);  // tiled-vec 64×64, ragged m + wide k (down)
-    ok &= check_linear(128, 8192, 896, 5e-3, false, rng);  // tiled-vec 128×128, large n (lm_head path)
-    ok &= check_linear(100, 8192, 896, 5e-3, false, rng);  // tiled-vec 128×128, large n + ragged m
+    ok &= check_linear(128, 896, 896, 5e-3, DType::F32, rng);   // tiled-vec 64×64, square (prefill q/o)
+    ok &= check_linear(128, 4864, 896, 5e-3, DType::F32, rng);  // tiled-vec 64×64, wide n (gate/up)
+    ok &= check_linear(100, 896, 4864, 5e-3, DType::F32, rng);  // tiled-vec 64×64, ragged m + wide k (down)
+    ok &= check_linear(128, 8192, 896, 5e-3, DType::F32, rng);  // tiled-vec 128×128, large n (lm_head path)
+    ok &= check_linear(100, 8192, 896, 5e-3, DType::F32, rng);  // tiled-vec 128×128, large n + ragged m
 
     // Double-buffered projection GEMM (G5 micro-gain): bit-identical to the tiled-vec kernel (only the
     // load timing changes), so it must meet the same oracle on the narrow-n projection shapes it routes
     // — square, wide n, and the ragged-m + wide-k (down) case that exercises the prefetch's m-bound.
     cuda_policy().use_dbuf = true;
-    ok &= check_linear(128, 896, 896, 5e-3, false, rng);   // dbuf 64×64, square (q/o)
-    ok &= check_linear(128, 4864, 896, 5e-3, false, rng);  // dbuf 64×64, wide n (gate/up)
-    ok &= check_linear(100, 896, 4864, 5e-3, false, rng);  // dbuf 64×64, ragged m + wide k (down)
+    ok &= check_linear(128, 896, 896, 5e-3, DType::F32, rng);   // dbuf 64×64, square (q/o)
+    ok &= check_linear(128, 4864, 896, 5e-3, DType::F32, rng);  // dbuf 64×64, wide n (gate/up)
+    ok &= check_linear(100, 896, 4864, 5e-3, DType::F32, rng);  // dbuf 64×64, ragged m + wide k (down)
     cuda_policy().use_dbuf = false;
 
     // Tensor-core (fp32 weight, fp16 staged) — the max|diff| is the fp16 cost. n<8192 hits the 64²
     // kernel; n>=8192 the 128² warp-tiled kernel (the lm_head path).
     cuda_policy().use_wmma = true;
-    ok &= check_linear(128, 896, 896, 3e-1, false, rng);   // wmma 64², square
-    ok &= check_linear(100, 896, 4864, 1e0, false, rng);   // wmma 64², ragged + wide k
-    ok &= check_linear(128, 8192, 896, 5e-1, false, rng);  // wmma 128² warp-tiled, large n
-    ok &= check_linear(100, 8192, 896, 5e-1, false, rng);  // wmma 128², large n + ragged m
+    ok &= check_linear(128, 896, 896, 3e-1, DType::F32, rng);   // wmma 64², square
+    ok &= check_linear(100, 896, 4864, 1e0, DType::F32, rng);   // wmma 64², ragged + wide k
+    ok &= check_linear(128, 8192, 896, 5e-1, DType::F32, rng);  // wmma 128² warp-tiled, large n
+    ok &= check_linear(100, 8192, 896, 5e-1, DType::F32, rng);  // wmma 128², large n + ragged m
     cuda_policy().use_wmma = false;
 
     // fp16 WEIGHTS (G5d): gemv-h (decode); prefill projections (n<8192) -> CUDA-core float4 tiled
     // (tiled-h: fp16-weight-only error, fp32 compute, so tighter than wmma's fp16-accumulate);
     // lm_head (n>=8192) -> 128² warp-tiled tensor cores (wmma-h).
-    ok &= check_linear(4, 896, 896, 1e-1, true, rng);      // gemv-h (decode, fp16 weight)
-    ok &= check_linear(128, 896, 896, 1e-1, true, rng);    // tiled-h (prefill projection, fp16 weight)
-    ok &= check_linear(100, 896, 4864, 3e-1, true, rng);   // tiled-h, ragged m + wide k
-    ok &= check_linear(128, 8192, 896, 5e-1, true, rng);   // wmma-h 128² warp-tiled, large n (lm_head)
+    ok &= check_linear(4, 896, 896, 1e-1, DType::F16, rng);      // gemv-h (decode, fp16 weight)
+    ok &= check_linear(128, 896, 896, 1e-1, DType::F16, rng);    // tiled-h (prefill projection, fp16 weight)
+    ok &= check_linear(100, 896, 4864, 3e-1, DType::F16, rng);   // tiled-h, ragged m + wide k
+    ok &= check_linear(128, 8192, 896, 5e-1, DType::F16, rng);   // wmma-h 128² warp-tiled, large n (lm_head)
 
-    // Embedding gather (G5d): fp32 table is an exact copy; fp16 table (embed_tokens path) costs
-    // only the fp16 rounding of the looked-up rows.
-    ok &= check_embedding(2048, 896, 8, false, 1e-6, rng);  // fp32 table — exact
-    ok &= check_embedding(2048, 896, 8, true, 1e-3, rng);   // fp16 table — fp16 rounding
+    // bf16 WEIGHTS (B1): the same GEMV/tiled dispatch reading __nv_bfloat16 through ldf/load4 —
+    // fp32 compute, so the max|diff| is purely the bf16 rounding of the weight (8 mantissa bits,
+    // 2^3 coarser than fp16 → the tolerances sit ~8× above the fp16-weight rows). The ragged-n
+    // case exercises the scalar-tiled fallback (the one path fp16 sends to wmma instead).
+    ok &= check_linear(4, 896, 896, 8e-1, DType::BF16, rng);     // gemv-b (decode, bf16 weight)
+    ok &= check_linear(128, 896, 896, 8e-1, DType::BF16, rng);   // tiled-b (prefill projection)
+    ok &= check_linear(100, 896, 4864, 2e0, DType::BF16, rng);   // tiled-b, ragged m + wide k
+    ok &= check_linear(128, 8192, 896, 8e-1, DType::BF16, rng);  // tiled-b 128-aligned huge n (lm_head, B1)
+    ok &= check_linear(20, 100, 90, 8e-1, DType::BF16, rng);     // stile-b: ragged n+k fallback
+
+    // Embedding gather (G5d/B1): fp32 table is an exact copy; fp16/bf16 tables (embed_tokens path)
+    // cost only that dtype's rounding of the looked-up rows.
+    ok &= check_embedding(2048, 896, 8, DType::F32, 1e-6, rng);   // fp32 table — exact
+    ok &= check_embedding(2048, 896, 8, DType::F16, 1e-3, rng);   // fp16 table — fp16 rounding
+    ok &= check_embedding(2048, 896, 8, DType::BF16, 8e-3, rng);  // bf16 table — bf16 rounding (8× fp16)
 
     // Warp-per-query + online-softmax attention (G5f): prefill (limit>32 → lane key-striding),
     // decode (sq=1, large sk), and full (non-causal). Tight tol — only the key sums reorder vs the

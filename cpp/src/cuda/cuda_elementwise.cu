@@ -129,6 +129,9 @@ Tensor CudaBackend::embedding(const Tensor& table, const std::vector<int64_t>& i
     if (table.dtype() == DType::F16)  // G5d: embed_tokens uploaded as half (the largest weight)
         embedding_kernel<half><<<blocks, kBlock>>>(static_cast<const half*>(table.device_ptr()),
                                                    d_ids, dptr(out), n, hidden);
+    else if (table.dtype() == DType::BF16)  // B1: the bf16 sibling (byte-exact to the checkpoint)
+        embedding_kernel<__nv_bfloat16><<<blocks, kBlock>>>(
+            static_cast<const __nv_bfloat16*>(table.device_ptr()), d_ids, dptr(out), n, hidden);
     else
         embedding_kernel<float><<<blocks, kBlock>>>(dptr(table), d_ids, dptr(out), n, hidden);
     launch_check("embedding_kernel");

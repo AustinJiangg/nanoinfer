@@ -1,12 +1,14 @@
 // CUDA backend: the dense GEMM kernels + CudaBackend::linear (R4 — split out of cuda_backend.cu).
 //
-// All eight fp32/fp16 matmul kernels (naive, warp-GEMV, scalar/vectorized/double-buffered tiled,
-// warp-tiled, and the two wmma tensor-core variants) and the m/dtype dispatch that picks among them.
-// Launched only by CudaBackend::linear, so they live together in one TU (whole-program compilation:
-// a kernel must be launched in the TU it's defined in). Shared pool/loaders come from cuda_internal.cuh.
+// All eight fp32/fp16/bf16 matmul kernels (naive, warp-GEMV, scalar/vectorized/double-buffered
+// tiled, warp-tiled, and the two wmma tensor-core variants) and the m/dtype dispatch that picks
+// among them. Launched only by CudaBackend::linear, so they live together in one TU (whole-program
+// compilation: a kernel must be launched in the TU it's defined in). Shared pool/loaders come from
+// cuda_internal.cuh.
 #include "cuda/cuda_backend.hpp"   // CudaBackend, cuda_policy()
 #include "cuda/cuda_internal.cuh"  // device_alloc, dptr, launch_check, ldf/ldh/load4, kGemvMaxM, kBlock
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <mma.h>
 
@@ -71,9 +73,10 @@ __global__ void linear_gemv_kernel(const float* __restrict__ x, const WT* __rest
 // (one output's weights) is contiguous — both staging loops stride the k dim fastest, which
 // keeps the global reads coalesced. OOB rows/cols (ragged m,n) load 0 and skip the store; a
 // thread reads only its own As rows / Bs cols, so the zero padding never contaminates a
-// valid output.
-template <int BM, int BN, int BK, int TM, int TN>
-__global__ void linear_tiled_kernel(const float* __restrict__ x, const float* __restrict__ w,
+// valid output. WT (B1): fp32 or a half dtype read through ldf — the weight converts to fp32
+// at staging, so the tile math (and its error) is unchanged; only the global read narrows.
+template <typename WT, int BM, int BN, int BK, int TM, int TN>
+__global__ void linear_tiled_kernel(const float* __restrict__ x, const WT* __restrict__ w,
                                     const float* __restrict__ bias, float* __restrict__ y, int m,
                                     int n, int k) {
     constexpr int numThreads = (BM / TM) * (BN / TN);
@@ -102,7 +105,8 @@ __global__ void linear_tiled_kernel(const float* __restrict__ x, const float* __
         }
         for (int off = 0; off < BN; off += strideB) {
             const int o = innerRowB + off, go = colBase + o, gk = kIdx + innerColB;
-            Bs[innerColB * BN + o] = (go < n && gk < k) ? w[go * k + gk] : 0.0f;
+            Bs[innerColB * BN + o] =
+                (go < n && gk < k) ? ldf(w, static_cast<size_t>(go) * k + gk) : 0.0f;
         }
         __syncthreads();
         for (int dot = 0; dot < BK; ++dot) {
@@ -655,6 +659,35 @@ Tensor CudaBackend::linear(const Tensor& x, const Tensor& weight, const Tensor* 
                             (static_cast<unsigned>(m) + BM - 1) / BM);
             linear_wmma_kernel<half><<<grid, 128>>>(xp, wh, bp, yp, mi, ni, ki);
         }
+    } else if (weight.dtype() == DType::BF16) {
+        // bf16 weights (B1): the same ½-byte storage win as fp16, read through the SAME dtype-
+        // templated kernels — GEMV for decode, the CUDA-core float4 tiled GEMM for aligned prefill
+        // (weights convert to fp32 in-register; the compute and its error model are fp32, so the
+        // only cost vs fp32 weights is the bf16 rounding of the weight itself — which is ZERO for
+        // a bf16-shipped checkpoint). B1 routes the lm_head through the tiled kernel too; B2 gives
+        // it the bf16 tensor-core path (wmma mandates fp32 accumulate for bf16 inputs).
+        const __nv_bfloat16* wb = static_cast<const __nv_bfloat16*>(weight.device_ptr());
+        if (m <= kGemvMaxM) {
+            const int threads = 128;
+            const int blocks = static_cast<int>((n + threads / 32 - 1) / (threads / 32));
+            linear_gemv_kernel<__nv_bfloat16><<<blocks, threads>>>(xp, wb, bp, yp, mi, ni, ki);
+        } else if (n % 128 == 0 && k % 16 == 0) {
+            constexpr int BM = 64, BN = 64, BK = 16, TM = 4, TN = 4;
+            constexpr int threads = (BM / TM) * (BN / TN);  // 256
+            const dim3 grid((static_cast<unsigned>(n) + BN - 1) / BN,
+                            (static_cast<unsigned>(m) + BM - 1) / BM);
+            linear_tiled_vec_kernel<__nv_bfloat16, BM, BN, BK, TM, TN>
+                <<<grid, threads>>>(xp, wb, bp, yp, mi, ni, ki);
+        } else {
+            // Ragged fallback: the scalar tiled kernel (bounds-checks every edge), templated on
+            // the weight dtype — fp32 compute, so it is TIGHTER than fp16's wmma-h fallback.
+            constexpr int BM = 64, BN = 64, BK = 8, TM = 4, TN = 4;
+            constexpr int threads = (BM / TM) * (BN / TN);  // 256
+            const dim3 grid((static_cast<unsigned>(n) + BN - 1) / BN,
+                            (static_cast<unsigned>(m) + BM - 1) / BM);
+            linear_tiled_kernel<__nv_bfloat16, BM, BN, BK, TM, TN>
+                <<<grid, threads>>>(xp, wb, bp, yp, mi, ni, ki);
+        }
     } else if (cuda_policy().force_naive_gemm) {
         const dim3 block(16, 16);
         const dim3 grid((static_cast<unsigned>(n) + block.x - 1) / block.x,
@@ -713,7 +746,7 @@ Tensor CudaBackend::linear(const Tensor& x, const Tensor& weight, const Tensor* 
         constexpr int threads = (BM / TM) * (BN / TN);  // 256
         const dim3 grid((static_cast<unsigned>(n) + BN - 1) / BN,
                         (static_cast<unsigned>(m) + BM - 1) / BM);
-        linear_tiled_kernel<BM, BN, BK, TM, TN><<<grid, threads>>>(xp, wp, bp, yp, mi, ni, ki);
+        linear_tiled_kernel<float, BM, BN, BK, TM, TN><<<grid, threads>>>(xp, wp, bp, yp, mi, ni, ki);
     }
     launch_check("linear_kernel");
     return y;

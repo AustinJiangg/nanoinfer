@@ -92,12 +92,14 @@ void device_pool_trim() { pool().trim(); }
 
 // Allocate a device tensor of `shape` (+ dtype) from the pool and hand the Tensor a deleter
 // that returns the buffer to the pool (not cudaFree) — so steady-state forwards do no
-// cudaMalloc. F16 buffers (fp16 weights, G5d) are half the bytes; the pool keys on bytes.
+// cudaMalloc. F16/BF16 buffers (half-storage weights, G5d/B1) are half the bytes; the pool
+// keys on bytes.
 Tensor device_alloc(const std::vector<int64_t>& shape, DType dt) {
     Tensor d(shape, Device::CUDA);
     d.set_dtype(dt);
-    const size_t elem =
-        (dt == DType::F16) ? sizeof(half) : (dt == DType::I8) ? sizeof(int8_t) : sizeof(float);
+    const size_t elem = (dt == DType::F16 || dt == DType::BF16) ? 2
+                        : (dt == DType::I8)                     ? sizeof(int8_t)
+                                                                : sizeof(float);
     const size_t nbytes = static_cast<size_t>(d.numel()) * elem;
     if (nbytes == 0) return d;  // empty tensor (e.g. an unfilled KV history): no buffer
     void* p = pool().acquire(nbytes);

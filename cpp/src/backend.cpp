@@ -83,6 +83,10 @@ std::unique_ptr<KVCacheBase> CpuBackend::make_kv_cache(int64_t num_layers, int64
 // The former #ifdef ladder in Model's constructor, isolated to one spot so the model is
 // device-agnostic. CUDA is only reachable in an -DNI_CUDA build; otherwise this throws for it.
 std::unique_ptr<Backend> make_backend(Device device, [[maybe_unused]] const BackendConfig& cfg) {
+    // fp16 and bf16 weight storage are mutually exclusive per model — a weight has ONE dtype.
+    // Checked here (device-independent) so a misconfigured Model fails loudly at construction.
+    if (cfg.fp16_weights && cfg.bf16_weights)
+        throw std::invalid_argument("make_backend: fp16_weights and bf16_weights are exclusive");
     if (device == Device::CPU) return std::make_unique<CpuBackend>();
 #ifdef NI_CUDA
     if (device == Device::CUDA) return std::make_unique<CudaBackend>(cfg);

@@ -76,11 +76,11 @@ public:
     virtual Tensor finalize_logits(Tensor logits) { return logits; }
 
     // R3: make a host weight resident on this backend's device, once at load. CPU: identity (the
-    // weight stays a host tensor). CUDA: H2D upload — as fp16 when fp16_eligible AND the backend's
-    // fp16-weights mode is on (the big projections/embed), else fp32. The model calls this in a
-    // plain loop over its norms/biases/embed, with no #ifdef and no device global in sight — the
-    // fp16 decision (the backend's fp16_weights config) lives inside the CUDA override.
-    virtual Tensor to_resident(Tensor weight, bool /*fp16_eligible*/) { return weight; }
+    // weight stays a host tensor). CUDA: H2D upload — as fp16/bf16 when half_eligible AND the
+    // backend's matching half-storage mode is on (the big projections/embed), else fp32. The model
+    // calls this in a plain loop over its norms/biases/embed, with no #ifdef and no device global
+    // in sight — the storage decision (fp16_weights/bf16_weights config) lives in the CUDA override.
+    virtual Tensor to_resident(Tensor weight, bool /*half_eligible*/) { return weight; }
 
     // R3c: the backend as weight factory, so the model builds quantized weights with no #ifdef.
     // make_quant_weight: a quantized projection (Q8/Q4/Q4G/W8A8) from a host fp32 tensor — CPU keeps
@@ -124,11 +124,11 @@ public:
                                                int64_t head_dim, int64_t max_seq) override;
 };
 
-// R3: a plain fp32/fp16 weight exposed as a Weight, so Model::project drives dense and quantized
-// projections through one pointer with no branch. It forwards to the backend's GEMM over its
-// (already device-resident) tensor; the fp16 case is handled inside the backend's linear dispatch
-// (dtype()==F16), so DenseWeight is device- and precision-agnostic. The quant weights (quant.cpp,
-// cuda W8A8) are the other Weight impls. (gather() for the embedding lands with R3b.)
+// R3: a plain fp32/fp16/bf16 weight exposed as a Weight, so Model::project drives dense and
+// quantized projections through one pointer with no branch. It forwards to the backend's GEMM over
+// its (already device-resident) tensor; the half-storage cases are handled inside the backend's
+// linear dispatch (dtype()==F16/BF16), so DenseWeight is device- and precision-agnostic. The quant
+// weights (quant.cpp, cuda W8A8) are the other Weight impls. (gather() for the embedding: R3b.)
 class DenseWeight : public Weight {
 public:
     DenseWeight(Backend* backend, Tensor w) : backend_(backend), w_(std::move(w)) {}
@@ -138,9 +138,16 @@ public:
     Tensor gather(const std::vector<int64_t>& ids) const override {  // R3b: the embed table case
         return backend_->embedding(w_, ids);
     }
-    // R5: F16 vs F32 is the only thing a dense weight's format depends on (the device is orthogonal).
-    Format format() const override { return w_.dtype() == DType::F16 ? Format::F16 : Format::F32; }
-    int64_t bytes() const override { return w_.numel() * (w_.dtype() == DType::F16 ? 2 : 4); }
+    // R5: the dtype is the only thing a dense weight's format depends on (the device is orthogonal).
+    Format format() const override {
+        return w_.dtype() == DType::F16    ? Format::F16
+               : w_.dtype() == DType::BF16 ? Format::BF16
+                                           : Format::F32;
+    }
+    int64_t bytes() const override {
+        return w_.numel() *
+               ((w_.dtype() == DType::F16 || w_.dtype() == DType::BF16) ? 2 : 4);
+    }
     int64_t fp32_bytes() const override { return w_.numel() * 4; }
 
 private:
@@ -151,12 +158,15 @@ private:
 // Construction-time backend/model configuration — the typed, per-instance home for what were
 // load-time globals (the de-globalization the R1/R2 comments anticipated). fp16_weights: the CUDA
 // backend uploads the big eligible weights (layer projections + the tied embed/lm_head) as fp16, half
-// the DRAM bytes (G5d) — read in CudaBackend::to_resident. quantize_embed: weight-only int8 for the
-// tied token-embedding / lm_head (G5d), read in the Model ctor (CPU + CUDA). Threaded Model ctor ->
-// make_backend -> CudaBackend. (The kernel-selection CudaPolicy folds in next; CUDA-graph state stays
-// per-call.)
+// the DRAM bytes (G5d) — read in CudaBackend::to_resident. bf16_weights: the same upload as bf16 (B1)
+// — the same byte win, but byte-exact to the bf16 the checkpoints ship (fp32's exponent range, no
+// overflow risk; the trade is a coarser mantissa: 8 bits vs fp16's 11). Exclusive with fp16_weights
+// (make_backend rejects both). quantize_embed: weight-only int8 for the tied token-embedding /
+// lm_head (G5d), read in the Model ctor (CPU + CUDA). Threaded Model ctor -> make_backend ->
+// CudaBackend. (The kernel-selection CudaPolicy folds in next; CUDA-graph state stays per-call.)
 struct BackendConfig {
     bool fp16_weights = false;
+    bool bf16_weights = false;
     bool quantize_embed = false;
 };
 

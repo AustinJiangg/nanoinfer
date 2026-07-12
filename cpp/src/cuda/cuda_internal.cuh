@@ -10,6 +10,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
 #include <cstdint>
@@ -54,11 +55,20 @@ constexpr int kBlock = 256;
 // the compute-bound tiled GEMM (prefill). Shared by the fp32/fp16 linear() and the int8 cuda_linear_q8.
 constexpr int64_t kGemvMaxM = 16;
 
-// Dtype-folding weight loaders (G5d): one templated kernel serves fp32 and fp16 weights. ldf -> float
-// (the fp32-accumulate GEMV/tiled paths), ldh -> half (wmma staging), load4 -> a float4 of 4 consecutive
-// weights (fp16 reads 8 bytes + converts, so one float4 register path stages either dtype).
+// Dtype-folding weight loaders (G5d fp16; B1 bf16): one templated kernel serves fp32, fp16, and
+// bf16 weights. ldf -> float (the fp32-accumulate GEMV/tiled paths), from_f32<ST> -> the wmma
+// staging dtype (half / __nv_bfloat16 — B2 templates the tensor-core kernels on it), load4 -> a
+// float4 of 4 consecutive weights (a half dtype reads 8 bytes + converts, so one float4 register
+// path stages any dtype).
 __device__ inline float ldf(const float* w, size_t i) { return w[i]; }
 __device__ inline float ldf(const half* w, size_t i) { return __half2float(w[i]); }
+__device__ inline float ldf(const __nv_bfloat16* w, size_t i) { return __bfloat162float(w[i]); }
+template <typename ST>
+__device__ inline ST from_f32(float v);
+template <>
+__device__ inline half from_f32<half>(float v) { return __float2half(v); }
+template <>
+__device__ inline __nv_bfloat16 from_f32<__nv_bfloat16>(float v) { return __float2bfloat16(v); }
 __device__ inline half ldh(const float* w, size_t i) { return __float2half(w[i]); }
 __device__ inline half ldh(const half* w, size_t i) { return w[i]; }
 __device__ inline float4 load4(const float* w, size_t i) {
@@ -67,6 +77,11 @@ __device__ inline float4 load4(const float* w, size_t i) {
 __device__ inline float4 load4(const half* w, size_t i) {
     const half2* h = reinterpret_cast<const half2*>(w + i);
     const float2 a = __half22float2(h[0]), b = __half22float2(h[1]);
+    return make_float4(a.x, a.y, b.x, b.y);
+}
+__device__ inline float4 load4(const __nv_bfloat16* w, size_t i) {
+    const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(w + i);
+    const float2 a = __bfloat1622float2(h[0]), b = __bfloat1622float2(h[1]);
     return make_float4(a.x, a.y, b.x, b.y);
 }
 

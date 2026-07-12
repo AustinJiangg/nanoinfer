@@ -448,6 +448,7 @@ const char* format_name(Format f) {
     switch (f) {
         case Format::F32: return "f32";
         case Format::F16: return "f16";
+        case Format::BF16: return "bf16";
         case Format::Q8: return "q8";
         case Format::Q4: return "q4";
         case Format::Q4G: return "q4g";

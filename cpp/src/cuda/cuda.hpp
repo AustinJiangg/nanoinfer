@@ -22,6 +22,11 @@ Tensor to_device(const Tensor& host);
 // The returned tensor has device()==CUDA and dtype()==F16.
 Tensor to_device_f16(const Tensor& host);
 
+// The bf16 sibling (B1): same once-at-load upload+convert, dtype()==BF16. Same byte win as fp16,
+// but round-to-nearest f32->bf16 of a bf16-shipped checkpoint's (losslessly upcast) weights is
+// EXACT — the device bytes equal the checkpoint's, one rounding step removed vs fp16.
+Tensor to_device_bf16(const Tensor& host);
+
 // Copy a device tensor back down to the CPU (D2H). Returns a host tensor.
 Tensor to_host(const Tensor& dev);
 

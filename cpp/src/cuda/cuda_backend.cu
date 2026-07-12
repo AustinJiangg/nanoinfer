@@ -41,6 +41,14 @@ __global__ void f32_to_f16_kernel(const float* __restrict__ src, half* __restric
     if (i < n) dst[i] = __float2half(src[i]);
 }
 
+// Convert an fp32 buffer to bf16 (B1 weight upload): round-to-nearest-even, exact for
+// bf16-representable inputs (which a bf16-shipped checkpoint's upcast weights all are).
+__global__ void f32_to_bf16_kernel(const float* __restrict__ src, __nv_bfloat16* __restrict__ dst,
+                                   int64_t n) {
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2bfloat16(src[i]);
+}
+
 // Scaled dot-product attention, causal. One thread per (head, query) — it walks all
 // visible keys twice (max, then softmax+weighted-V), recomputing scores rather than
 // storing them. Two-pass max-subtract mirrors ops.cpp; acc holds the output row.
@@ -662,6 +670,18 @@ Tensor to_device_f16(const Tensor& host) {
     return d;  // `src` (fp32 temp) returns to the pool here
 }
 
+// The bf16 sibling (B1): same upload+convert shape, RNE — exact when the fp32 came from bf16.
+Tensor to_device_bf16(const Tensor& host) {
+    Tensor src = to_device(host);
+    Tensor d = device_alloc(host.shape(), DType::BF16);
+    const int64_t n = host.numel();
+    if (n > 0)
+        f32_to_bf16_kernel<<<grid1d(n, kBlock), kBlock>>>(
+            dptr(src), static_cast<__nv_bfloat16*>(d.device_ptr()), n);
+    launch_check("f32_to_bf16_kernel");
+    return d;
+}
+
 Tensor to_device_i8(const int8_t* host, const std::vector<int64_t>& shape) {
     Tensor d = device_alloc(shape, DType::I8);
     const int64_t n = d.numel();
@@ -762,12 +782,15 @@ Tensor CudaBackend::finalize_logits(Tensor logits) {
     return logits;
 }
 
-Tensor CudaBackend::to_resident(Tensor weight, bool fp16_eligible) {
+Tensor CudaBackend::to_resident(Tensor weight, bool half_eligible) {
     // Upload a host weight to the GPU once, at load. The big eligible weights (layer projections /
-    // embedding) go up as fp16 when config_.fp16_weights is set — half the DRAM bytes — and the
-    // linear/embedding dispatch reads the F16 dtype directly; everything else (norms, biases, the
-    // RoPE tables) stays fp32. The fp16 decision is a per-instance config field now, not a global.
-    return (fp16_eligible && config_.fp16_weights) ? to_device_f16(weight) : to_device(weight);
+    // embedding) go up as fp16 (G5d) or bf16 (B1) when the matching config flag is set — half the
+    // DRAM bytes either way — and the linear/embedding dispatch reads the F16/BF16 dtype directly;
+    // everything else (norms, biases, the RoPE tables) stays fp32. The half-storage decision is a
+    // per-instance config field, not a global; both flags at once is rejected in make_backend.
+    if (half_eligible && config_.fp16_weights) return to_device_f16(weight);
+    if (half_eligible && config_.bf16_weights) return to_device_bf16(weight);
+    return to_device(weight);
 }
 
 // --- Device-resident KV cache (G3) ---

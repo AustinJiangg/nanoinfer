@@ -11,7 +11,7 @@
 // Greedy here is a FULL RECOMPUTE each step (no KV cache): the cache moves to the GPU in
 // G3, so the uncached forward is all we can drive on the device today.
 //
-// Each weight format (fp32 / fp16 / W8A8 / int8-embed / full-int8) runs in its OWN scope and
+// Each weight format (fp32 / fp16 / bf16 / W8A8 / int8-embed / full-int8) runs in its OWN scope and
 // device_pool_trim() reclaims its device buffers before the next Model is built. The pool is a
 // caching allocator that never cudaFrees on its own, so without the trim the formats' weights
 // would sum in VRAM: fine at 0.5B (~6 GB total) but an OOM at 1.5B (fp32 alone ~6 GB, five
@@ -148,6 +148,42 @@ int main(int argc, char** argv) {
             std::printf("fp16 weights: device weight storage %.0f MB -> %.0f MB (%.2fx smaller)\n",
                         wb32_bytes / 1e6, double(wb16.first) / 1e6,
                         wb32_bytes / double(wb16.first));
+        }
+        device_pool_trim();
+
+        // --- 3b. bf16 weights (B1), informational: the same uncached greedy with the big weights
+        // uploaded as bf16 — the same 2× storage win as fp16, but byte-exact to the bf16 the
+        // checkpoint ships (the fp32 export is a lossless bf16 upcast, and RNE f32->bf16 inverts
+        // it exactly), so the weights carry ZERO quantization error vs the checkpoint. The logit
+        // diff vs the fp32 ref is then the fp32-vs-bf16-WEIGHT gap the model itself induced —
+        // expected ~8× fp16's (8 vs 11 mantissa bits). Like fp16: not gated, tokens reported. ---
+        {
+            BackendConfig cfgb;
+            cfgb.bf16_weights = true;
+            Model modelb(dir, QuantMode::None, Device::CUDA, cfgb);
+            double maxdb = 0.0;
+            {
+                Tensor lg = modelb.forward(ids);
+                for (int64_t i = 0; i < lg.numel() && i < ref.numel(); ++i)
+                    maxdb = std::fmax(maxdb, std::fabs(double(lg[i]) - double(ref[i])));
+            }
+            std::vector<int64_t> ctxb = ids, gotb;
+            for (size_t t = 0; t < ref_gen.size(); ++t) {
+                Tensor lg = modelb.forward(ctxb);
+                const int64_t tok = argmax_row(lg, lg.size(0) - 1, lg.size(1));
+                gotb.push_back(tok);
+                ctxb.push_back(tok);
+            }
+            int genb = 0;
+            for (size_t i = 0; i < ref_gen.size() && i < gotb.size(); ++i)
+                if (ref_gen[i] != gotb[i]) ++genb;
+            print_ids("bf16w :", gotb);
+            std::printf("bf16 weights: greedy %s (%d/%zu mism), logits max|diff|=%g vs fp32 ref\n",
+                        genb == 0 ? "MATCH" : "DIFFERS", genb, ref_gen.size(), maxdb);
+            const auto wbb = modelb.weight_bytes();
+            std::printf("bf16 weights: device weight storage %.0f MB -> %.0f MB (%.2fx smaller)\n",
+                        wb32_bytes / 1e6, double(wbb.first) / 1e6,
+                        wb32_bytes / double(wbb.first));
         }
         device_pool_trim();
 
