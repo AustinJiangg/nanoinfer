@@ -987,15 +987,27 @@ golden tokens; (4) serving, run_serve / run_spec_serve / HTTP smoke;
       small draft's step, so r is *higher* than the weight ratio (S2's story sharpened — lowering
       r is the fix, not tuning K; speedup 1.09× @K=4). fp32 pair OOMs a full bench sweep on 12 GB
       (fp16 is the enabler, the 1.5B P1 finding at 1.7B). See BASELINE-qwen3.md.
-- [ ] **A2** — **Llama-3.2-1B** (Meta 2024-09): the config-heavy rung, cheap after
-      A1. (1) llama3 rope scaling — scale inv_freq in three frequency bands at LOAD
-      time (low ÷ factor 32, high untouched, smooth ramp between); the RoPE kernel is
-      untouched — config-time resolution, the rope_theta lesson applied forward;
-      (2) vocab 128256, a tiktoken-family BPE with different space handling → add a
-      Llama tokenizer case to the incremental-detok gate (V1's algorithm must prove
-      tokenizer-generic); (3) tied embeddings (already supported). 16 layers, 32 Q /
-      8 KV heads, head_dim 64, fp32 4.9 GB. License note: Llama Community License,
-      not Apache — fine locally; don't redistribute weights or goldens' text.
+- [x] **A2** ✅ landed — **Llama-3.2-1B** (Meta 2024-09): the config-heavy rung, cheap
+      after A1 as predicted — ONE build-time frequency rescale, no kernel touched. (1)
+      llama3 rope scaling — `_apply_rope_scaling` (Python) / `llama3_scale_inv_freq` +
+      a plain-double `RopeScalingParams` (C++ ops.cpp) rescale inv_freq in three bands
+      INSIDE build_rope_cache (long wavelengths ÷factor, short kept, smooth blend —
+      mirrors HF's _compute_llama3_parameters; attention_factor=1); apply_rope untouched,
+      and CUDA got it FREE (the scaled cos/sin tables are host-built + to_resident-
+      uploaded, apply_rope reads them unchanged — same as A1's QK-Norm through rmsnorm).
+      A0 already parsed rope_scaling + the 4 params from config.txt. (2) tiktoken BPE
+      vocab 128256 → NEW `tests/python/run_detok.py` proves the IncrementalDetokenizer is
+      tokenizer-generic on Llama tiktoken AND Qwen BPE (adversarial emoji/CJK/space-boundary
+      UTF-8; deltas concat == one-shot decode, no `�` leaked) — it only ever calls
+      tokenizer.decode(), so it was generic by construction. (3) tied embeddings + no
+      bias + no qk-norm + head_dim 64 + GQA 32/8: all A0 config. Used the ungated
+      `unsloth/Llama-3.2-1B` mirror (meta-llama is gated; identical weights). **Gate all 5
+      steps:** pytest test_llama HF-parity, CPU run_parity 1.29e-5 + golden 0/12 +
+      cache/batch/paged max|diff|=0, CUDA fp32 1.32e-5 + golden 0/12 + fp16(2×)/W8A8/
+      full-int8(3.99×) + cache/paged/batch, run_detok + run_serve + run_http_serve MATCH,
+      goldens + `cpp/docs/BASELINE-llama.md`. Qwen2.5/Qwen3 bit-identical (RopeScalingParams
+      default enabled=false; ctest -L weights 13/13 + nomodel 9/9, pytest 44). License:
+      Llama Community License — weights + goldens' text not redistributed (baseline lists ids).
 - [ ] **A3** — **Granite-3.1-1B-A400M** (IBM 2024-12, Apache 2.0): the MoE rung, the
       phase's biggest new code. 1.3B total / 400M active, 32 experts top-8, SwiGLU
       experts (moe_ffn 512), GQA 16/8, fp32 5.2 GB — the only standard-transformer
