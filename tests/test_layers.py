@@ -93,6 +93,39 @@ def test_transformer_block_shape():
     assert out.shape == x.shape
 
 
+def test_rope_scaling_none_is_identity():
+    # Qwen2.5/Qwen3: no scaling -> inv_freq passes through untouched.
+    from nanoinfer.layers import _apply_rope_scaling
+
+    inv = 1.0 / (10000.0 ** (torch.arange(0, 64, 2).float() / 64))
+    assert torch.equal(_apply_rope_scaling(inv, None), inv)
+
+
+def test_llama3_rope_scaling_bands():
+    # A2 Llama-3.2: the three frequency bands. High freq (short wavelength) is
+    # untouched, low freq (long wavelength) is divided by `factor`, and the band
+    # between blends smoothly — the real Llama-3.2-1B params.
+    import math
+
+    from nanoinfer.layers import _apply_rope_scaling
+
+    theta, head_dim = 500000.0, 64
+    inv = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
+    scaling = {"rope_type": "llama3", "factor": 32.0, "low_freq_factor": 1.0,
+               "high_freq_factor": 4.0, "original_max_position_embeddings": 8192}
+    out = _apply_rope_scaling(inv, scaling)
+
+    wavelen = 2 * math.pi / inv
+    hi = wavelen < (8192 / 4.0)   # high-freq band: unchanged
+    lo = wavelen > (8192 / 1.0)   # low-freq band: /factor
+    assert torch.allclose(out[hi], inv[hi])
+    assert torch.allclose(out[lo], inv[lo] / 32.0)
+    med = ~hi & ~lo               # medium band: strictly between the two
+    if med.any():
+        ratio = out[med] / inv[med]
+        assert torch.all(ratio > 1 / 32.0 - 1e-6) and torch.all(ratio < 1.0 + 1e-6)
+
+
 def test_qk_norm_default_off():
     # Qwen2.5 default: qk_norm False -> no q_norm/k_norm submodules, no new params.
     attn = Attention(tiny_cfg())

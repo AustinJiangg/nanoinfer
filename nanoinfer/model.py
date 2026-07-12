@@ -25,7 +25,7 @@ class Model(nn.Module):
         # Registered as a buffer so .to(device) moves them with the model.
         cos, sin = build_rope_cache(
             cfg.max_position_embeddings, cfg.head_dim, cfg.rope_theta,
-            device="cpu",
+            device="cpu", rope_scaling=cfg.rope_scaling,
         )
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)

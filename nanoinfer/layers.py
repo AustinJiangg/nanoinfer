@@ -10,6 +10,8 @@ Sharp edges (see CLAUDE.md):
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -36,18 +38,58 @@ class RMSNorm(nn.Module):
         return (x * self.weight).to(dtype)
 
 
+def _apply_rope_scaling(inv_freq: torch.Tensor, rope_scaling: dict | None) -> torch.Tensor:
+    """Rescale the base inv_freq for a scaled-RoPE variant (A2 Llama-3.2).
+
+    Resolved here, at table-build time, so the rotation kernel (apply_rope) is
+    UNTOUCHED — the same "fix the frequencies at load, not in the hot path" lesson
+    as rope_theta. None (Qwen2.5/Qwen3) returns inv_freq unchanged.
+
+    llama3 stretches the low frequencies (long wavelengths) to extend context: a
+    frequency's wavelength decides its band — below high_freq_wavelen stays as-is
+    (local detail), above low_freq_wavelen is divided by `factor` (long range),
+    and the band between is a smooth interpolation. Mirrors HF's
+    _compute_llama3_parameters exactly (attention_factor is 1.0, so cos/sin aren't
+    further scaled).
+    """
+    if rope_scaling is None:
+        return inv_freq
+    rtype = rope_scaling.get("rope_type") or rope_scaling.get("type")
+    if rtype != "llama3":
+        raise ValueError(f"unsupported rope_scaling type {rtype!r} (A2 implements llama3)")
+
+    factor = rope_scaling["factor"]
+    low_freq_factor = rope_scaling["low_freq_factor"]
+    high_freq_factor = rope_scaling["high_freq_factor"]
+    old_context_len = rope_scaling["original_max_position_embeddings"]
+
+    low_freq_wavelen = old_context_len / low_freq_factor
+    high_freq_wavelen = old_context_len / high_freq_factor
+    wavelen = 2 * math.pi / inv_freq
+    # Long wavelengths (low freq) divided by factor; short ones (high freq) kept.
+    inv_freq_llama = torch.where(wavelen > low_freq_wavelen, inv_freq / factor, inv_freq)
+    # Medium band: smooth blend between the scaled and unscaled frequency.
+    smooth = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
+    smoothed = (1 - smooth) * inv_freq_llama / factor + smooth * inv_freq_llama
+    is_medium = ~(wavelen < high_freq_wavelen) & ~(wavelen > low_freq_wavelen)
+    return torch.where(is_medium, smoothed, inv_freq_llama)
+
+
 def build_rope_cache(
-    seq_len: int, head_dim: int, theta: float, device, dtype=torch.float32
+    seq_len: int, head_dim: int, theta: float, device, dtype=torch.float32,
+    rope_scaling: dict | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Precompute cos/sin tables for rotary position embeddings.
 
     Returns two tensors of shape [seq_len, head_dim]. Each frequency is duplicated
     across the two halves of the head dimension to match the half-split rotation.
+    `rope_scaling` (A2) rescales the frequencies at build time for scaled variants.
     """
     # inv_freq: [head_dim/2]
     inv_freq = 1.0 / (
         theta ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim)
     )
+    inv_freq = _apply_rope_scaling(inv_freq, rope_scaling)
     positions = torch.arange(seq_len, device=device).float()  # [seq_len]
     freqs = torch.outer(positions, inv_freq)                  # [seq_len, head_dim/2]
     # Duplicate to full head_dim: [seq_len, head_dim]
