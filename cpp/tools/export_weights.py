@@ -51,7 +51,10 @@ def main() -> None:
     from nanoinfer.weights import load_model
 
     print(f"loading {model_name} ...")
-    model, tokenizer = load_model(model_name, dtype=torch.float32, device="cpu")
+    # hf_dtype="auto" loads HF at the checkpoint's native dtype (bf16), then upcasts
+    # losslessly into our fp32 model — half the peak RAM of an all-fp32 load, so the
+    # ~1.7B exports (A1 Qwen3-1.7B) stay under this box's ceiling. Byte-identical fp32.
+    model, tokenizer = load_model(model_name, dtype=torch.float32, device="cpu", hf_dtype="auto")
     cfg = model.cfg
     eos_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else -1
 

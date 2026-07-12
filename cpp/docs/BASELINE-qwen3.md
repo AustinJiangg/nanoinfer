@@ -125,12 +125,63 @@ python tests/python/run_spec_serve.py weights/qwen3-0.6b weights/qwen3-0.6b
 python tests/python/run_http_serve.py weights/qwen3-0.6b --device cuda
 ```
 
+## Qwen3-1.7B — the scale-up target (zero model-code changes)
+
+The A1 second target. Same arch as 0.6B (QK-Norm, no bias, head_dim 128) — the port was export +
+parity, **no code change**, exactly like the Qwen2.5-0.5B → 1.5B port. Bigger dims: hidden
+1024→**2048**, intermediate 3072→**6144** (layers 28, heads 16/8, head_dim 128 unchanged); fp32
+weights **6885 MB**. Prompt/goldens identical to 0.6B on this prompt (both greedy to *" Paris. The
+capital of Italy is Rome. The capital of"*).
+
+**RAM ceiling handled (the roadmap's named risk).** 1.7B fp32 = 6.8 GB, and the old export loaded
+the HF model fp32 (6.8 GB) *and* our fp32 model (6.8 GB) co-resident ≈ 13.6 GB — over this box's
+~12 GB available. Fix: `load_model(hf_dtype="auto")` loads HF at the checkpoint's native bf16
+(3.4 GB) and upcasts losslessly into our fp32 model (bf16→fp32 zero-extends — verified byte-identical
+over all 311 tensors, `max|diff|=0`). Peak export RAM **11 GB** (measured), under the ceiling.
+export_weights / dump_reference pass `hf_dtype="auto"`.
+
+| gate | result |
+|---|---|
+| CPU `run_parity` | `max\|diff\|=3.14713e-05`, argmax 0/5, next-token MATCH; `run_generate` golden **0/12** |
+| CUDA fp32 | `max\|diff\|=1.57356e-05`, argmax 0/5, greedy **0/12** MATCH; weights 6885 MB |
+| CUDA fp16 | greedy **0/12** MATCH, `max\|diff\|=2.67029e-05`; 3444 MB (2.00×) |
+| CUDA W8A8 | greedy **0/12** differ, preserved; 2660 MB |
+| CUDA full-int8 | greedy 11/12 differ, preserved; 1727 MB (**3.99×**) |
+| `run_cuda_cache` / `run_cuda_paged` | flash-split MATCH; S1 rollback `max\|diff\|=0` bit-identical |
+
+## Speculative pair (0.6B draft / 1.7B target) — the S2 second data point
+
+The A1 bonus: a same-tokenizer draft/target pair (both vocab 151936). Correctness gate `run_spec`
+(CPU, fp32 oracle): the verify primitive is bit-identical (`multi==sequential |diff|=0`,
+`truncate+replay |diff|=0`), and greedy speculative output is **token-identical to plain 1.7B
+greedy at every K** — accept **88.9% @k=2, 95.0% @k=4, 75.0% @k=8** (higher than the Qwen2.5
+0.5B/1.5B pair's 65% @k=2 — a same-generation draft tracks its target better). Prompt-lookup MATCH
+on both models.
+
+**But `r = t_draft/t_target ≈ 0.56` (measured, clean single-prompt) / 0.61 (under VRAM pressure) —
+NOT the 0.35 the param ratio predicted.** `bench_spec --device cuda` (france prompt, the pair fits):
+plain target 28.2 tok/s, plain draft 50.7 tok/s → r=0.56; K=4 accept 81.8%, **speedup 1.09×** (spec
+30.8 tok/s), correctness-gated ok. The gap from 0.35 is the S2 story sharpened: decode is not purely
+weight-bandwidth-bound at this scale — the path-independent per-op launch overhead (~360 ops/token,
+G6) is a *bigger* fraction of the small 0.6B draft's step, so its relative cost is **higher** than
+its weight ratio, not lower. So the 0.6B/1.7B pair is r=0.56 vs 0.5B/1.5B's 0.45 — the newer pair is
+*worse* for spec, the opposite of the naive prediction, and the modest 1.09× (K=4) is exactly what
+`(k+1)/(1+k·r)` gives at r≈0.56. **S2's verdict holds and generalizes: lowering r (a genuinely cheap
+draft, or a free proposer — S4 prompt-lookup) is the fix; tuning K is only a knob.**
+
+**VRAM finding:** the fp32 pair (6885 + 2387 = 9.3 GB) + WSL2/display (~1.6 GB) leaves too little for
+two KV caches — `bench_spec`'s full 5-prompt K-sweep OOMs mid-sweep on the 12 GB 4070S (single-prompt
+short-context fits). This is the 1.5B P1 finding at 1.7B: **fp16/quant is the enabler** for the
+two-model resident scenario (fp16 halves the pair to 4.6 GB). A clean full-sweep r under fp16 weights
+needs bench_spec to take a weight-dtype flag — a small follow-up.
+
 ## Verdict (A1)
 
 The A0 architecture-description layer did its job: **a new Llama-family arch cost one config flag
 (`qk_norm`) already read by A0, one `apply_qk_norm` helper wired into three forwards, and zero new
-kernels — CUDA inherited QK-Norm through the existing `rmsnorm` op.** Qwen3-0.6B is now parity-locked
-CPU + CUDA (fp32/fp16/int8) and green across the serving + spec + HTTP gates, while Qwen2.5 stays
-bit-identical. The "feature flags, not a class hierarchy" bet (the llama.cpp shape) is validated on
-the first rung. The Qwen3-1.7B target + the 0.6B/1.7B speculative pair (r≈0.35, a second data point
-for S2's "r is the binding constraint") are the remaining A1 items.
+kernels — CUDA inherited QK-Norm through the existing `rmsnorm` op.** Both Qwen3 sizes are parity-
+locked CPU + CUDA (fp32/fp16/int8) and green across the serving + spec + HTTP gates, while Qwen2.5
+stays bit-identical; the 1.7B port was export + parity with no code change (the RAM ceiling met by a
+lossless bf16 HF-load path). The "feature flags, not a class hierarchy" bet (the llama.cpp shape) is
+validated on the first rung. The spec pair adds an S2 data point that sharpens the r-is-the-constraint
+story (r≈0.56, above the param-ratio prediction, because per-op overhead dominates the small draft).

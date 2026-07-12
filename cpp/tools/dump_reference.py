@@ -30,7 +30,9 @@ def main() -> None:
 
     from nanoinfer.weights import load_model
 
-    model, tokenizer = load_model(model_name, dtype=torch.float32, device="cpu")
+    # hf_dtype="auto": load HF at native (bf16) dtype, upcast losslessly to our fp32
+    # model — half the peak RAM (the ~1.7B ceiling), byte-identical fp32 (see export_weights).
+    model, tokenizer = load_model(model_name, dtype=torch.float32, device="cpu", hf_dtype="auto")
     ids = tokenizer(prompt, return_tensors="pt").input_ids
     with torch.no_grad():
         logits = model(ids)[0]  # [seq, vocab]

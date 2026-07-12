@@ -22,10 +22,23 @@ if TYPE_CHECKING:
     from transformers import AutoTokenizer
 
 
-def load_model(model_name: str, dtype=torch.float32, device="cpu") -> tuple[Model, AutoTokenizer]:
+def load_model(
+    model_name: str, dtype=torch.float32, device="cpu", hf_dtype=None
+) -> tuple[Model, AutoTokenizer]:
     """Download/load `model_name`, build our Model, copy weights in.
 
     Returns (model, tokenizer). The model is in eval mode on `device`.
+
+    `hf_dtype` controls the dtype the HF model is *loaded* at, before its tensors
+    are copied into our `dtype` model. It defaults to `dtype` (both fp32 — the
+    usual, fully-precise oracle path). Pass `"auto"` to load HF at the checkpoint's
+    native dtype (bf16 for the Qwen/Llama checkpoints), which HALVES the peak RAM:
+    otherwise the fp32 HF model and our fp32 model are co-resident (~2× the model
+    size), which is over this box's ceiling at ~1.7B (the A1 Qwen3-1.7B case).
+    The copy into our fp32 model UPCASTS each tensor (bf16/fp32 -> fp32), which is
+    lossless — bf16->fp32 zero-extends the mantissa — so the fp32 weights are
+    byte-identical to the all-fp32 path. Never pass a dtype that would DOWNCAST a
+    checkpoint tensor (that would lose precision); "auto" only ever upcasts.
     """
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
@@ -35,7 +48,9 @@ def load_model(model_name: str, dtype=torch.float32, device="cpu") -> tuple[Mode
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     # Load HF weights only to read tensors out of them — we never call generate().
-    hf_model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype)
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        model_name, torch_dtype=(hf_dtype if hf_dtype is not None else dtype)
+    )
     hf_sd = hf_model.state_dict()
 
     model = Model(cfg).to(dtype=dtype)

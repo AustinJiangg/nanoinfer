@@ -965,17 +965,28 @@ golden tokens; (4) serving, run_serve / run_spec_serve / HTTP smoke;
       1.5B target — mixed-version back-compat). The 1.5B export is deliberately left
       at v1 (re-export needs ~12 GB co-resident, near the box ceiling); it loads
       correctly precisely because the v1-compat defaults are right for Qwen2.5.
-- [ ] **A1** — **Qwen3-0.6B + 1.7B** (2025-04, Apache 2.0): the smallest delta.
-      (1) QK-Norm — per-head RMSNorm over head_dim on Q and K, post-projection,
-      pre-RoPE, own weights; near-zero new kernel code (reshape to tokens·heads rows
-      and drive the existing rmsnorm op/kernel); (2) no QKV bias; (3) explicit
-      head_dim=128 — on 0.6B q_proj is 1024→2048, NOT square, flushing any hidden
-      `n_heads·head_dim == hidden` assumption; (4) rope_theta 1e6; vocab identical to
-      Qwen2.5 (151936). 1.7B fp32 = 6.8 GB — AT the oracle RAM ceiling; the fallback
-      is tensor-streaming export (never HF + fp32 copies co-resident). **Bonus:** a
-      new spec pair — 0.6B draft / 1.7B target, same tokenizer, r≈0.35 vs today's
-      0.45 — rerun bench_spec unchanged and check S2's "r is the binding constraint"
-      curve against a second data point.
+- [x] **A1** ✅ landed — **Qwen3-0.6B + 1.7B** (2025-04, Apache 2.0): the smallest delta,
+      and it cost almost no code. (1) QK-Norm — per-head RMSNorm over head_dim on Q and K,
+      post-projection, pre-RoPE, own weights; **one `Model::apply_qk_norm` helper** wired into
+      all three forwards (the existing rmsnorm op already normalizes `[heads,*,head_dim]` over
+      its last dim, on BOTH the CPU op and CudaBackend::rmsnorm — so **CUDA got QK-Norm for
+      free, no kernel change**); the Python oracle mirrors it in Attention. (2) no QKV bias +
+      (3) explicit head_dim=128 (0.6B q_proj 1024→2048, non-square) + (4) rope_theta 1e6: all
+      already read by A0's config layer, so config-only. vocab identical to Qwen2.5 (151936).
+      **Gate (all 5 steps, both sizes):** Python HF-parity (tests/test_qwen3.py, logits allclose
+      + greedy), CPU run_parity (0.6B 2.0e-5 / 1.7B 3.1e-5) + golden 0/12, CUDA fp32 (2.9e-5 /
+      1.6e-5) + golden + fp16/W8A8/full-int8, cache/paged/batch bit-identical, serving
+      (run_serve / run_spec_serve / run_http_serve) MATCH, goldens + `cpp/docs/BASELINE-qwen3.md`.
+      Qwen2.5 stays bit-identical (ctest -L weights 13/13 + nomodel 9/9 — QK-Norm is a true no-op
+      when off). **1.7B RAM ceiling met** by `load_model(hf_dtype="auto")` — HF loads native bf16,
+      upcasts losslessly to our fp32 (verified byte-identical), peak 11 GB not 13.6 GB; no
+      tensor-streaming needed. **Bonus — spec pair 0.6B draft / 1.7B target** (same tokenizer):
+      run_spec token-identical to plain 1.7B greedy, accept 88.9–95%; but **measured r≈0.56
+      (france, clean) / 0.61 — NOT the predicted 0.35.** The param ratio isn't the forward-time
+      ratio at this scale: per-op launch overhead (~360/token, G6) is a bigger fraction of the
+      small draft's step, so r is *higher* than the weight ratio (S2's story sharpened — lowering
+      r is the fix, not tuning K; speedup 1.09× @K=4). fp32 pair OOMs a full bench sweep on 12 GB
+      (fp16 is the enabler, the 1.5B P1 finding at 1.7B). See BASELINE-qwen3.md.
 - [ ] **A2** — **Llama-3.2-1B** (Meta 2024-09): the config-heavy rung, cheap after
       A1. (1) llama3 rope scaling — scale inv_freq in three frequency bands at LOAD
       time (low ÷ factor 32, high untouched, smooth ramp between); the RoPE kernel is
