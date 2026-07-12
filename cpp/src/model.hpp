@@ -90,6 +90,12 @@ private:
     // qkv_bias flag: Qwen2.5 carries one, Qwen3/Llama don't). The exporter simply
     // omits the bias .bin when qkv_bias is off, so this must not look it up then.
     const Tensor* qkv_bias_ptr(const std::string& name) const;
+    // QK-Norm (A1 Qwen3): a per-head RMSNorm over head_dim applied to Q and K
+    // after the head split and before RoPE (matching the Python oracle). Given
+    // [heads, *, head_dim] tensors, rmsnorm normalizes each (head, position) row
+    // over its last dim. A no-op — and looks up no weight — when cfg.qk_norm is
+    // off (Qwen2.5), keeping that path bit-identical. Shared by all three forwards.
+    void apply_qk_norm(Tensor& q, Tensor& k, const std::string& layer_prefix) const;
     // A linear projection that dispatches to the Q8 path when `name` is quantized.
     Tensor project(const Tensor& x, const std::string& name, const Tensor* bias) const;
     // The token-embedding gather and the output projection to logits — each weight-only int8

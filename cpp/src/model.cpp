@@ -132,6 +132,12 @@ std::unique_ptr<KVCacheBase> Model::make_kv_cache(int64_t max_seq) const {
     return backend_->make_kv_cache(cfg_.num_layers, cfg_.num_kv_heads, cfg_.head_dim, max_seq);
 }
 
+void Model::apply_qk_norm(Tensor& q, Tensor& k, const std::string& layer_prefix) const {
+    if (!cfg_.qk_norm) return;  // Qwen2.5: no QK-Norm weights, path stays bit-identical
+    q = backend_->rmsnorm(q, W(layer_prefix + "self_attn.q_norm.weight"), cfg_.rms_norm_eps);
+    k = backend_->rmsnorm(k, W(layer_prefix + "self_attn.k_norm.weight"), cfg_.rms_norm_eps);
+}
+
 Tensor Model::project(const Tensor& x, const std::string& name, const Tensor* bias) const {
     // R3: every projection is a Weight (DenseWeight for fp32/fp16, a quant weight otherwise) in one
     // map — no device or format branch here; the Weight owns its own kernel.
@@ -229,6 +235,9 @@ Tensor Model::forward(const std::vector<int64_t>& ids, KVCacheBase* cache) const
         k = backend_->split_heads(k, cfg_.num_kv_heads, cfg_.head_dim);
         v = backend_->split_heads(v, cfg_.num_kv_heads, cfg_.head_dim);
 
+        // QK-Norm (Qwen3) between the head split and RoPE; no-op for Qwen2.5.
+        apply_qk_norm(q, k, L);
+
         // RoPE at absolute positions; cached keys are stored already rotated.
         q = backend_->apply_rope(q, rope_.cos, rope_.sin, start_pos);
         k = backend_->apply_rope(k, rope_.cos, rope_.sin, start_pos);
@@ -311,6 +320,7 @@ Tensor Model::forward_batch(const std::vector<int64_t>& tokens,
             Tensor qs = backend_->extract_row(q, s, H, D);   // [H, 1, D]
             Tensor ks = backend_->extract_row(k, s, KV, D);  // [KV, 1, D]
             Tensor vs = backend_->extract_row(v, s, KV, D);
+            apply_qk_norm(qs, ks, L);  // QK-Norm before RoPE (see forward())
             qs = backend_->apply_rope(qs, rope_.cos, rope_.sin, pos[static_cast<size_t>(s)]);
             ks = backend_->apply_rope(ks, rope_.cos, rope_.sin, pos[static_cast<size_t>(s)]);
             // Append this token's K/V and attend over the sequence's own history.
@@ -394,6 +404,7 @@ Tensor Model::forward_spec_batch(const std::vector<int64_t>& tokens,
             Tensor qh = backend_->split_heads(backend_->extract_rows(q, rs, cnt), H, D);   // [H,cnt,D]
             Tensor kh = backend_->split_heads(backend_->extract_rows(k, rs, cnt), KV, D);  // [KV,cnt,D]
             Tensor vh = backend_->split_heads(backend_->extract_rows(v, rs, cnt), KV, D);
+            apply_qk_norm(qh, kh, L);  // QK-Norm before RoPE (see forward())
             qh = backend_->apply_rope(qh, rope_.cos, rope_.sin, p);
             kh = backend_->apply_rope(kh, rope_.cos, rope_.sin, p);
             // Multi-query causal attend at offset p: query row j attends keys 0..p+j (its
