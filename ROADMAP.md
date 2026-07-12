@@ -1059,12 +1059,34 @@ golden tokens; (4) serving, run_serve / run_spec_serve / HTTP smoke;
       (run_generate, run_cuda_parity, cache/paged/batch, serve/spec/http) passes against
       it unchanged. Load RAM: the host map still inflates to fp32 (the 3B-class
       stream-on-load tail stays open — noted for when a 3B target actually exists).
-- [ ] **B2** — wmma fp32 accumulators, re-measured. G5d's wmma accumulated in fp16
-      (err 8e-3); switch to fragment<accumulator, float> for fp16 AND bf16 inputs
-      (bf16 wmma mandates fp32 accum anyway). Honest expectation: GeForce halves
-      fp32-accum tensor throughput vs fp16-accum (deliberate segmentation), so the
-      lm_head's 105%-of-cuBLAS may drop to ~50–60% and tie the fp32 tiled kernel —
-      measure and record either way (the G5f-tiled discipline).
+- [x] **B2** ✅ landed — bf16 tensor cores + the wmma-accumulator question answered by
+      measurement. **The record corrected first:** this item's premise ("G5d's wmma
+      accumulated in fp16, err 8e-3") was STALE — git shows the wmma kernels have used
+      `fragment<accumulator, float>` since the day they landed (b98aee1); the 8e-3 was
+      the fp16 rounding of the STAGED OPERANDS, never the accumulator. So B2 re-scoped
+      to: (1) template both wmma kernels on the staging dtype ST (half | __nv_bfloat16;
+      from_f32<ST> replaces ldh; a weight already stored as ST restages exactly) and
+      route the bf16 lm_head prefill through the 128² warp-tiled wmma-b (fp32 accum —
+      the hardware mandate for bf16 inputs, static_assert'd); (2) add a BENCH-ONLY
+      fp16-accumulator variant (ACC template + cuda_policy().wmma_fp16_acc, never in the
+      model path) to test the "GeForce halves fp32-accum tensor throughput" fear
+      directly. **Measured (run_cuda_bench B2 matrix, lm_head m=128):** on 0.5B shapes
+      fp16-acc is 0.83× — SLOWER than fp32-acc (14.5k vs 17.5k GF/s); on 1.5B shapes
+      1.06× — mixed sign, tie-class both ways, nowhere near the feared 2×. The kernel
+      runs at ~12% of the tensor-core ALU peak: it is FEEDING-bound, so the ALU-rate
+      segmentation cannot bite — fp32 accumulate is simultaneously the faster-or-tied
+      AND ~18× more accurate (err 1.5e-2 vs 2.7e-1) choice. The G5d "105% of cuBLAS"
+      number was always an fp32-accum number. **wmma-b:** 16.9k GF/s = 0.97× wmma-h
+      (1.28× the fp32 warp-tiled) on 0.5B, 0.98× on 1.5B — bf16 tensor cores cost
+      ~nothing vs fp16, with the ~8× coarser ACTIVATION staging as the trade (test_cuda
+      wmma-b 1.0e-1 vs wmma-h 1.26e-2; the weights themselves restage exactly). e2e
+      (run_cuda_decode_bench, prefill 128 / decode 128, 0.5B): bf16 decode 100.2 tok/s ≈
+      fp16's 102.9 (1.19× vs fp32's 84.4 — the ½-byte lever), prefill ~3500 all three
+      (the lm_head is one op of ~360 — Amdahl). Honest scope: like fp16's wmma-h, wmma-b
+      feeds argmax only at prefill m>16, which the short-prompt golden gates don't
+      reach — its correctness floor is the isolated oracle parity (test_cuda) plus the
+      same not-gated-informational status the fp16 lm_head has always had; the decode
+      paths (GEMV-b) are golden-gated MATCH in run_cuda_parity.
 - [ ] **B3a** — half-precision KV cache (the real payoff; smallest blast radius
       first). Cast K/V to bf16 at write; attend converts to fp32 in registers
       (softmax/accumulate stay fp32). Long-context decode is KV-bandwidth-bound (P2),

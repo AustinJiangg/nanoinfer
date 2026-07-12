@@ -56,8 +56,9 @@ static bool check_linear(int64_t m, int64_t n, int64_t k, double tol, DType wdt,
         wdt == DType::F16
             ? (m <= 16 ? "gemv-h" : (n >= 8192 ? "wmma-h" : "tiled-h"))
         : wdt == DType::BF16
-            // B1 dispatch: GEMV / float4 tiled / the scalar-tiled ragged fallback (B2 adds wmma-b).
-            ? (m <= 16 ? "gemv-b" : (aligned ? "tiled-b" : "stile-b"))
+            // GEMV / wmma-b (lm_head tensor cores, B2) / float4 tiled / scalar-tiled ragged fallback.
+            ? (m <= 16 ? "gemv-b"
+                       : (n >= 8192 && aligned ? "wmma-b" : (aligned ? "tiled-b" : "stile-b")))
             : (cuda_policy().use_wmma ? "wmma" : (m <= 16 ? "gemv" : "tiled"));
     std::printf("test_cuda: [%4lld x %4lld] @ [%6lld x %4lld]^T (%-6s) max|diff|=%.3e (tol %.0e) %s\n",
                 (long long)m, (long long)k, (long long)n, (long long)k, kern, maxdiff, tol,
@@ -351,14 +352,16 @@ int main() {
     ok &= check_linear(100, 896, 4864, 3e-1, DType::F16, rng);   // tiled-h, ragged m + wide k
     ok &= check_linear(128, 8192, 896, 5e-1, DType::F16, rng);   // wmma-h 128² warp-tiled, large n (lm_head)
 
-    // bf16 WEIGHTS (B1): the same GEMV/tiled dispatch reading __nv_bfloat16 through ldf/load4 —
-    // fp32 compute, so the max|diff| is purely the bf16 rounding of the weight (8 mantissa bits,
-    // 2^3 coarser than fp16 → the tolerances sit ~8× above the fp16-weight rows). The ragged-n
-    // case exercises the scalar-tiled fallback (the one path fp16 sends to wmma instead).
+    // bf16 WEIGHTS (B1/B2): GEMV + float4 tiled read __nv_bfloat16 through ldf/load4 — fp32
+    // compute, so the max|diff| is purely the bf16 rounding of the weight (8 mantissa bits, 2^3
+    // coarser than fp16 → the tolerances sit ~8× above the fp16-weight rows). The huge-n rows hit
+    // the B2 tensor-core path (wmma-b: activations restage to bf16 too, so it's the loosest). The
+    // ragged-n case exercises the scalar-tiled fallback (the one path fp16 sends to wmma instead).
     ok &= check_linear(4, 896, 896, 8e-1, DType::BF16, rng);     // gemv-b (decode, bf16 weight)
     ok &= check_linear(128, 896, 896, 8e-1, DType::BF16, rng);   // tiled-b (prefill projection)
     ok &= check_linear(100, 896, 4864, 2e0, DType::BF16, rng);   // tiled-b, ragged m + wide k
-    ok &= check_linear(128, 8192, 896, 8e-1, DType::BF16, rng);  // tiled-b 128-aligned huge n (lm_head, B1)
+    ok &= check_linear(128, 8192, 896, 1e0, DType::BF16, rng);   // wmma-b 128² warp-tiled (lm_head, B2)
+    ok &= check_linear(100, 8192, 896, 1e0, DType::BF16, rng);   // wmma-b, ragged m
     ok &= check_linear(20, 100, 90, 8e-1, DType::BF16, rng);     // stile-b: ragged n+k fallback
 
     // Embedding gather (G5d/B1): fp32 table is an exact copy; fp16/bf16 tables (embed_tokens path)

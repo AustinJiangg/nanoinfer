@@ -112,6 +112,9 @@ int main(int argc, char** argv) {
         // is built, since the conversion happens at the once-per-load upload.
         BackendConfig cfg;
         if (const char* e = std::getenv("NI_FP16W")) cfg.fp16_weights = (e[0] == '1');
+        // NI_BF16W=1: the bf16 sibling (B1/B2) — same ½-byte lever, byte-exact weights; decode
+        // rides GEMV-b, prefill the tiled-b projections + wmma-b lm_head. Exclusive with NI_FP16W.
+        if (const char* e = std::getenv("NI_BF16W")) cfg.bf16_weights = (e[0] == '1');
         // NI_WMMA=1 routes the prefill (m>16) projection GEMMs through the tensor-core wmma-h kernel
         // (P0: it TIED on 0.5B but wins on 1.5B's wide MLP GEMMs — gate/up 1.61×, down 1.25× isolated).
         // Pairs with NI_FP16W (wmma only wins reading fp16 weight storage, not fp32+per-tile convert).
@@ -156,7 +159,9 @@ int main(int argc, char** argv) {
         Model model(dir, qmode, Device::CUDA, cfg);
         const int64_t vocab = model.config().vocab_size;
         std::printf("layer weights: %s%s; KV cache: %s; A/B: %s\n",
-                    qmode == QuantMode::W8A8 ? "int8 W8A8 (DP4A)" : (cfg.fp16_weights ? "fp16 (G5d)" : "fp32"),
+                    qmode == QuantMode::W8A8 ? "int8 W8A8 (DP4A)"
+                    : (cfg.fp16_weights ? "fp16 (G5d)"
+                                        : (cfg.bf16_weights ? "bf16 (B1)" : "fp32")),
                     cfg.quantize_embed ? " + int8 embed/lm_head" : "",
                     use_paged ? "paged (G4b)" : "contiguous (G3)",
                     g_ab_int8_lmhead ? "int8 lm_head tiled vs GEMV"

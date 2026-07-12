@@ -55,6 +55,12 @@ struct CudaPolicy {
     // (the P1-named decode cap). GEMV is bit-identical to the tiled kernel (int32 exact), so this only
     // trades speed, not the result. Left false in normal use.
     bool force_tiled_w8a8 = false;
+    // BENCH-ONLY (B2): run the 128² wmma lm_head kernel with an fp16 ACCUMULATOR instead of the fp32
+    // one it has had since G5d. Never set in the model path (fp16 accumulate is lossy over k-length
+    // sums and feeds argmax); exists so run_cuda_bench can answer "does GeForce's halved fp32-accum
+    // tensor throughput actually bite this kernel?" by measurement. bf16 inputs ignore it (the
+    // hardware mandates a float accumulator for bf16 — static_assert'd in the kernel).
+    bool wmma_fp16_acc = false;
     // W8A8 lm_head (backlog follow-up): route the int8 embed/lm_head's PREFILL linear (m>kGemvMaxM,
     // the biggest compute-bound matmul) through int8×int8 DP4A (the 4:1-MAC compute win) instead of the
     // weight-only-int8-storage fp32 GEMM. Opt-in and token-guarded — the lm_head feeds argmax, so the

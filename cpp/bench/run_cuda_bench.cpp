@@ -96,11 +96,14 @@ int main(int argc, char** argv) {
     if (const char* e = std::getenv("NI_WMMA")) cuda_policy().use_wmma = (e[0] == '1');
     bool fp16w = false;
     if (const char* e = std::getenv("NI_FP16W")) fp16w = (e[0] == '1');
+    bool bf16w = false;  // B2: bf16 weight storage — GEMV-b / tiled-b / wmma-b (lm_head)
+    if (const char* e = std::getenv("NI_BF16W")) bf16w = (e[0] == '1');
     if (const char* e = std::getenv("NI_DBUF")) cuda_policy().use_dbuf = (e[0] == '1');
     std::printf("prefill (m>16) kernel: %s\n",
-                fp16w ? "wmma-h (fp16 weights)"
-                      : (cuda_policy().use_wmma ? "wmma (fp32 weights, fp16 staged)"
-                                                : "tiled (fp32)"));
+                fp16w   ? "wmma-h (fp16 weights)"
+                : bf16w ? "wmma-b (bf16 weights)"
+                        : (cuda_policy().use_wmma ? "wmma (fp32 weights, fp16 staged)"
+                                                  : "tiled (fp32)"));
 
     // Projection shapes {label, n, k} = y[m,n] = x[m,k] @ w[n,k]ᵀ, per model.
     //   0.5B: hidden=896,  intermediate=4864, n_heads=14, head_dim=64  (q/o n=896,  kv n=128)
@@ -137,9 +140,9 @@ int main(int argc, char** argv) {
             for (int64_t i = 0; i < x.numel(); ++i) x[i] = dist(rng);
             for (int64_t i = 0; i < w.numel(); ++i) w[i] = dist(rng);
             Tensor xd = to_device(x), wf32 = to_device(w), yd = to_device(Tensor({m, n}));
-            // ours uses fp16 weights when opted in; cuBLAS always reads the fp32 copy, so the
-            // max|diff| column then reports the fp16-weight cost vs the fp32 baseline.
-            Tensor wd = fp16w ? to_device_f16(w) : wf32;
+            // ours uses fp16/bf16 weights when opted in; cuBLAS always reads the fp32 copy, so
+            // the max|diff| column then reports that half-weight cost vs the fp32 baseline.
+            Tensor wd = fp16w ? to_device_f16(w) : bf16w ? to_device_bf16(w) : wf32;
             float* xp = static_cast<float*>(xd.device_ptr());
             float* wp = static_cast<float*>(wf32.device_ptr());
             float* yp = static_cast<float*>(yd.device_ptr());
@@ -401,6 +404,65 @@ int main(int argc, char** argv) {
         const double flop = 2.0 * m * n * k;
         std::printf("%-9s %10.0f %10.0f %7.2fx | %13.1e\n", lm.label, flop / (w8_ms * 1e-3) / 1e9,
                     flop / (q8_ms * 1e-3) / 1e9, q8_ms / w8_ms, aerr);
+    }
+
+    // --- B2: the lm_head wmma accumulator + input-dtype matrix, one shape (m=128, the prefill
+    // lm_head — the only op the 128² wmma kernel serves). Answers two questions by measurement:
+    //   1. Does GeForce's halved fp32-accum tensor throughput bite THIS kernel? The B2 roadmap
+    //      premise assumed the 105%-of-cuBLAS number came from an fp16 accumulator — the code
+    //      says the accumulator has been fp32 since G5d. fp16-acc here is BENCH-ONLY
+    //      (cuda_policy().wmma_fp16_acc); if it ties fp32-acc, the kernel is FEEDING-bound and
+    //      the ALU-rate segmentation never mattered.
+    //   2. Does bf16 wmma (fp32 accum mandated) run at the fp16 wmma rate? Same fragment
+    //      throughput class on Ada — expect a tie, recorded either way.
+    // min-of-interleaved-rounds timing (the G5h clock-drift discipline). diffs are vs the fp32
+    // warp-tiled kernel on the same inputs (the model-path baseline).
+    std::printf("\nB2 lm_head wmma matrix (m=128): accumulator + input dtype, GFLOP/s:\n");
+    std::printf("%-22s %10s %8s | %10s\n", "variant", "GF/s", "vs fp32", "vs-fp32 err");
+    {
+        const Shape lm = shapes.back();
+        const int64_t m = 128, n = lm.n, k = lm.k;
+        Tensor x({m, k}), w({n, k});
+        for (int64_t i = 0; i < x.numel(); ++i) x[i] = dist(rng);
+        for (int64_t i = 0; i < w.numel(); ++i) w[i] = dist(rng);
+        Tensor xd = to_device(x), wf = to_device(w);
+        Tensor wh = to_device_f16(w), wb = to_device_bf16(w);
+        const double flop = 2.0 * m * n * k;
+
+        // Baseline: the fp32 warp-tiled kernel (the default fp32 lm_head path).
+        Tensor y_f32 = to_host(gpu.linear(xd, wf, nullptr));
+
+        struct Variant {
+            const char* name;
+            const Tensor* wgt;   // which weight buffer the dispatch reads (dtype picks the kernel)
+            bool use_wmma;       // fp32 weights need the opt-in to reach wmma
+            bool fp16_acc;       // the bench-only accumulator knob
+        };
+        const Variant variants[] = {
+            {"fp32 warp-tiled", &wf, false, false},
+            {"wmma fp32w f32-acc", &wf, true, false},
+            {"wmma fp32w f16-acc", &wf, true, true},
+            {"wmma-h f16w f32-acc", &wh, false, false},
+            {"wmma-h f16w f16-acc", &wh, false, true},
+            {"wmma-b bf16w f32-acc", &wb, false, false},
+        };
+        double base_ms = 0.0;
+        for (const Variant& v : variants) {
+            cuda_policy().use_wmma = v.use_wmma;
+            cuda_policy().wmma_fp16_acc = v.fp16_acc;
+            Tensor y = to_host(gpu.linear(xd, *v.wgt, nullptr));
+            double err = 0.0;
+            for (int64_t i = 0; i < y.numel(); ++i)
+                err = std::max(err, std::fabs((double)y[i] - y_f32[i]));
+            auto run = [&] { Tensor t = gpu.linear(xd, *v.wgt, nullptr); };
+            double ms = 1e30;  // min over interleaved rounds ≈ peak-clock comparison
+            for (int r = 0; r < 4; ++r) ms = std::min(ms, time_ms(run, 30, 5));
+            if (base_ms == 0.0) base_ms = ms;  // first row is the fp32 baseline
+            std::printf("%-22s %10.0f %7.2fx | %10.1e\n", v.name, flop / (ms * 1e-3) / 1e9,
+                        base_ms / ms, err);
+        }
+        cuda_policy().use_wmma = false;
+        cuda_policy().wmma_fp16_acc = false;
     }
 
     cublasDestroy(handle);
