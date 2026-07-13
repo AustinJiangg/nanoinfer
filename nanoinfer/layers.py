@@ -181,6 +181,14 @@ class Attention(nn.Module):
             self.q_norm = None
             self.k_norm = None
 
+        # muP attention scale (A0 flag, A3 Granite): attention_multiplier REPLACES
+        # the softmax scale 1/sqrt(head_dim) when set (Granite 1B: 0.015625, vs
+        # 0.125 default at head_dim 64). None lets SDPA compute the default, which
+        # keeps every non-muP arch on the exact pre-A3 code path.
+        self.scale = (
+            cfg.attention_multiplier if cfg.attention_multiplier != 1.0 else None
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -224,25 +232,69 @@ class Attention(nn.Module):
         # case, where the new queries must attend the whole history (a naive [t, t]
         # triangle would wrongly hide the past keys).
         if attn_mask is None:
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=self.scale)
         else:
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, scale=self.scale)
 
         out = out.transpose(1, 2).contiguous().view(b, t, -1)
         return self.o_proj(out)
 
 
 class SwiGLU(nn.Module):
-    """Gated feed-forward: down( silu(gate(x)) * up(x) )."""
+    """Gated feed-forward: down( silu(gate(x)) * up(x) ).
 
-    def __init__(self, cfg: ModelConfig):
+    `intermediate_size` defaults to the dense FFN width; a MoE expert (A3) passes
+    its own (smaller) width and reuses this module — an expert IS a SwiGLU.
+    """
+
+    def __init__(self, cfg: ModelConfig, intermediate_size: int | None = None):
         super().__init__()
-        self.gate_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=False)
+        inner = intermediate_size or cfg.intermediate_size
+        self.gate_proj = nn.Linear(cfg.hidden_size, inner, bias=False)
+        self.up_proj = nn.Linear(cfg.hidden_size, inner, bias=False)
+        self.down_proj = nn.Linear(inner, cfg.hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class MoE(nn.Module):
+    """Sparse mixture-of-experts FFN (A3 Granite): top-k routed SwiGLU experts.
+
+    Semantics locked against HF GraniteMoe by parity (not docs):
+      - router logits are computed in float32; top-k SELECTS k experts, then
+        softmax runs over ONLY the k selected logits (not all E then renormalize
+        — the Mixtral variant differs here);
+      - each selected expert is a plain SwiGLU at moe_intermediate_size; its
+        output is weighted by the gate probability and summed.
+    The loop below groups tokens BY EXPERT (gather rows -> one expert call ->
+    index_add), accumulating in ascending expert order — the same grouping HF's
+    scatter-sort performs, and the shape the C++ prefill path (A3) mirrors.
+    """
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        self.top_k = cfg.moe_top_k
+        self.router = nn.Linear(cfg.hidden_size, cfg.n_experts, bias=False)
+        self.experts = nn.ModuleList(
+            [SwiGLU(cfg, cfg.moe_intermediate_size) for _ in range(cfg.n_experts)]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, t, h = x.shape
+        flat = x.reshape(-1, h)                                   # [N, hidden]
+        logits = self.router(flat).float()                        # [N, E]
+        top_v, top_i = logits.topk(self.top_k, dim=-1)            # [N, k]
+        gates = torch.softmax(top_v, dim=-1).to(x.dtype)          # [N, k]
+
+        out = torch.zeros_like(flat)
+        for e, expert in enumerate(self.experts):
+            token_idx, kth = (top_i == e).nonzero(as_tuple=True)
+            if token_idx.numel() == 0:
+                continue
+            y = expert(flat[token_idx]) * gates[token_idx, kth, None]
+            out.index_add_(0, token_idx, y)
+        return out.view(b, t, h)
 
 
 class TransformerBlock(nn.Module):
@@ -253,7 +305,13 @@ class TransformerBlock(nn.Module):
         self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.self_attn = Attention(cfg)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
-        self.mlp = SwiGLU(cfg)
+        # A3: n_experts > 0 swaps the dense FFN for the routed experts — the ONLY
+        # structural difference an MoE arch has; attention/cache/masking unchanged.
+        self.mlp = MoE(cfg) if cfg.n_experts > 0 else SwiGLU(cfg)
+        # muP residual scale (A3 Granite): each sublayer's output is scaled before
+        # its residual add. 1.0 for every other arch — kept as a plain float so the
+        # multiply below is a literal no-op branch, not a *1.0 through the graph.
+        self.residual_multiplier = cfg.residual_multiplier
 
     def forward(
         self,
@@ -267,9 +325,16 @@ class TransformerBlock(nn.Module):
         # Pass the cache/mask args by keyword: layer_idx and the mask are easy to
         # transpose positionally, and a swap would silently corrupt the cache slice
         # or the masking (exactly the kind of off-by-one CLAUDE.md warns about).
-        x = x + self.self_attn(
+        attn_out = self.self_attn(
             self.input_layernorm(x), cos, sin,
             cache=cache, layer_idx=layer_idx, attn_mask=attn_mask,
         )
-        x = x + self.mlp(self.post_attention_layernorm(x))
+        mult = self.residual_multiplier
+        if mult != 1.0:
+            # muP (A3 Granite): scale each sublayer output before the residual add.
+            x = x + attn_out * mult
+            x = x + self.mlp(self.post_attention_layernorm(x)) * mult
+        else:
+            x = x + attn_out
+            x = x + self.mlp(self.post_attention_layernorm(x))
         return x

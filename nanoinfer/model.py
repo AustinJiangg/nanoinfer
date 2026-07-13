@@ -48,6 +48,9 @@ class Model(nn.Module):
         """
         b, t = input_ids.shape
         x = self.embed_tokens(input_ids)  # [b, t, hidden]
+        if self.cfg.embedding_multiplier != 1.0:
+            # muP (A3 Granite): the embedding output is scaled (Granite 1B: 12.0).
+            x = x * self.cfg.embedding_multiplier
 
         start_pos = cache.length if cache is not None else 0
 
@@ -78,7 +81,12 @@ class Model(nn.Module):
             cache.advance(t)
 
         x = self.norm(x)
-        return self.lm_head(x)
+        logits = self.lm_head(x)
+        if self.cfg.logits_scaling != 1.0:
+            # muP (A3 Granite): the final logits are DIVIDED by logits_scaling
+            # (HF's convention — a temperature baked into the checkpoint).
+            logits = logits / self.cfg.logits_scaling
+        return logits
 
     def init_cache(self, batch: int, max_seq: int) -> KVCache:
         """Allocate a fresh KV cache sized to this model, on its device/dtype."""

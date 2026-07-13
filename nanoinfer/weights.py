@@ -71,7 +71,9 @@ def load_model(
     return model, tokenizer
 
 
-def _remap_llama_family(hf_name: str, tensor: torch.Tensor) -> tuple[str, torch.Tensor]:
+def _remap_llama_family(
+    hf_name: str, tensor: torch.Tensor
+) -> list[tuple[str, torch.Tensor]]:
     """The default HF->ours name map, shared by every Llama-family arch.
 
     HF Qwen2/Qwen3/Llama layout:
@@ -88,19 +90,65 @@ def _remap_llama_family(hf_name: str, tensor: torch.Tensor) -> tuple[str, torch.
     top. The per-tensor shape is untouched — this is a pure rename.
     """
     if hf_name == "lm_head.weight":
-        return "lm_head.weight", tensor
+        return [("lm_head.weight", tensor)]
     if hf_name.startswith("model."):
-        return hf_name[len("model."):], tensor
+        return [(hf_name[len("model."):], tensor)]
     # Be loud about anything we didn't anticipate rather than silently dropping it.
     raise RuntimeError(f"Unrecognized HF weight name: {hf_name}")
 
 
+def _remap_granitemoe(
+    hf_name: str, tensor: torch.Tensor
+) -> list[tuple[str, torch.Tensor]]:
+    """GraniteMoe (A3): unfuse the stacked expert tensors, rename the router.
+
+    HF stores the MoE FFN under `block_sparse_moe` with every expert FUSED into
+    one 3-D tensor (the Megablocks/vLLM-kernel layout):
+        ...block_sparse_moe.router.layer.weight   [E, hidden]
+        ...block_sparse_moe.input_linear.weight   [E, 2*ffn, hidden]  gate|up stacked
+        ...block_sparse_moe.output_linear.weight  [E, hidden, ffn]    down
+    input_linear's first ffn rows are the GATE (HF chunk(2)[0], the activated
+    half), the last ffn the UP — locked by parity. We unfuse to one plain SwiGLU
+    per expert (our MoE module's layout, and the per-expert .bin names the C++
+    export needs):
+        ...mlp.router.weight
+        ...mlp.experts.{e}.{gate,up,down}_proj.weight
+    Everything else (attention, norms, embed) is the shared Llama-family rename.
+    """
+    if ".block_sparse_moe." not in hf_name:
+        return _remap_llama_family(hf_name, tensor)
+
+    prefix, moe_name = hf_name.split(".block_sparse_moe.")
+    prefix = prefix[len("model."):]  # layers.{i}
+    if moe_name == "router.layer.weight":
+        return [(f"{prefix}.mlp.router.weight", tensor)]
+    if moe_name == "input_linear.weight":
+        ffn = tensor.shape[1] // 2
+        out = []
+        for e in range(tensor.shape[0]):
+            out.append((f"{prefix}.mlp.experts.{e}.gate_proj.weight", tensor[e, :ffn]))
+            out.append((f"{prefix}.mlp.experts.{e}.up_proj.weight", tensor[e, ffn:]))
+        return out
+    if moe_name == "output_linear.weight":
+        return [
+            (f"{prefix}.mlp.experts.{e}.down_proj.weight", tensor[e])
+            for e in range(tensor.shape[0])
+        ]
+    raise RuntimeError(f"Unrecognized GraniteMoe weight name: {hf_name}")
+
+
 # Weight-name registry keyed by HF model_type (A0). This module is the ONE place
-# that knows HF's names; the registry is the seam where a future arch whose layout
-# differs (e.g. A3 Granite's fused MoE experts) plugs in its own remapper without
-# touching the rest of the loader. The Llama-family archs (Qwen2, Qwen3, Llama3)
-# all share the default map, so the registry is a fallback-to-default lookup.
-_NAME_MAP_REGISTRY: dict[str, Callable[[str, torch.Tensor], tuple[str, torch.Tensor]]] = {}
+# that knows HF's names; the registry is the seam where an arch whose layout
+# differs (A3 Granite's fused MoE experts) plugs in its own remapper without
+# touching the rest of the loader. A mapper takes one HF tensor and returns the
+# renamed tensors it becomes — usually one, several when unfusing. The
+# Llama-family archs (Qwen2, Qwen3, Llama3) share the default map, so the
+# registry is a fallback-to-default lookup.
+_NAME_MAP_REGISTRY: dict[
+    str, Callable[[str, torch.Tensor], list[tuple[str, torch.Tensor]]]
+] = {
+    "granitemoe": _remap_granitemoe,
+}
 
 
 def _name_mapper(model_type: str):
@@ -113,8 +161,7 @@ def _remap_state_dict(hf_sd: dict, our_sd: dict, cfg: ModelConfig) -> dict:
     out: dict[str, torch.Tensor] = {}
 
     for hf_name, tensor in hf_sd.items():
-        our_name, t = remap(hf_name, tensor)
-        if our_name is not None:
+        for our_name, t in remap(hf_name, tensor):
             out[our_name] = t
 
     # Tied embeddings: some checkpoints omit lm_head and reuse the input embedding.

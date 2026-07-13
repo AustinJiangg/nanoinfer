@@ -64,8 +64,13 @@ class ModelConfig:
     # otherwise the HF dict, e.g. {"rope_type": "llama3", "factor": 32, ...}.
     rope_scaling: Optional[dict] = None
     # muP-style scalars, identity (1.0) for Qwen2.5; earn their keep in A3 Granite.
+    # embedding_multiplier scales the embedding output; residual_multiplier scales
+    # each sublayer output before its residual add; logits_scaling DIVIDES the final
+    # logits (HF Granite's convention). attention_multiplier REPLACES the softmax
+    # scale 1/sqrt(head_dim) when set — 1.0 means "unset, use the default scale"
+    # (HF GraniteMoe: `self.scaling = config.attention_multiplier`).
     embedding_multiplier: float = 1.0
-    attention_multiplier: float = 1.0   # softmax scale multiplier (A3; roadmap "attention_scale")
+    attention_multiplier: float = 1.0
     residual_multiplier: float = 1.0
     logits_scaling: float = 1.0
     # Mixture-of-experts (A3 Granite). n_experts == 0 => a dense FFN.
@@ -145,7 +150,14 @@ class ModelConfig:
             logits_scaling=float(getattr(hf_config, "logits_scaling", 1.0)),
             n_experts=int(getattr(hf_config, "num_local_experts", 0)),
             moe_top_k=int(getattr(hf_config, "num_experts_per_tok", 0)),
-            moe_intermediate_size=int(getattr(hf_config, "moe_intermediate_size", 0) or 0),
+            # GraniteMoe has no separate moe_intermediate_size field — its
+            # `intermediate_size` IS the per-expert FFN width (there is no dense
+            # FFN to size). Fall back to it whenever the model is MoE.
+            moe_intermediate_size=int(
+                getattr(hf_config, "moe_intermediate_size", 0)
+                or (hf_config.intermediate_size
+                    if getattr(hf_config, "num_local_experts", 0) else 0)
+            ),
             sliding_window=int(sw) if sw else 0,
             sliding_pattern=int(getattr(hf_config, "sliding_window_pattern", 0) or 0),
         )
