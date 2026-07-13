@@ -1008,22 +1008,38 @@ golden tokens; (4) serving, run_serve / run_spec_serve / HTTP smoke;
       goldens + `cpp/docs/BASELINE-llama.md`. Qwen2.5/Qwen3 bit-identical (RopeScalingParams
       default enabled=false; ctest -L weights 13/13 + nomodel 9/9, pytest 44). License:
       Llama Community License — weights + goldens' text not redistributed (baseline lists ids).
-- [ ] **A3** — **Granite-3.1-1B-A400M** (IBM 2024-12, Apache 2.0): the MoE rung, the
-      phase's biggest new code. 1.3B total / 400M active, 32 experts top-8, SwiGLU
-      experts (moe_ffn 512), GQA 16/8, fp32 5.2 GB — the only standard-transformer
-      MoE that fits the oracle. MoE replaces the FFN ONLY: attention, all four
-      caches, scheduler, spec, HTTP work day one. New concepts: the router linear
-      [hidden→32] + top-8 + softmax over the selected (exact HF GraniteMoe semantics
-      locked by PARITY, not docs); HF stores experts FUSED (input_linear
-      [E, 2·ffn, hidden] = gate+up) — export unfuses to per-expert names; the muP
-      scalars earn their A0 fields. CPU forward: decode (m=1) loops the 8 chosen
-      experts; prefill groups tokens BY EXPERT — gather rows per expert, one GEMM per
-      expert per projection (each expert's weight streamed once, the C5 lever; the
-      ragged grouping is forward_spec_batch's shape — the lesson transfers). CUDA
-      staged: correctness first (gather/scatter + reuse the existing linear kernels
-      per active expert), grouped-GEMM optimization second; quant = a per-expert
-      QuantizedWeight, the Q8/W8A8 interface unchanged. Extra gates: expert-grouped
-      prefill == per-token loop bit-identical (CPU); router top-k determinism.
+- [x] **A3** ✅ landed — **Granite-3.1-1B-A400M** (IBM 2024-12, Apache 2.0): the MoE rung,
+      and "MoE replaces the FFN ONLY" held literally — attention, all four caches,
+      scheduler, spec, HTTP ran day one. (1) **MoE FFN**: router [hidden→32] + top-8 +
+      softmax over ONLY the selected 8 (locked by parity — Mixtral renormalizes
+      differently); the granitemoe registry entry (now one-to-many) unfuses HF's fused
+      input_linear [E, 2·ffn, hidden] (first ffn rows = gate) to per-expert
+      experts.{e}.{gate,up,down}_proj names. Both engines group tokens BY EXPERT
+      (gather → one SwiGLU per active expert, weight streamed once — the C5/F8a lever
+      → gate-scaled scatter-add); decode degrades to 8 single-row experts, same code.
+      run_batch's max|diff|=0 IS the "grouped == per-token" gate (row-independence).
+      (2) **muP scalars folded into the weights at load** (config-time resolution):
+      q_proj ×= mult·√head_dim (0.125 = power of two → BIT-EXACT; guarded vs qk_norm),
+      o_proj/down_proj ×= residual_mult, embed ×= 12, norm.weight ÷= 6·12 (tied lm_head
+      compensation) — Granite runs a dense model's exact op sequence, no scale param
+      through 4 caches / kernels, nothing on the launch-bound decode path (G6 lesson).
+      Python oracle scales at runtime instead; run_parity 7.3e-5 (the non-power-of-two
+      folds cost ~1 ulp/weight — bounded, expected). (3) **Backend MoE primitives**
+      to_host_copy/zeros/gather_rows/scatter_add_rows (CPU + CUDA kernels; no atomics —
+      top-k indices distinct; defaults throw, the S1 pattern). Sharp edge: naming the
+      virtual `to_host` shadowed free ni::to_host inside CudaBackend → D2H became
+      identity → segfault; renamed + ni::-qualified. Expert weights are *_proj.weight →
+      every quant/half format inherited them FREE: fp16/bf16 2.00× MATCH, W8A8 /
+      int8-embed / full-int8 (3.97×) all 12/12; bf16's byte-exactness doesn't survive
+      the folds (tolerance + golden is the bar — holds). **Gate (all 5 steps)**: pytest
+      48 (incl. isolated MoE-layer vs HF block_sparse_moe 1e-5), CPU golden 0/12 +
+      cache/batch/paged max|diff|=0, CUDA 2.96e-5 + golden 0/12 all formats +
+      cache/paged/batch =0, serve/cuda_serve/spec_serve (CPU+CUDA, mixed draft/lookup,
+      ragged MoE verify)/http_serve/detok all MATCH; regression 13/13 + 9/9 + Qwen
+      gates MATCH. BASELINE-granite.md. **Honest open item:** CUDA MoE decode 23.8
+      tok/s is per-op-overhead-bound (24 router D2H + ~5× launches + per-call index
+      cudaMalloc) — levers named, not built: pooled index buffers, device-side routing,
+      grouped expert GEMVs. Measure first (G5a discipline).
 - [ ] **A4** — **Gemma-3-1B** (Google 2025-03): the stretch rung, LAST, droppable. A
       genuinely different attention shape: 5:1 sliding(1024)/global layer interleave,
       dual rope theta (local 10k / global 1M), QK-Norm, sandwich norms (pre+post),

@@ -133,13 +133,15 @@ C++/CUDA engine — built on our own kernels:
 - [x] **V-track** — HTTP serving: an asyncio engine bridge over the schedulers (plain AND spec),
       a hand-rolled HTTP/1.1 + SSE server with incremental detokenization, disconnect→cancel,
       TTFT/TPOT metrics, and a closed-loop load bench (`tools/serve_http.py`)
-- [x] **E-track + A0–A2 + B1–B2** — MIT license + 4-job CI; the architecture-description
-      config layer; Qwen3-0.6B/1.7B (QK-Norm), Llama-3.2-1B (llama3 RoPE scaling, tiktoken);
-      bf16 weight storage (byte-exact to the shipped checkpoints, NIT1 export halves the
-      file) + bf16 tensor cores (fp32 accumulate, measured)
+- [x] **E-track + A0–A3 + B1–B2** — MIT license + 4-job CI; the architecture-description
+      config layer; Qwen3-0.6B/1.7B (QK-Norm), Llama-3.2-1B (llama3 RoPE scaling, tiktoken),
+      Granite-3.1-1B-A400M (mixture-of-experts: 32 experts top-8 + the muP scalars folded
+      into the weights at load); bf16 weight storage (byte-exact to the shipped
+      checkpoints, NIT1 export halves the file) + bf16 tensor cores (fp32 accumulate,
+      measured)
 - [ ] **Metal** — a third backend on the M4 GPU (deferred; structurally prepped)
-- [ ] **Next phase remainder (A3–A4 / B3 / G7)** — Granite-1B-A400M MoE, Gemma-3-1B
-      (stretch); half-precision KV cache + activations; batched/split CUDA graphs — see
+- [ ] **Next phase remainder (A4 / B3 / G7)** — Gemma-3-1B (stretch, sliding window);
+      half-precision KV cache + activations; batched/split CUDA graphs — see
       the "Next phase" section in ROADMAP.md
 
 ## Development
