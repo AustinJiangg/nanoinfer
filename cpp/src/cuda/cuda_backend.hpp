@@ -123,6 +123,15 @@ public:
     void place_row(Tensor& dst, int64_t s, const Tensor& row) override;
     Tensor extract_rows(const Tensor& x, int64_t row_start, int64_t count) override;
     void place_rows(Tensor& dst, int64_t row_start, const Tensor& block) override;
+    // MoE row plumbing (A3): D2H for the router logits (the routing decision runs on the
+    // host), a device zeros accumulator, and the gather / gate-scaled-scatter-add kernels.
+    // Indices/gates are uploaded per call (the embedding()-id pattern) — correctness first;
+    // device-side routing is the later optimization if the H2D traffic ever matters.
+    Tensor to_host_copy(const Tensor& x) override;
+    Tensor zeros(const std::vector<int64_t>& shape) override;
+    Tensor gather_rows(const Tensor& x, const std::vector<int64_t>& rows) override;
+    void scatter_add_rows(Tensor& dst, const std::vector<int64_t>& rows,
+                          const std::vector<float>& scale, const Tensor& src) override;
     // R1: the device-resident KV cache (grows by concat, so max_seq is unused) and the result
     // D2H (respecting the graph driver's keep-on-device flag), behind the Backend so the model
     // needs no #ifdef for either. Bodies in cuda_backend.cu.

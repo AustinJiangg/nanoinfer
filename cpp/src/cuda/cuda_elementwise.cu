@@ -6,6 +6,7 @@
 // attention stay in cuda_backend.cu. Reads the graph-decode globals (g_cuda_graph_pos/token) for the
 // captured decode path; shared pool/loaders come from cuda_internal.cuh.
 #include "cuda/cuda_backend.hpp"   // CudaBackend
+#include "cuda/cuda.hpp"           // ni::to_host (the MoE router-logits D2H)
 #include "cuda/cuda_internal.cuh"  // device_alloc, dptr, launch_check, grid1d, ldf, kBlock, g_cuda_graph_*
 
 #include <cuda_fp16.h>
@@ -89,6 +90,29 @@ __global__ void repeat_kv_kernel(const float* __restrict__ x, float* __restrict_
     const int64_t oh = idx / (seq * D), rem = idx % (seq * D), s = rem / D, d = rem % D;
     const int64_t j = oh / n_rep;  // source kv head
     out[idx] = x[(j * seq + s) * D + d];
+}
+
+// MoE (A3): gather non-contiguous rows — out[j,:] = x[rows[j],:]. One thread per
+// output element (rows are hidden-width, ~1024; the copy is trivially coalesced).
+__global__ void gather_rows_kernel(const float* __restrict__ x, const int64_t* __restrict__ rows,
+                                   float* __restrict__ out, int64_t n, int64_t width) {
+    const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= n * width) return;
+    const int64_t j = idx / width, c = idx % width;
+    out[idx] = x[rows[j] * width + c];
+}
+
+// MoE (A3): dst[rows[j],:] += scale[j] * src[j,:] — the gate multiply folded into the
+// scatter, mirroring the CPU op. Within one call the row indices are UNIQUE (top-k
+// indices are distinct, so a token reaches a given expert at most once), so a plain
+// += needs no atomics.
+__global__ void scatter_add_rows_kernel(float* __restrict__ dst, const int64_t* __restrict__ rows,
+                                        const float* __restrict__ scale,
+                                        const float* __restrict__ src, int64_t n, int64_t width) {
+    const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= n * width) return;
+    const int64_t j = idx / width, c = idx % width;
+    dst[rows[j] * width + c] += scale[j] * src[idx];
 }
 
 // RoPE (neox / half-split): out = x*cos + rotate_half(x)*sin, where rotate_half =
@@ -242,5 +266,61 @@ void CudaBackend::place_rows(Tensor& dst, int64_t row_start, const Tensor& block
                           static_cast<size_t>(count * width) * sizeof(float),
                           cudaMemcpyDeviceToDevice),
                "place_rows");
+}
+
+// --- MoE row plumbing (A3). Correctness-first: the row indices / gate scales ride a
+// per-call cudaMalloc + H2D (the embedding()-id pattern); the D2H in to_host_copy is a
+// small [rows, n_experts] tensor once per layer. Both are known per-op overhead of the
+// G6 class — device-side routing / grouped GEMMs are the later optimization, measured
+// before built (the G5a discipline). ---
+
+Tensor CudaBackend::to_host_copy(const Tensor& x) {
+    // ni:: qualification is load-bearing: unqualified to_host would resolve back to
+    // this very member (the shadowing that briefly segfaulted finalize_logits).
+    return x.device() == Device::CUDA ? ni::to_host(x) : x;
+}
+
+Tensor CudaBackend::zeros(const std::vector<int64_t>& shape) {
+    Tensor t = device_alloc(shape);
+    cuda_check(cudaMemset(t.device_ptr(), 0, static_cast<size_t>(t.numel()) * sizeof(float)),
+               "zeros memset");
+    return t;
+}
+
+Tensor CudaBackend::gather_rows(const Tensor& x, const std::vector<int64_t>& rows) {
+    const int64_t n = static_cast<int64_t>(rows.size()), width = x.size(1);
+    Tensor out = device_alloc({n, width});
+    int64_t* d_rows = nullptr;
+    cuda_check(cudaMalloc(&d_rows, static_cast<size_t>(n) * sizeof(int64_t)),
+               "gather_rows malloc");
+    cuda_check(cudaMemcpy(d_rows, rows.data(), static_cast<size_t>(n) * sizeof(int64_t),
+                          cudaMemcpyHostToDevice),
+               "gather_rows H2D");
+    gather_rows_kernel<<<grid1d(n * width, kBlock), kBlock>>>(dptr(x), d_rows, dptr(out), n, width);
+    launch_check("gather_rows_kernel");
+    cudaFree(d_rows);
+    return out;
+}
+
+void CudaBackend::scatter_add_rows(Tensor& dst, const std::vector<int64_t>& rows,
+                                   const std::vector<float>& scale, const Tensor& src) {
+    const int64_t n = static_cast<int64_t>(rows.size()), width = dst.size(1);
+    int64_t* d_rows = nullptr;
+    float* d_scale = nullptr;
+    cuda_check(cudaMalloc(&d_rows, static_cast<size_t>(n) * sizeof(int64_t)),
+               "scatter_add_rows rows malloc");
+    cuda_check(cudaMalloc(&d_scale, static_cast<size_t>(n) * sizeof(float)),
+               "scatter_add_rows scale malloc");
+    cuda_check(cudaMemcpy(d_rows, rows.data(), static_cast<size_t>(n) * sizeof(int64_t),
+                          cudaMemcpyHostToDevice),
+               "scatter_add_rows rows H2D");
+    cuda_check(cudaMemcpy(d_scale, scale.data(), static_cast<size_t>(n) * sizeof(float),
+                          cudaMemcpyHostToDevice),
+               "scatter_add_rows scale H2D");
+    scatter_add_rows_kernel<<<grid1d(n * width, kBlock), kBlock>>>(dptr(dst), d_rows, d_scale,
+                                                                   dptr(src), n, width);
+    launch_check("scatter_add_rows_kernel");
+    cudaFree(d_rows);
+    cudaFree(d_scale);
 }
 }  // namespace ni
