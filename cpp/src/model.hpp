@@ -98,6 +98,13 @@ private:
     void apply_qk_norm(Tensor& q, Tensor& k, const std::string& layer_prefix) const;
     // A linear projection that dispatches to the Q8 path when `name` is quantized.
     Tensor project(const Tensor& x, const std::string& name, const Tensor* bias) const;
+    // The FFN sublayer on [rows, hidden] (A3): the dense SwiGLU, or — when
+    // cfg.n_experts > 0 — the routed mixture-of-experts. MoE groups the rows BY
+    // EXPERT (host top-k on the router logits, gather rows, one SwiGLU per active
+    // expert, gate-scaled scatter-add), so each expert weight is streamed once per
+    // call (the C5/F8a lever); decode (rows==1) degrades to its top-k experts, one
+    // row each. Row results are independent, so all three forwards share this.
+    Tensor ffn(const Tensor& hm, const std::string& layer_prefix) const;
     // The token-embedding gather and the output projection to logits — each weight-only int8
     // (embedding_q8 / linear_q8) when cfg.quantize_embed quantized that tied weight, else the
     // fp32/device backend path. One place each so forward() and forward_batch() share the routing.

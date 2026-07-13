@@ -64,6 +64,25 @@ public:
     virtual Tensor extract_rows(const Tensor& x, int64_t row_start, int64_t count) = 0;
     virtual void place_rows(Tensor& dst, int64_t row_start, const Tensor& block) = 0;
 
+    // --- MoE (A3 Granite) plumbing: the FFN groups tokens BY EXPERT — gather each
+    // expert's (non-contiguous) rows into one batch, run the expert's SwiGLU as plain
+    // projections (each expert weight streamed once, the C5/F8a lever), and
+    // scatter-add the gate-scaled outputs back: dst[rows[j]] += scale[j] * src[j].
+    // The gate multiply is folded into the scatter so the accumulation is one op.
+    // Routing DECISIONS (top-k on the [rows, n_experts] router logits) run on the
+    // host — to_host_copy lands a device tensor there (CPU: identity, the tensor
+    // already is; NOT named to_host — a member of that name would shadow cuda.hpp's
+    // free ni::to_host inside CudaBackend methods and silently rebind their D2H to
+    // the identity default). zeros is the scatter accumulator (alloc is
+    // uninitialized). Defaults: host-side behavior, correct for CPU; gather/scatter
+    // throw so a backend that hasn't implemented MoE fails loudly (the S1
+    // default-throw pattern), and the CUDA overrides land with the A3 CUDA stage. ---
+    virtual Tensor to_host_copy(const Tensor& x);
+    virtual Tensor zeros(const std::vector<int64_t>& shape);
+    virtual Tensor gather_rows(const Tensor& x, const std::vector<int64_t>& rows);
+    virtual void scatter_add_rows(Tensor& dst, const std::vector<int64_t>& rows,
+                                  const std::vector<float>& scale, const Tensor& src);
+
     // --- R1: device objects the factory owns, so Model stays #ifdef-free ---
     // The KV cache native to this backend (CPU KVCache / device CudaKVCache), returned through
     // the base so the model drives either via one pointer. max_seq sizes the preallocated CPU
@@ -120,6 +139,9 @@ public:
     void place_row(Tensor& dst, int64_t s, const Tensor& row) override;
     Tensor extract_rows(const Tensor& x, int64_t row_start, int64_t count) override;
     void place_rows(Tensor& dst, int64_t row_start, const Tensor& block) override;
+    Tensor gather_rows(const Tensor& x, const std::vector<int64_t>& rows) override;
+    void scatter_add_rows(Tensor& dst, const std::vector<int64_t>& rows,
+                          const std::vector<float>& scale, const Tensor& src) override;
     std::unique_ptr<KVCacheBase> make_kv_cache(int64_t num_layers, int64_t n_kv_heads,
                                                int64_t head_dim, int64_t max_seq) override;
 };

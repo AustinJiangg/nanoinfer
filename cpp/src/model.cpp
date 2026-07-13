@@ -1,8 +1,11 @@
 #include "model.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <stdexcept>
 #include <utility>
 
@@ -53,6 +56,61 @@ Model::Model(const std::string& weights_dir, QuantMode mode, Device device, Back
         }
     }
     if (w_.empty()) throw std::runtime_error("Model: no .bin weights in " + weights_dir);
+
+    // --- A3 (Granite): fold the muP scalars into the WEIGHTS at load time, so the
+    // hot path stays scalar-free — Granite runs the exact op sequence a dense model
+    // does (no extra per-token kernels on the launch-bound CUDA decode path, G6), and
+    // no attention/cache/kernel signature grows a scale parameter. Config-time
+    // resolution, the rope_theta / llama3-scaling lesson applied again. Must run
+    // BEFORE quantization / half-precision residency so every representation is
+    // built from the folded values. The algebra, per scalar:
+    //   attention_multiplier  REPLACES softmax scale 1/sqrt(head_dim) (HF Granite).
+    //     Folding r = mult*sqrt(head_dim) into q_proj makes the kernels' baked-in
+    //     1/sqrt(head_dim) yield exactly mult. (Granite: r = 0.015625*8 = 0.125, a
+    //     power of two — the fold is bit-exact, not just tolerance-close.)
+    //     Incompatible with QK-Norm, which would normalize the fold away — guarded.
+    //   residual_multiplier   scales each sublayer output -> fold into the output
+    //     projection of each sublayer: o_proj and (every expert's) down_proj.
+    //   embedding_multiplier  scales the embedding output -> fold into embed_tokens.
+    //   logits_scaling        DIVIDES the logits -> fold 1/s into the final
+    //     norm.weight (its output feeds only the lm_head). A TIED lm_head also
+    //     picked up the embedding fold, so divide that back out here too.
+    {
+        auto scale_weight = [this](const std::string& name, float s) {
+            auto it = w_.find(name);
+            if (it == w_.end()) return;  // absent (e.g. no qkv bias) — nothing to fold
+            Tensor& t = it->second;
+            for (int64_t i = 0; i < t.numel(); ++i) t.data()[i] *= s;
+        };
+        if (cfg_.attention_multiplier != 1.0f) {
+            if (cfg_.qk_norm)
+                throw std::runtime_error(
+                    "Model: attention_multiplier with qk_norm is unsupported (the q_proj "
+                    "fold would be erased by the norm — needs a real scale parameter)");
+            const float r =
+                cfg_.attention_multiplier * std::sqrt(static_cast<float>(cfg_.head_dim));
+            for (int64_t i = 0; i < cfg_.num_layers; ++i) {
+                const std::string A = "layers." + std::to_string(i) + ".self_attn.q_proj.";
+                scale_weight(A + "weight", r);
+                scale_weight(A + "bias", r);
+            }
+        }
+        if (cfg_.residual_multiplier != 1.0f) {
+            for (int64_t i = 0; i < cfg_.num_layers; ++i) {
+                const std::string L = "layers." + std::to_string(i) + ".";
+                scale_weight(L + "self_attn.o_proj.weight", cfg_.residual_multiplier);
+                scale_weight(L + "mlp.down_proj.weight", cfg_.residual_multiplier);
+                for (int64_t e = 0; e < cfg_.n_experts; ++e)
+                    scale_weight(L + "mlp.experts." + std::to_string(e) + ".down_proj.weight",
+                                 cfg_.residual_multiplier);
+            }
+        }
+        if (cfg_.embedding_multiplier != 1.0f)
+            scale_weight("embed_tokens.weight", cfg_.embedding_multiplier);
+        float lm_div = cfg_.logits_scaling;
+        if (cfg_.tie_word_embeddings) lm_div *= cfg_.embedding_multiplier;
+        if (lm_div != 1.0f) scale_weight("norm.weight", 1.0f / lm_div);
+    }
 
     // Build the RoPE tables once for the full context; forward slices them.
     // A2: a llama3-scaled config rescales inv_freq here, at build time — the
@@ -154,6 +212,73 @@ Tensor Model::project(const Tensor& x, const std::string& name, const Tensor* bi
     auto it = weights_.find(name);
     if (it == weights_.end()) throw std::runtime_error("Model: missing projection weight " + name);
     return it->second->linear(x, bias);
+}
+
+Tensor Model::ffn(const Tensor& hm, const std::string& L) const {
+    if (cfg_.n_experts == 0) {
+        // Dense SwiGLU — the pre-A3 path, byte-for-byte.
+        Tensor gate = backend_->silu(project(hm, L + "mlp.gate_proj.weight", nullptr));
+        Tensor up = project(hm, L + "mlp.up_proj.weight", nullptr);
+        return project(backend_->mul(gate, up), L + "mlp.down_proj.weight", nullptr);
+    }
+
+    // --- MoE (A3 Granite). Semantics parity-locked against HF via the Python
+    // oracle: router logits (fp32), top-k SELECTS k experts, softmax over ONLY the
+    // selected k logits, output = sum of gate-scaled expert outputs. ---
+    const int64_t rows = hm.size(0);
+    const int64_t E = cfg_.n_experts;
+    const size_t K = static_cast<size_t>(cfg_.moe_top_k);
+
+    // Router: a small [rows, E] linear. The routing DECISION runs on the host (the
+    // CUDA backend D2Hs this one small tensor per layer — the correctness-first
+    // price; device-side routing is a later optimization if it ever matters).
+    Tensor rl =
+        backend_->to_host_copy(backend_->linear(hm, W(L + "mlp.router.weight"), nullptr));
+
+    // Group rows by expert. Ties break toward the lower expert index (torch.topk's
+    // order, so selection matches the oracle even on equal logits). Accumulation
+    // order per row is ascending expert id — the same order the oracle's
+    // expert-grouped loop adds in, which is what makes grouped == per-token exact.
+    std::vector<std::vector<int64_t>> expert_rows(static_cast<size_t>(E));
+    std::vector<std::vector<float>> expert_gates(static_cast<size_t>(E));
+    std::vector<int64_t> idx(static_cast<size_t>(E));
+    for (int64_t r = 0; r < rows; ++r) {
+        const float* lr = rl.data() + r * E;
+        std::iota(idx.begin(), idx.end(), 0);
+        std::partial_sort(idx.begin(), idx.begin() + static_cast<int64_t>(K), idx.end(),
+                          [lr](int64_t a, int64_t b) {
+                              return lr[a] > lr[b] || (lr[a] == lr[b] && a < b);
+                          });
+        // Softmax over the selected k. idx[0] holds the max, so the usual
+        // max-subtraction falls out of the sort.
+        float sum = 0.0f;
+        std::vector<float> g(K);
+        for (size_t j = 0; j < K; ++j) {
+            g[j] = std::exp(lr[idx[j]] - lr[idx[0]]);
+            sum += g[j];
+        }
+        for (size_t j = 0; j < K; ++j) {
+            expert_rows[static_cast<size_t>(idx[j])].push_back(r);
+            expert_gates[static_cast<size_t>(idx[j])].push_back(g[j] / sum);
+        }
+    }
+
+    // One SwiGLU per ACTIVE expert over its gathered rows: the projections fuse
+    // over that expert's whole row group (each expert weight streamed once — the
+    // C5/F8a lever; prefill averages rows*k/E rows per expert). The gate multiply
+    // is folded into the scatter-add.
+    Tensor out = backend_->zeros({rows, cfg_.hidden_size});
+    for (int64_t e = 0; e < E; ++e) {
+        const auto& rws = expert_rows[static_cast<size_t>(e)];
+        if (rws.empty()) continue;
+        const std::string EP = L + "mlp.experts." + std::to_string(e) + ".";
+        Tensor xe = backend_->gather_rows(hm, rws);
+        Tensor gate = backend_->silu(project(xe, EP + "gate_proj.weight", nullptr));
+        Tensor up = project(xe, EP + "up_proj.weight", nullptr);
+        Tensor ye = project(backend_->mul(gate, up), EP + "down_proj.weight", nullptr);
+        backend_->scatter_add_rows(out, rws, expert_gates[static_cast<size_t>(e)], ye);
+    }
+    return out;
 }
 
 Tensor Model::embed_tokens(const std::vector<int64_t>& ids) const {
@@ -270,12 +395,9 @@ Tensor Model::forward(const std::vector<int64_t>& ids, KVCacheBase* cache) const
         a = project(a, L + "self_attn.o_proj.weight", nullptr);  // o_proj has no bias
         x = backend_->add(x, a);
 
-        // --- SwiGLU MLP (pre-norm + residual) ---
+        // --- FFN (pre-norm + residual): dense SwiGLU, or the MoE experts (A3) ---
         Tensor hm = backend_->rmsnorm(x, W(L + "post_attention_layernorm.weight"), eps);
-        Tensor gate = backend_->silu(project(hm, L + "mlp.gate_proj.weight", nullptr));
-        Tensor up = project(hm, L + "mlp.up_proj.weight", nullptr);
-        Tensor down = project(backend_->mul(gate, up), L + "mlp.down_proj.weight", nullptr);
-        x = backend_->add(x, down);
+        x = backend_->add(x, ffn(hm, L));
     }
 
     if (cache) cache->advance(seq);
@@ -342,12 +464,10 @@ Tensor Model::forward_batch(const std::vector<int64_t>& tokens,
         Tensor a = project(attn, L + "self_attn.o_proj.weight", nullptr);  // o_proj: no bias
         x = backend_->add(x, a);
 
-        // --- SwiGLU MLP (pre-norm + residual), all batched over the n rows ---
+        // --- FFN (pre-norm + residual), all batched over the n rows; the MoE path
+        // (A3) groups the rows by expert internally — rows stay independent ---
         Tensor hm = backend_->rmsnorm(x, W(L + "post_attention_layernorm.weight"), eps);
-        Tensor gate = backend_->silu(project(hm, L + "mlp.gate_proj.weight", nullptr));
-        Tensor up = project(hm, L + "mlp.up_proj.weight", nullptr);
-        Tensor down = project(backend_->mul(gate, up), L + "mlp.down_proj.weight", nullptr);
-        x = backend_->add(x, down);
+        x = backend_->add(x, ffn(hm, L));
     }
 
     for (int64_t s = 0; s < n; ++s) caches[s]->advance(1);
@@ -427,12 +547,10 @@ Tensor Model::forward_spec_batch(const std::vector<int64_t>& tokens,
         Tensor a = project(attn, L + "self_attn.o_proj.weight", nullptr);  // o_proj: no bias
         x = backend_->add(x, a);
 
-        // --- SwiGLU MLP (pre-norm + residual), all batched over the M rows ---
+        // --- FFN (pre-norm + residual), all batched over the M rows; the MoE path
+        // (A3) groups the rows by expert internally — rows stay independent ---
         Tensor hm = backend_->rmsnorm(x, W(L + "post_attention_layernorm.weight"), eps);
-        Tensor gate = backend_->silu(project(hm, L + "mlp.gate_proj.weight", nullptr));
-        Tensor up = project(hm, L + "mlp.up_proj.weight", nullptr);
-        Tensor down = project(backend_->mul(gate, up), L + "mlp.down_proj.weight", nullptr);
-        x = backend_->add(x, down);
+        x = backend_->add(x, ffn(hm, L));
     }
 
     for (int64_t s = 0; s < n; ++s) caches[s]->advance(counts[static_cast<size_t>(s)]);

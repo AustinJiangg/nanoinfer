@@ -80,6 +80,59 @@ std::unique_ptr<KVCacheBase> CpuBackend::make_kv_cache(int64_t num_layers, int64
     return std::make_unique<KVCache>(num_layers, n_kv_heads, head_dim, max_seq);
 }
 
+// --- MoE plumbing (A3). The base defaults are host-side: zeros allocates a host
+// accumulator (correct for CPU; the CUDA backend overrides with a device cudaMemset),
+// and gather/scatter throw so a backend without a MoE implementation fails loudly
+// rather than dereferencing a device pointer on the host. ---
+Tensor Backend::to_host_copy(const Tensor& x) {
+    // Identity is only correct for a tensor that already lives on the host; a device
+    // backend must override with its D2H. Guard so a missing override throws instead
+    // of handing the caller a device pointer to dereference.
+    if (x.device() != Device::CPU)
+        throw std::runtime_error("to_host_copy: not implemented on this backend (MoE, A3)");
+    return x;
+}
+
+Tensor Backend::zeros(const std::vector<int64_t>& shape) {
+    Tensor t(shape);
+    std::memset(t.data(), 0, static_cast<size_t>(t.numel()) * sizeof(float));
+    return t;
+}
+
+Tensor Backend::gather_rows(const Tensor&, const std::vector<int64_t>&) {
+    throw std::runtime_error("gather_rows: not implemented on this backend (MoE, A3)");
+}
+
+void Backend::scatter_add_rows(Tensor&, const std::vector<int64_t>&, const std::vector<float>&,
+                               const Tensor&) {
+    throw std::runtime_error("scatter_add_rows: not implemented on this backend (MoE, A3)");
+}
+
+// CPU MoE row plumbing: plain host copies/FMAs. Rows are hidden-width (1024 on
+// Granite), so memcpy per gathered row is the whole cost — negligible next to the
+// expert GEMMs.
+Tensor CpuBackend::gather_rows(const Tensor& x, const std::vector<int64_t>& rows) {
+    const int64_t width = x.size(1), n = static_cast<int64_t>(rows.size());
+    Tensor out({n, width});
+    for (int64_t j = 0; j < n; ++j)
+        std::memcpy(out.data() + j * width, x.data() + rows[static_cast<size_t>(j)] * width,
+                    static_cast<size_t>(width) * sizeof(float));
+    return out;
+}
+
+void CpuBackend::scatter_add_rows(Tensor& dst, const std::vector<int64_t>& rows,
+                                  const std::vector<float>& scale, const Tensor& src) {
+    const int64_t width = dst.size(1), n = static_cast<int64_t>(rows.size());
+    for (int64_t j = 0; j < n; ++j) {
+        float* d = dst.data() + rows[static_cast<size_t>(j)] * width;
+        const float* s = src.data() + j * width;
+        const float g = scale[static_cast<size_t>(j)];
+        // dst[row] += g * src[j] — the gate multiply folded into the accumulate,
+        // matching the oracle's `expert(x) * gate` then index_add order per element.
+        for (int64_t c = 0; c < width; ++c) d[c] += g * s[c];
+    }
+}
+
 // The former #ifdef ladder in Model's constructor, isolated to one spot so the model is
 // device-agnostic. CUDA is only reachable in an -DNI_CUDA build; otherwise this throws for it.
 std::unique_ptr<Backend> make_backend(Device device, [[maybe_unused]] const BackendConfig& cfg) {
